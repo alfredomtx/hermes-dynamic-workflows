@@ -109,6 +109,7 @@ def _start_named_workflow(name: str, raw_args: str = "") -> str:
         record = get_run_manager().start_from_params(
             params,
             cwd=os.environ.get("TERMINAL_CWD") or os.getcwd(),
+            plugin_context=registrar.get_plugin_context(),
         )
     except Exception as exc:
         return f"Failed to start workflow '{name}': {type(exc).__name__}: {exc}"

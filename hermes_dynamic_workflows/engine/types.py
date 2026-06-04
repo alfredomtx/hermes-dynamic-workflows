@@ -26,6 +26,9 @@ class AgentRecord:
     isolation: str | None = None
     workspace: str | None = None
     model: str | None = None
+    task_id: str | None = None
+    hermes_session_id: str | None = None
+    transcript_path: str | None = None
     tool_calls: int = 0
     tokens: int = 0
     cache_read_tokens: int = 0
@@ -48,6 +51,9 @@ class AgentRecord:
             "isolation": self.isolation,
             "workspace": self.workspace,
             "model": self.model,
+            "task_id": self.task_id,
+            "hermes_session_id": self.hermes_session_id,
+            "transcript_path": self.transcript_path,
             "tool_calls": self.tool_calls,
             "tokens": self.tokens,
             "cache_read_tokens": self.cache_read_tokens,

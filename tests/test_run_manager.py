@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import threading
 import unittest
@@ -7,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from hermes_dynamic_workflows.engine.config import PluginConfig
+from hermes_dynamic_workflows.engine.errors import WorkflowRuntimeError
 from hermes_dynamic_workflows.engine.manager import WorkflowRunManager
 from hermes_dynamic_workflows.engine.types import ChildAgentRequest, ChildAgentResult, ChildAgentRunner
 from hermes_dynamic_workflows.storage.store import WorkflowStore
@@ -41,12 +43,20 @@ class RecordingCtx:
     def __init__(self, fail: bool = False):
         self.messages: list[str] = []
         self.fail = fail
+        self.session_id = "test-session"
 
     def inject_message(self, content: str, role: str = "user") -> bool:
         if self.fail:
             raise RuntimeError("inject failed")
         self.messages.append(content)
         return True
+
+
+class CliRefCtx:
+    def __init__(self, *, cli_session_id: str, agent_session_id: str | None = None):
+        agent = type("Agent", (), {"session_id": agent_session_id})() if agent_session_id else None
+        cli = type("Cli", (), {"session_id": cli_session_id, "agent": agent})()
+        self._manager = type("PluginManager", (), {"_cli_ref": cli})()
 
 
 class FailingRunner(ChildAgentRunner):
@@ -67,6 +77,20 @@ class CountingRunner(ChildAgentRunner):
     def run(self, request: ChildAgentRequest):
         type(self).calls += 1
         return f"{type(self).calls}:{request.label}"
+
+
+class TranscriptRunner(ChildAgentRunner):
+    def run(self, request: ChildAgentRequest):
+        return ChildAgentResult(
+            content=f"done:{request.label}",
+            metadata={
+                "task_id": f"child-session-{request.id}",
+                "session_id": f"child-session-{request.id}",
+                "hermes_session_id": f"child-session-{request.id}",
+                "tokens": 9,
+                "tool_calls": 2,
+            },
+        )
 
 
 class MetadataRunner(ChildAgentRunner):
@@ -90,6 +114,29 @@ class MetadataRunner(ChildAgentRunner):
 class RunManagerTests(unittest.TestCase):
     def setUp(self):
         CountingRunner.calls = 0
+        self._env_patcher = patch.dict(os.environ, {"HERMES_SESSION_ID": "unit-session"}, clear=False)
+        self._env_patcher.start()
+
+    def tearDown(self):
+        self._env_patcher.stop()
+
+    def test_task_output_path_uses_platform_tempdir_and_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = WorkflowStore(Path(tmp) / "store")
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("HERMES_DYNAMIC_WORKFLOWS_TMPDIR", None)
+                default_path = store.task_output_path(
+                    "C:\\Users\\me\\project",
+                    "session-1",
+                    "task:1",
+                )
+            default_path.relative_to(Path(tempfile.gettempdir()))
+            self.assertEqual(default_path.name, "task-1.output")
+
+            with tempfile.TemporaryDirectory() as output_tmp:
+                with patch.dict(os.environ, {"HERMES_DYNAMIC_WORKFLOWS_TMPDIR": output_tmp}):
+                    override_path = store.task_output_path("/repo", "session-2", "task-2")
+            override_path.relative_to(Path(output_tmp))
 
     def test_script_path_run(self):
         script = """
@@ -110,6 +157,58 @@ def workflow():
         self.assertEqual(final["status"], "completed")
         self.assertEqual(final["result"], "1:path-agent")
         self.assertEqual(final["source"]["type"], "scriptPath")
+        self.assertEqual(final["scriptPath"], str(script_path.resolve()))
+
+    def test_inline_script_saved_under_session_workflow_scripts(self):
+        script = """
+meta = {"name": "Inline Save"}
+
+def workflow():
+    return "ok"
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = WorkflowRunManager(store=WorkflowStore(root / "store"), config=PluginConfig())
+            record = manager.start_from_params({"script": script}, cwd=str(root), plugin_context=RecordingCtx())
+            manager.wait(record["runId"], timeout=2)
+
+            script_path = Path(record["scriptPath"])
+            self.assertEqual(script_path.name, f"inline-save-{record['runId']}.py")
+            self.assertIn("projects", script_path.parts)
+            self.assertIn("workflows", script_path.parts)
+            self.assertIn("scripts", script_path.parts)
+            self.assertTrue(script_path.read_text(encoding="utf-8").strip().startswith("meta ="))
+
+    def test_cli_ref_session_id_is_used_for_workflow_layout(self):
+        script = """
+meta = {"name": "cli session"}
+
+def workflow():
+    return "ok"
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctx = CliRefCtx(cli_session_id="cli-session", agent_session_id="agent-session")
+            manager = WorkflowRunManager(store=WorkflowStore(root / "store"), config=PluginConfig())
+            record = manager.start_from_params({"script": script}, cwd=str(root), plugin_context=ctx)
+            manager.wait(record["runId"], timeout=2)
+
+            self.assertEqual(record["workflowSessionId"], "agent-session")
+            self.assertIn("agent-session", Path(record["scriptPath"]).parts)
+            self.assertIn("agent-session", Path(record["transcriptDir"]).parts)
+
+    def test_missing_host_session_id_fails_instead_of_synthesizing(self):
+        script = """
+meta = {"name": "no session"}
+
+def workflow():
+    return "ok"
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig())
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(WorkflowRuntimeError):
+                    manager.start_from_params({"script": script}, cwd=tmp)
 
     def test_resume_reuses_unchanged_prefix(self):
         script = """
@@ -326,10 +425,54 @@ def workflow():
         self.assertEqual(len(ctx.messages), 1)
         msg = ctx.messages[0]
         self.assertIn("<task-notification>", msg)
-        self.assertIn(f"<task-id>{rec['runId']}</task-id>", msg)
+        self.assertIn(f"<task-id>{rec['taskId']}</task-id>", msg)
+        self.assertIn("<output-file>", msg)
         self.assertIn("<status>completed</status>", msg)
-        self.assertIn('notify-me', msg)
-        self.assertIn(f"/workflows {rec['runId']}", msg)
+        self.assertIn('Dynamic workflow "notify-me" completed', msg)
+        self.assertIn("<agent_count>1</agent_count>", msg)
+        self.assertIn("<subagent_tokens>", msg)
+        self.assertIn("<tool_uses>", msg)
+        self.assertIn("<duration_ms>", msg)
+        self.assertNotIn("<errors>", msg)
+        self.assertTrue(msg.strip().endswith("</task-notification>"))
+        self.assertTrue(Path(final["outputFile"]).is_file())
+
+    def test_completion_exports_child_transcripts_after_run(self):
+        script = """
+meta = {"name": "transcripts"}
+
+def workflow():
+    return agent("do it", {"label": "worker"})
+"""
+        fake_messages = [
+            {"role": "user", "content": "do it"},
+            {"role": "assistant", "content": "done"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = WorkflowRunManager(store=WorkflowStore(root / "store"), config=PluginConfig())
+            with patch(
+                "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                return_value=TranscriptRunner(),
+            ), patch(
+                "hermes_dynamic_workflows.engine.manager._load_session_messages",
+                return_value=fake_messages,
+            ):
+                rec = manager.start_from_params({"script": script}, cwd=str(root), plugin_context=RecordingCtx())
+                final = manager.wait(rec["runId"], timeout=2)
+
+            transcript_dir = Path(final["transcriptDir"])
+            self.assertEqual(transcript_dir.name, final["runId"])
+            files = final["transcriptFiles"]
+            self.assertEqual(len(files), 1)
+            transcript_path = Path(files[0])
+            self.assertEqual(transcript_path.parent, transcript_dir)
+            content = transcript_path.read_text(encoding="utf-8")
+            self.assertIn('"type": "metadata"', content)
+            self.assertIn('"session_id": "child-session-1"', content)
+            self.assertIn('"content": "done"', content)
+            agent = final["workflow"]["agents"][0]
+            self.assertEqual(agent["transcript_path"], str(transcript_path))
 
     def test_completion_notification_disabled(self):
         script = """

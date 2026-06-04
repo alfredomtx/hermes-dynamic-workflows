@@ -4,16 +4,16 @@ from __future__ import annotations
 
 import os
 
-from .hermes_dynamic_workflows.engine.structured_tool import (
+from hermes_dynamic_workflows.engine.structured_tool import (
     STRUCTURED_OUTPUT_TOOL_NAME,
     STRUCTURED_OUTPUT_TOOL_SCHEMA,
     STRUCTURED_OUTPUT_TOOLSET,
     submit_structured_output_handler,
 )
-from .hermes_dynamic_workflows.plugin import registrar
-from .hermes_dynamic_workflows.plugin.schema import DYNAMIC_WORKFLOW_SCHEMA
-from .hermes_dynamic_workflows.plugin.tool import workflow
-from .hermes_dynamic_workflows.ui.commands import (
+from hermes_dynamic_workflows.plugin import registrar
+from hermes_dynamic_workflows.plugin.schema import DYNAMIC_WORKFLOW_SCHEMA
+from hermes_dynamic_workflows.plugin.tool import workflow
+from hermes_dynamic_workflows.ui.commands import (
     discover_named_workflows,
     make_named_workflow_handler,
     workflow_stop_command,

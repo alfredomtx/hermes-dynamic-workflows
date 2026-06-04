@@ -489,6 +489,9 @@ def _child_metadata(
     reasoning_tokens = _int_attr(child, "session_reasoning_tokens")
     metadata = {
         "runner": "standalone",
+        "task_id": lease.task_id,
+        "session_id": lease.task_id,
+        "hermes_session_id": lease.task_id,
         "workspace": lease.cwd,
         "isolation": lease.isolation or "shared",
         "worktree_path": lease.path,

@@ -10,7 +10,7 @@ ONLY call this tool when the user explicitly opted into multi-agent orchestratio
 
 When calling this tool, the right move is often hybrid: scout inline first (list files, inspect the diff, discover the work-list), then call workflow to pipeline over the discovered items. You do not need to know the whole shape before the task, only before the orchestration step.
 
-Pass the script inline via script, or pass scriptPath to rerun a saved script, or pass name to run a predefined workflow from .hermes/workflows/<name>.py or ~/.hermes/dynamic-workflows/workflows/<name>.py. Every inline invocation automatically persists the script under ~/.hermes/dynamic-workflows/scripts/<runId>.py and returns that path. To iterate, edit that file and call workflow with scriptPath instead of resending the full script.
+Pass the script inline via script, or pass scriptPath to rerun a saved script, or pass name to run a predefined workflow from .hermes/workflows/<name>.py or ~/.hermes/dynamic-workflows/workflows/<name>.py. Every inline invocation automatically persists the script under ~/.hermes/projects/<sanitized-cwd>/<sessionId>/workflows/scripts/<meta-name>-<runId>.py and returns that path. A later scriptPath invocation reuses that same file instead of creating a new one. To iterate, edit that file and call workflow with scriptPath instead of resending the full script. The tool result also reports a Transcript dir under ~/.hermes/projects/<sanitized-cwd>/<sessionId>/subagents/workflows/<runId> (written when the workflow completes).
 
 Every Python workflow script should define a literal meta dict near the top:
 
@@ -106,7 +106,8 @@ DYNAMIC_WORKFLOW_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Path to a workflow Python script on disk. Takes precedence over script and name. "
-                    "Use this to rerun or iterate on a script saved by an earlier invocation."
+                    "Use this to rerun or iterate on a script saved by an earlier invocation; "
+                    "the same file is reused rather than copied to a new run-specific path."
                 ),
             },
             "name": {

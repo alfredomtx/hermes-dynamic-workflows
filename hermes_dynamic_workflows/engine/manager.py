@@ -11,7 +11,15 @@ from typing import Any
 
 from .cache import ResumeCache
 from .config import PluginConfig, load_config
-from ..storage.store import WorkflowStore, new_run_id, resolve_workflow_source, utc_now_iso
+from .errors import WorkflowRuntimeError
+from .sandbox import extract_meta, parse_script
+from ..storage.store import (
+    WorkflowStore,
+    new_run_id,
+    new_task_id,
+    resolve_workflow_source,
+    utc_now_iso,
+)
 from ..ui.display import (
     render_agent_detail,
     render_phase_detail,
@@ -46,11 +54,27 @@ class WorkflowRunManager:
         *,
         cwd: str | None = None,
         plugin_context: Any = None,
+        tool_use_id: str | None = None,
+        host_session_id: str | None = None,
     ) -> dict[str, Any]:
         config = self.config
+        cwd_value = cwd or os.environ.get("TERMINAL_CWD") or os.getcwd()
         source = resolve_workflow_source(params, store=self.store, cwd=cwd)
+        meta = extract_meta(parse_script(source.script, config))
         run_id = new_run_id()
-        saved_path = self.store.save_script(run_id, source.script)
+        task_id = new_task_id()
+        workflow_session_id = _resolve_workflow_session_id(
+            plugin_context,
+            host_session_id=host_session_id,
+        )
+        saved_path = self._script_path_for_source(
+            source,
+            run_id=run_id,
+            session_id=workflow_session_id,
+            cwd=cwd_value,
+            meta=meta,
+        )
+        transcript_dir = self.store.transcript_dir(cwd_value, workflow_session_id, run_id)
         resume_from = str(params.get("resumeFromRunId") or "").strip() or None
         previous = self.store.load_run(resume_from) if resume_from else None
         resume_cache = ResumeCache.from_run(previous)
@@ -60,12 +84,17 @@ class WorkflowRunManager:
         stop_event = threading.Event()
         record = {
             "runId": run_id,
+            "taskId": task_id,
+            "toolUseId": tool_use_id,
             "status": "queued",
             "createdAt": utc_now_iso(),
             "startedAt": None,
             "finishedAt": None,
-            "cwd": cwd or os.environ.get("TERMINAL_CWD") or os.getcwd(),
+            "cwd": cwd_value,
+            "workflowSessionId": workflow_session_id,
             "scriptPath": str(saved_path),
+            "transcriptDir": str(transcript_dir),
+            "summary": meta.get("description") or meta.get("name") or "workflow",
             "source": {
                 "type": source.source_type,
                 "ref": source.source_ref,
@@ -78,6 +107,8 @@ class WorkflowRunManager:
             "display": "",
             "workflow": None,
             "agentCache": {},
+            "outputFile": None,
+            "transcriptFiles": [],
         }
         managed = ManagedRun(run_id=run_id, stop_event=stop_event, record=record)
 
@@ -153,6 +184,33 @@ class WorkflowRunManager:
         if not run:
             return f"Workflow run not found: {run_id}"
         return render_agent_detail(run, selector)
+
+    def _script_path_for_source(
+        self,
+        source,
+        *,
+        run_id: str,
+        session_id: str,
+        cwd: str,
+        meta: dict[str, Any],
+    ) -> Path:
+        if source.source_type == "script":
+            return self.store.save_workflow_script(
+                cwd=cwd,
+                session_id=session_id,
+                run_id=run_id,
+                name=str(meta.get("name") or "dynamic-workflow"),
+                script=source.script,
+            )
+        if source.saved_script_path:
+            return Path(source.saved_script_path)
+        return self.store.save_workflow_script(
+            cwd=cwd,
+            session_id=session_id,
+            run_id=run_id,
+            name=str(meta.get("name") or "dynamic-workflow"),
+            script=source.script,
+        )
 
     def save_markdown(self, run_id: str, path: str | None = None) -> str:
         run = self.get(run_id)
@@ -262,6 +320,7 @@ class WorkflowRunManager:
                     on_update=lambda state: self._update_state(managed, state),
                     plugin_context=plugin_context,
                     token_budget_total=token_budget,
+                    source_ref=str(managed.record.get("scriptPath") or ""),
                 ),
             )
             snapshot = result.state.snapshot()
@@ -288,7 +347,21 @@ class WorkflowRunManager:
                 agentCache=resume_cache.current,
             )
         finally:
+            self._finalize_completion_artifacts(managed)
             _notify_completion(plugin_context, managed.record, config)
+
+    def _finalize_completion_artifacts(self, managed: ManagedRun) -> None:
+        with managed.lock:
+            record = managed.record
+            try:
+                _write_output_file(record, self.store)
+            except Exception:
+                pass
+            try:
+                _export_child_transcripts(record, self.store)
+            except Exception as exc:
+                record["transcriptExportError"] = f"{type(exc).__name__}: {exc}"
+            self.store.save_run(record)
 
     def _update_state(self, managed: ManagedRun, state) -> None:
         snapshot = state.snapshot()
@@ -313,6 +386,163 @@ def _content_from_value(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2, default=str)
 
 
+def _completion_output_text(record: dict[str, Any]) -> str:
+    if record.get("result") is not None:
+        return _content_from_value(record.get("result"))
+    if record.get("error"):
+        return str(record.get("error") or "")
+    return ""
+
+
+def _write_output_file(record: dict[str, Any], store: WorkflowStore) -> None:
+    text = _completion_output_text(record)
+    if not text:
+        return
+    task_id = str(record.get("taskId") or record.get("runId") or "")
+    session_id = str(record.get("workflowSessionId") or "")
+    cwd = str(record.get("cwd") or "")
+    if not task_id or not session_id:
+        return
+    path = store.task_output_path(cwd, session_id, task_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    record["outputFile"] = str(path)
+
+
+def _export_child_transcripts(record: dict[str, Any], store: WorkflowStore) -> None:
+    snapshot = record.get("workflow")
+    if not isinstance(snapshot, dict):
+        return
+    transcript_dir_raw = record.get("transcriptDir")
+    if not transcript_dir_raw:
+        return
+    transcript_dir = Path(str(transcript_dir_raw))
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+    run_id = str(record.get("runId") or "")
+    files: list[str] = []
+    for agent in _iter_agent_snapshots(snapshot):
+        session_id = str(
+            agent.get("hermes_session_id")
+            or agent.get("session_id")
+            or agent.get("task_id")
+            or ""
+        )
+        if not session_id:
+            continue
+        agent_id = str(agent.get("id") or len(files) + 1)
+        path = transcript_dir / f"agent-{run_id}-{agent_id}.jsonl"
+        _write_agent_transcript(path, record=record, agent=agent, session_id=session_id)
+        agent["transcript_path"] = str(path)
+        files.append(str(path))
+    if files:
+        record["transcriptFiles"] = files
+        record["transcriptsExportedAt"] = utc_now_iso()
+
+
+def _write_agent_transcript(
+    path: Path,
+    *,
+    record: dict[str, Any],
+    agent: dict[str, Any],
+    session_id: str,
+) -> None:
+    messages = _load_session_messages(session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        fh.write(
+            json.dumps(
+                {
+                    "type": "metadata",
+                    "run_id": record.get("runId"),
+                    "task_id": record.get("taskId"),
+                    "agent_id": agent.get("id"),
+                    "label": agent.get("label"),
+                    "session_id": session_id,
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+            + "\n"
+        )
+        for message in messages:
+            fh.write(
+                json.dumps(
+                    {"type": "message", "message": message},
+                    ensure_ascii=False,
+                    default=str,
+                )
+                + "\n"
+            )
+
+
+def _load_session_messages(session_id: str) -> list[dict[str, Any]]:
+    try:
+        from hermes_state import SessionDB
+
+        return SessionDB().get_messages(session_id, include_inactive=True)
+    except Exception:
+        return []
+
+
+def _iter_agent_snapshots(snapshot: dict[str, Any]):
+    for agent in snapshot.get("agents") or []:
+        if isinstance(agent, dict):
+            yield agent
+    for child in snapshot.get("children") or []:
+        if isinstance(child, dict):
+            yield from _iter_agent_snapshots(child)
+
+
+def _resolve_workflow_session_id(plugin_context: Any, *, host_session_id: str | None = None) -> str:
+    if host_session_id:
+        return str(host_session_id)
+    for attr in ("session_id", "sessionId"):
+        value = getattr(plugin_context, attr, None) if plugin_context is not None else None
+        if value:
+            return str(value)
+    for method_name in ("get_session_id", "current_session_id"):
+        method = getattr(plugin_context, method_name, None) if plugin_context is not None else None
+        if callable(method):
+            try:
+                value = method()
+            except Exception:
+                value = None
+            if value:
+                return str(value)
+    cli_ref = _plugin_context_cli_ref(plugin_context)
+    for value in (
+        getattr(getattr(cli_ref, "agent", None), "session_id", None),
+        getattr(cli_ref, "session_id", None),
+    ):
+        if value:
+            return str(value)
+    for name in ("HERMES_SESSION_ID", "HERMES_SESSION_KEY"):
+        env_value = _get_hermes_session_env(name)
+        if env_value:
+            return env_value
+    raise WorkflowRuntimeError(
+        "Hermes did not provide a session id for workflow layout. "
+        "Expected task_id/session_id kwargs, plugin_context CLI session, "
+        "or gateway session context."
+    )
+
+
+def _plugin_context_cli_ref(plugin_context: Any) -> Any:
+    manager = getattr(plugin_context, "_manager", None) if plugin_context is not None else None
+    if manager is not None:
+        return getattr(manager, "_cli_ref", None)
+    return None
+
+
+def _get_hermes_session_env(name: str) -> str:
+    try:
+        from gateway.session_context import get_session_env
+
+        return str(get_session_env(name, "") or "").strip()
+    except Exception:
+        return os.getenv(name, "").strip()
+
+
 def _notify_completion(plugin_context: Any, record: dict[str, Any], config: PluginConfig) -> None:
     """On terminal state, inject a Claude-Code-style <task-notification> into the
     conversation so the model can deliver the result without the user polling
@@ -334,6 +564,7 @@ def _render_task_notification(record: dict[str, Any], preview_chars: int) -> str
     """Mirror Claude Code's LocalAgentTask task-notification block, adapted to a
     workflow run (tool_uses -> agents, plus errors)."""
     run_id = record.get("runId") or ""
+    task_id = record.get("taskId") or run_id
     status = str(record.get("status") or "completed")
     snapshot = record.get("workflow") or {}
     meta = snapshot.get("meta") or {}
@@ -341,46 +572,58 @@ def _render_task_notification(record: dict[str, Any], preview_chars: int) -> str
     totals = snapshot.get("totals") or {}
 
     if record.get("error"):
-        summary = f'Workflow "{name}" {status}: {record["error"]}'
+        summary = f'Dynamic workflow "{name}" {status}: {record["error"]}'
     elif status == "completed":
-        summary = f'Workflow "{name}" completed'
+        summary = f'Dynamic workflow "{name}" completed'
     elif status == "failed":
-        summary = f'Workflow "{name}" failed: all agents errored'
+        summary = f'Dynamic workflow "{name}" failed: all agents errored'
     elif status == "stopped":
-        summary = f'Workflow "{name}" was stopped'
+        summary = f'Dynamic workflow "{name}" was stopped'
     else:
-        summary = f'Workflow "{name}" {status}'
+        summary = f'Dynamic workflow "{name}" {status}'
 
-    result = record.get("result")
-    result_text = result if isinstance(result, str) else _content_from_value(result)
-    result_text = result_text or ""
+    result_text = _completion_output_text(record)
     truncated = len(result_text) > preview_chars > 0
     if truncated:
-        result_text = result_text[:preview_chars] + "…"
+        remaining = len(result_text) - preview_chars
+        output_file = str(record.get("outputFile") or "")
+        suffix = f"\n... (truncated {remaining} chars"
+        if output_file:
+            suffix += f", full result in {output_file}"
+        suffix += ")"
+        result_text = result_text[:preview_chars] + suffix
 
-    done = int(totals.get("done") or 0)
     agents = int(totals.get("agents") or 0)
-    errors = int(totals.get("errors") or 0)
     tokens = int(totals.get("tokens") or 0)
+    tool_uses = int(totals.get("tool_calls") or 0)
     duration_ms = int(float(snapshot.get("duration_seconds") or 0) * 1000)
 
     lines = [
         "<task-notification>",
-        f"<task-id>{run_id}</task-id>",
-        f"<status>{status}</status>",
-        f"<summary>{summary}</summary>",
+        f"<task-id>{task_id}</task-id>",
     ]
+    tool_use_id = str(record.get("toolUseId") or "")
+    if tool_use_id:
+        lines.append(f"<tool-use-id>{tool_use_id}</tool-use-id>")
+    output_file = str(record.get("outputFile") or "")
+    if output_file:
+        lines.append(f"<output-file>{output_file}</output-file>")
+    lines.extend(
+        [
+            f"<status>{status}</status>",
+            f"<summary>{summary}</summary>",
+        ]
+    )
     if result_text:
         lines.append(f"<result>{result_text}</result>")
     lines.append(
-        f"<usage><total_tokens>{tokens}</total_tokens>"
-        f"<agents>{done}/{agents}</agents><errors>{errors}</errors>"
+        f"<usage><agent_count>{agents}</agent_count>"
+        f"<subagent_tokens>{tokens}</subagent_tokens>"
+        f"<tool_uses>{tool_uses}</tool_uses>"
         f"<duration_ms>{duration_ms}</duration_ms></usage>"
     )
     lines.append("</task-notification>")
-    tail = f"Use /workflows {run_id} for full details"
-    tail += " (result truncated above)." if truncated else "."
-    return "\n".join(lines) + "\n" + tail
+    return "\n".join(lines)
 
 
 def _derive_run_status(snapshot: dict[str, Any]) -> str:

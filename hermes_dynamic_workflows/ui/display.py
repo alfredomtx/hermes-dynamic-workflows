@@ -128,6 +128,10 @@ def render_agent_detail(run: dict[str, Any], selector: str) -> str:
         lines.append(f"Workspace: {agent.get('workspace')}")
     if agent.get("model"):
         lines.append(f"Model: {agent.get('model')}")
+    if agent.get("hermes_session_id"):
+        lines.append(f"Hermes session: {agent.get('hermes_session_id')}")
+    if agent.get("transcript_path"):
+        lines.append(f"Transcript: {agent.get('transcript_path')}")
     stats = []
     if agent.get("tokens"):
         stats.append(f"{_format_tokens(agent.get('tokens'))} tok")

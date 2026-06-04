@@ -22,6 +22,10 @@ def has_context() -> bool:
     return _CTX is not None
 
 
+def get_plugin_context() -> Any:
+    return _CTX
+
+
 def register_command(
     name: str,
     handler: Callable[..., Any],

@@ -552,6 +552,11 @@ def _apply_child_metadata(record: AgentRecord, metadata: dict[str, Any]) -> None
     record.runner = str(metadata.get("runner") or record.runner)
     record.workspace = _optional_str(metadata.get("workspace"))
     record.model = _optional_str(metadata.get("model"))
+    record.task_id = _optional_str(metadata.get("task_id"))
+    record.hermes_session_id = _optional_str(
+        metadata.get("hermes_session_id") or metadata.get("session_id")
+    )
+    record.transcript_path = _optional_str(metadata.get("transcript_path"))
     record.agent_type = _optional_str(metadata.get("agent_type")) or record.agent_type
     record.isolation = _optional_str(metadata.get("isolation")) or record.isolation
     record.tokens = _as_int_metadata(metadata.get("tokens"))

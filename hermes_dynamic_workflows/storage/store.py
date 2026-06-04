@@ -9,6 +9,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import gettempdir
 from typing import Any
 
 from ..engine.errors import WorkflowParseError
@@ -33,12 +34,18 @@ def utc_now_iso() -> str:
 
 
 def new_run_id() -> str:
-    return f"wf_{uuid.uuid4().hex[:12]}"
+    raw = uuid.uuid4().hex
+    return f"wf_{raw[:8]}-{raw[8:11]}"
+
+
+def new_task_id() -> str:
+    return f"wg{_base36(uuid.uuid4().int)[:7]}"
 
 
 class WorkflowStore:
     def __init__(self, root: Path | None = None):
-        self.root = root or default_store_root()
+        self.layout_root = Path(root).expanduser() if root is not None else default_layout_root()
+        self.root = Path(root).expanduser() if root is not None else default_store_root()
         self.runs_dir = self.root / "runs"
         self.scripts_dir = self.root / "scripts"
         self.workflows_dir = self.root / "workflows"
@@ -54,8 +61,53 @@ class WorkflowStore:
         _validate_run_id(run_id)
         return self.scripts_dir / f"{run_id}.py"
 
+    def session_dir(self, cwd: str | None, session_id: str) -> Path:
+        return self.layout_root / "projects" / sanitize_path(cwd or "") / session_id
+
+    def workflow_scripts_dir(self, cwd: str | None, session_id: str) -> Path:
+        return self.session_dir(cwd, session_id) / "workflows" / "scripts"
+
+    def workflow_script_path(
+        self,
+        cwd: str | None,
+        session_id: str,
+        run_id: str,
+        name: str,
+    ) -> Path:
+        _validate_run_id(run_id)
+        stem = slugify_name(name) or "dynamic-workflow"
+        return self.workflow_scripts_dir(cwd, session_id) / f"{stem}-{run_id}.py"
+
+    def transcript_dir(self, cwd: str | None, session_id: str, run_id: str) -> Path:
+        _validate_run_id(run_id)
+        return self.session_dir(cwd, session_id) / "subagents" / "workflows" / run_id
+
+    def task_output_path(self, cwd: str | None, session_id: str, task_id: str) -> Path:
+        return (
+            Path(os.getenv("HERMES_DYNAMIC_WORKFLOWS_TMPDIR") or gettempdir())
+            / f"hermes-{_uid()}"
+            / sanitize_path(cwd or "")
+            / session_id
+            / "tasks"
+            / f"{sanitize_filename(task_id)}.output"
+        )
+
     def save_script(self, run_id: str, script: str) -> Path:
         path = self.script_path(run_id)
+        path.write_text(script, encoding="utf-8")
+        return path
+
+    def save_workflow_script(
+        self,
+        *,
+        cwd: str | None,
+        session_id: str,
+        run_id: str,
+        name: str,
+        script: str,
+    ) -> Path:
+        path = self.workflow_script_path(cwd, session_id, run_id, name)
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(script, encoding="utf-8")
         return path
 
@@ -116,6 +168,7 @@ def resolve_workflow_source(
             script=path.read_text(encoding="utf-8"),
             source_type="scriptPath",
             source_ref=str(path),
+            saved_script_path=str(path),
         )
 
     if name:
@@ -126,6 +179,7 @@ def resolve_workflow_source(
             script=path.read_text(encoding="utf-8"),
             source_type="name",
             source_ref=str(name),
+            saved_script_path=str(path),
         )
 
     if isinstance(script, str) and script.strip():
@@ -148,6 +202,57 @@ def default_store_root() -> Path:
         return Path(get_hermes_home()) / "dynamic-workflows"
     except Exception:
         return Path.home() / ".hermes" / "dynamic-workflows"
+
+
+def default_layout_root() -> Path:
+    override = os.getenv("HERMES_DYNAMIC_WORKFLOWS_HOME")
+    if override:
+        return Path(override).expanduser()
+    try:
+        from hermes_constants import get_hermes_home
+
+        return Path(get_hermes_home())
+    except Exception:
+        return Path.home() / ".hermes"
+
+
+def sanitize_path(value: str) -> str:
+    """Claude-Code-style project directory key: non-alnum characters become '-'."""
+
+    raw = str(value or "").strip() or "unknown-cwd"
+    sanitized = re.sub(r"[^a-zA-Z0-9]", "-", raw)
+    if len(sanitized) <= 180:
+        return sanitized
+    suffix = uuid.uuid5(uuid.NAMESPACE_URL, raw).hex[:10]
+    return f"{sanitized[:180]}-{suffix}"
+
+
+def slugify_name(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
+    return slug[:80].strip("-")
+
+
+def sanitize_filename(value: str) -> str:
+    raw = str(value or "").strip() or "workflow"
+    clean = re.sub(r"[^a-zA-Z0-9_.-]", "-", raw).strip(".-")
+    return clean[:160] or "workflow"
+
+
+def _uid() -> str:
+    try:
+        return str(os.getuid())
+    except Exception:
+        return "user"
+
+
+def _base36(value: int) -> str:
+    alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+    chars: list[str] = []
+    while value:
+        value, rem = divmod(value, 36)
+        chars.append(alphabet[rem])
+    return "".join(reversed(chars)) or "0"
 
 
 def _validate_run_id(run_id: str) -> None:
