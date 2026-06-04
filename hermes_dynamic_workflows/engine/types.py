@@ -30,6 +30,7 @@ class AgentRecord:
     tokens: int = 0
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    attempts: int = 0
     structured: dict[str, Any] = field(default_factory=dict)
 
     def snapshot(self) -> dict[str, Any]:
@@ -51,6 +52,7 @@ class AgentRecord:
             "tokens": self.tokens,
             "cache_read_tokens": self.cache_read_tokens,
             "cache_write_tokens": self.cache_write_tokens,
+            "attempts": self.attempts,
             "structured": dict(self.structured),
         }
 

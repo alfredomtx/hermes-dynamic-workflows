@@ -264,11 +264,11 @@ class WorkflowRunManager:
                     token_budget_total=token_budget,
                 ),
             )
+            snapshot = result.state.snapshot()
             if managed.stop_event.is_set():
                 status = "stopped"
             else:
-                status = "completed"
-            snapshot = result.state.snapshot()
+                status = _derive_run_status(snapshot)
             self._update(
                 managed,
                 status=status,
@@ -309,6 +309,18 @@ def _content_from_value(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+
+
+def _derive_run_status(snapshot: dict[str, Any]) -> str:
+    """A run that finished but where every agent errored is 'failed', not
+    'completed'. Partial failures stay 'completed' (surfaced via the error
+    count in the display)."""
+    totals = snapshot.get("totals") or {}
+    agents = int(totals.get("agents") or 0)
+    done = int(totals.get("done") or 0)
+    if agents > 0 and done == 0:
+        return "failed"
+    return "completed"
 
 
 def _as_positive_int(value: Any) -> int | None:

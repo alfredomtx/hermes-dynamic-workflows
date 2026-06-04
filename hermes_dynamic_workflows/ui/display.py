@@ -43,9 +43,11 @@ def render_runs_list(runs: list[dict[str, Any]]) -> str:
         name = meta.get("name") or run.get("source", {}).get("ref") or "workflow"
         marker = ">" if index == 1 and run.get("status") in {"queued", "running", "stopping"} else " "
         totals = _totals(snapshot)
+        errors = totals.get("errors") or 0
+        error_note = f" . {errors} err" if errors else ""
         lines.append(
             f"{marker} {status_icon(run.get('status'))} {name}  "
-            f"{totals['agents']} agents . {_format_tokens(totals['tokens'])} tok . "
+            f"{totals['agents']} agents . {_format_tokens(totals['tokens'])} tok{error_note} . "
             f"{_format_duration(_duration(run, snapshot))} . {run.get('runId')}"
         )
     lines.extend(
@@ -135,6 +137,8 @@ def render_agent_detail(run: dict[str, Any], selector: str) -> str:
         stats.append(f"{_format_tokens(agent.get('cache_write_tokens'))} cache write")
     if agent.get("tool_calls"):
         stats.append(f"{agent.get('tool_calls')} tool calls")
+    if int(agent.get("attempts") or 0) > 1:
+        stats.append(f"{agent.get('attempts')} attempts")
     if stats:
         lines.append("Stats: " + " . ".join(stats))
     structured = agent.get("structured")
@@ -204,6 +208,7 @@ def status_icon(status: Any) -> str:
         "completed": "+",
         "done": "+",
         "error": "!",
+        "failed": "!",
         "stopped": "x",
         "skipped": "-",
     }.get(str(status or ""), "?")

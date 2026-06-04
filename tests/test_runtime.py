@@ -50,6 +50,18 @@ class ResponseFormatFallbackRunner(ChildAgentRunner):
         return '{"ok": true}'
 
 
+class FlakyRunner(ChildAgentRunner):
+    def __init__(self, fail_times: int):
+        self.calls = 0
+        self.fail_times = fail_times
+
+    def run(self, request: ChildAgentRequest):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise RuntimeError("transient boom")
+        return f"ok:{request.label}"
+
+
 class RuntimeTests(unittest.TestCase):
     def test_runs_workflow_function(self):
         script = """
@@ -155,6 +167,39 @@ def workflow():
         self.assertEqual(agent["structured"]["status"], "valid")
         self.assertEqual(agent["structured"]["mode"], "prompt")
         self.assertIn("response_format_error", agent["structured"])
+
+    def test_agent_retries_until_success(self):
+        script = """
+meta = {"name": "retry-ok"}
+
+def workflow():
+    return agent("go", {"label": "r", "retries": 2})
+"""
+        runner = FlakyRunner(fail_times=2)
+        result = run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+
+        self.assertEqual(result.value, "ok:r")
+        self.assertEqual(runner.calls, 3)  # 1 + 2 retries
+        agent = result.state.snapshot()["agents"][0]
+        self.assertEqual(agent["status"], "done")
+        self.assertEqual(agent["attempts"], 3)
+
+    def test_agent_retries_exhausted_returns_none(self):
+        script = """
+meta = {"name": "retry-fail"}
+
+def workflow():
+    return agent("go", {"label": "r", "retries": 1})
+"""
+        runner = FlakyRunner(fail_times=5)
+        result = run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+
+        self.assertIsNone(result.value)
+        self.assertEqual(runner.calls, 2)  # 1 + 1 retry, then give up
+        agent = result.state.snapshot()["agents"][0]
+        self.assertEqual(agent["status"], "error")
+        self.assertEqual(agent["attempts"], 2)
+        self.assertIn("after 2 attempts", agent["error"])
 
     def test_requires_agent_call(self):
         script = """

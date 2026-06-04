@@ -35,6 +35,18 @@ class BudgetRunner(ChildAgentRunner):
         return ChildAgentResult(content=request.label, metadata={"tokens": self.tokens})
 
 
+class FailingRunner(ChildAgentRunner):
+    def run(self, request: ChildAgentRequest):
+        raise RuntimeError("always fails")
+
+
+class HalfFailingRunner(ChildAgentRunner):
+    def run(self, request: ChildAgentRequest):
+        if request.label == "a":
+            raise RuntimeError("boom")
+        return f"ok:{request.label}"
+
+
 class CountingRunner(ChildAgentRunner):
     calls = 0
 
@@ -230,6 +242,54 @@ def workflow():
         # hard ceiling and the run errors.
         self.assertEqual(final["status"], "error")
         self.assertIn("budget", (final["error"] or "").lower())
+
+    def test_all_agents_failed_marks_run_failed(self):
+        script = """
+meta = {"name": "all-fail"}
+
+def workflow():
+    return parallel([
+        lambda: agent("a", {"label": "a"}),
+        lambda: agent("b", {"label": "b"}),
+    ])
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(
+                store=WorkflowStore(Path(tmp)), config=PluginConfig(concurrency=2)
+            )
+            with patch(
+                "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                return_value=FailingRunner(),
+            ):
+                rec = manager.start_from_params({"script": script}, cwd=tmp)
+                final = manager.wait(rec["runId"], timeout=3)
+
+        self.assertEqual(final["status"], "failed")
+        self.assertEqual(final["result"], [None, None])
+
+    def test_partial_failure_stays_completed(self):
+        script = """
+meta = {"name": "partial"}
+
+def workflow():
+    return parallel([
+        lambda: agent("a", {"label": "a"}),
+        lambda: agent("b", {"label": "b"}),
+    ])
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(
+                store=WorkflowStore(Path(tmp)), config=PluginConfig(concurrency=2)
+            )
+            with patch(
+                "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                return_value=HalfFailingRunner(),
+            ):
+                rec = manager.start_from_params({"script": script}, cwd=tmp)
+                final = manager.wait(rec["runId"], timeout=3)
+
+        self.assertEqual(final["status"], "completed")
+        self.assertEqual(final["result"], [None, "ok:b"])
 
 
 if __name__ == "__main__":

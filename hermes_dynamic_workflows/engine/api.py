@@ -18,7 +18,7 @@ from .structured import (
 )
 from .structured_tool import build_tool_schema_instruction
 from ..ui.display import preview
-from .errors import WorkflowRuntimeError
+from .errors import WorkflowRuntimeError, WorkflowStopped, WorkflowTimeout
 from .types import AgentRecord, ChildAgentRequest, ChildAgentResult, WorkflowFrame
 
 
@@ -163,42 +163,70 @@ class WorkflowAPI:
                 "repaired": False,
             }
 
+        retries = _as_retries(opts.get("retries"))
+        max_attempts = 1 + retries
         record.status = "running"
         record.started_at = monotonic()
         self._notify()
-        try:
-            with self.context.agent_slot():
-                raw_result = self._run_child(request, record)
-            metadata = raw_result.metadata if isinstance(raw_result, ChildAgentResult) else {}
-            result = raw_result.content if isinstance(raw_result, ChildAgentResult) else raw_result
-            _apply_child_metadata(record, metadata)
-            self.context.record_tokens(record.tokens)
-            if schema:
-                if isinstance(metadata, dict) and metadata.get("structured_captured"):
-                    result = metadata.get("structured_result")
-                    record.structured.update(
-                        {
-                            "status": "valid",
-                            "mode": "tool",
-                            "attempts": int(metadata.get("structured_attempts") or 1),
-                            "error": "",
-                        }
-                    )
-                else:
-                    result = self._parse_or_repair_structured(result, schema, record, request)
-            record.status = "done"
-            record.result_preview = preview(result, 180)
-            self.resume_cache.put(fingerprint, result)
-            return result
-        except Exception as exc:
-            record.status = "error"
-            record.error = f"{type(exc).__name__}: {exc}"
-            with self._lock:
-                self.frame.errors.append(f"{label}: {record.error}")
-            return None
-        finally:
-            record.ended_at = monotonic()
-            self._notify()
+
+        accumulated_tokens = 0
+        for attempt in range(max_attempts):
+            try:
+                with self.context.agent_slot():
+                    raw_result = self._run_child(request, record)
+                metadata = raw_result.metadata if isinstance(raw_result, ChildAgentResult) else {}
+                result = raw_result.content if isinstance(raw_result, ChildAgentResult) else raw_result
+                _apply_child_metadata(record, metadata)
+                # Count every attempt's tokens toward the budget; record.tokens
+                # reports the run total across attempts.
+                self.context.record_tokens(record.tokens)
+                accumulated_tokens += record.tokens
+                if schema:
+                    if isinstance(metadata, dict) and metadata.get("structured_captured"):
+                        result = metadata.get("structured_result")
+                        record.structured.update(
+                            {
+                                "status": "valid",
+                                "mode": "tool",
+                                "attempts": int(metadata.get("structured_attempts") or 1),
+                                "error": "",
+                            }
+                        )
+                    else:
+                        result = self._parse_or_repair_structured(result, schema, record, request)
+                record.status = "done"
+                record.attempts = attempt + 1
+                record.tokens = accumulated_tokens
+                record.result_preview = preview(result, 180)
+                self.resume_cache.put(fingerprint, result)
+                return result
+            except WorkflowStopped:
+                raise  # a stop is not a child failure — never retry or swallow it
+            except Exception as exc:
+                record.attempts = attempt + 1
+                # Don't retry timeouts (would multiply long waits); retry other
+                # failures while attempts remain.
+                retryable = not isinstance(exc, WorkflowTimeout)
+                if retryable and attempt + 1 < max_attempts:
+                    record.status = "retrying"
+                    with self._lock:
+                        self.frame.logs.append(
+                            f"{label}: attempt {attempt + 1} failed "
+                            f"({type(exc).__name__}: {exc}); retrying"
+                        )
+                    self._notify()
+                    continue
+                record.status = "error"
+                record.tokens = accumulated_tokens
+                suffix = f" (after {attempt + 1} attempts)" if max_attempts > 1 else ""
+                record.error = f"{type(exc).__name__}: {exc}{suffix}"
+                with self._lock:
+                    self.frame.errors.append(f"{label}: {record.error}")
+                return None
+            finally:
+                record.ended_at = monotonic()
+                self._notify()
+        return None
 
     def _run_child(self, request: ChildAgentRequest, record: AgentRecord) -> Any:
         try:
@@ -471,6 +499,22 @@ def _as_timeout(value: Any) -> float | None:
         return max(1.0, float(value))
     except (TypeError, ValueError):
         raise WorkflowRuntimeError("timeout_seconds must be a number") from None
+
+
+def _as_retries(value: Any) -> int:
+    """Number of extra attempts after the first failure (0 = no retry).
+
+    Capped at 5 to bound cost. This is leaf-level retry on top of Hermes'
+    native per-API-call retry, for when a whole child gives up. Not part of the
+    cache fingerprint — it is an execution policy, not task identity.
+    """
+    if value in (None, "", False):
+        return 0
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise WorkflowRuntimeError("retries must be a non-negative integer") from None
+    return max(0, min(parsed, 5))
 
 
 def _structured_request_overrides(
