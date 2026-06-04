@@ -35,6 +35,20 @@ class BudgetRunner(ChildAgentRunner):
         return ChildAgentResult(content=request.label, metadata={"tokens": self.tokens})
 
 
+class RecordingCtx:
+    """Fake PluginContext capturing inject_message calls (CLI notification)."""
+
+    def __init__(self, fail: bool = False):
+        self.messages: list[str] = []
+        self.fail = fail
+
+    def inject_message(self, content: str, role: str = "user") -> bool:
+        if self.fail:
+            raise RuntimeError("inject failed")
+        self.messages.append(content)
+        return True
+
+
 class FailingRunner(ChildAgentRunner):
     def run(self, request: ChildAgentRequest):
         raise RuntimeError("always fails")
@@ -290,6 +304,74 @@ def workflow():
 
         self.assertEqual(final["status"], "completed")
         self.assertEqual(final["result"], [None, "ok:b"])
+
+    def test_completion_injects_task_notification(self):
+        script = """
+meta = {"name": "notify-me"}
+
+def workflow():
+    return agent("do it", {"label": "worker"})
+"""
+        ctx = RecordingCtx()
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig())
+            with patch(
+                "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                return_value=CountingRunner(),
+            ):
+                rec = manager.start_from_params({"script": script}, cwd=tmp, plugin_context=ctx)
+                final = manager.wait(rec["runId"], timeout=2)
+
+        self.assertEqual(final["status"], "completed")
+        self.assertEqual(len(ctx.messages), 1)
+        msg = ctx.messages[0]
+        self.assertIn("<task-notification>", msg)
+        self.assertIn(f"<task-id>{rec['runId']}</task-id>", msg)
+        self.assertIn("<status>completed</status>", msg)
+        self.assertIn('notify-me', msg)
+        self.assertIn(f"/workflows {rec['runId']}", msg)
+
+    def test_completion_notification_disabled(self):
+        script = """
+meta = {"name": "quiet"}
+
+def workflow():
+    return agent("do it", {"label": "worker"})
+"""
+        ctx = RecordingCtx()
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(
+                store=WorkflowStore(Path(tmp)),
+                config=PluginConfig(notify_on_complete=False),
+            )
+            with patch(
+                "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                return_value=CountingRunner(),
+            ):
+                rec = manager.start_from_params({"script": script}, cwd=tmp, plugin_context=ctx)
+                manager.wait(rec["runId"], timeout=2)
+
+        self.assertEqual(ctx.messages, [])
+
+    def test_completion_notification_failure_does_not_break_run(self):
+        script = """
+meta = {"name": "notify-fail"}
+
+def workflow():
+    return agent("do it", {"label": "worker"})
+"""
+        ctx = RecordingCtx(fail=True)  # inject_message raises (e.g. gateway/edge)
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig())
+            with patch(
+                "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                return_value=CountingRunner(),
+            ):
+                rec = manager.start_from_params({"script": script}, cwd=tmp, plugin_context=ctx)
+                final = manager.wait(rec["runId"], timeout=2)
+
+        self.assertEqual(final["status"], "completed")
+        self.assertEqual(final["result"], "1:worker")
 
 
 if __name__ == "__main__":

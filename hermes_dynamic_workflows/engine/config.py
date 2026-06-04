@@ -53,6 +53,12 @@ class PluginConfig:
     #       parsing the final message if the tool is never called.
     #   "response_format" -> provider-native json_schema response_format override.
     #   "prompt" -> instruction only, then parse the final message.
+    # On run completion, inject a <task-notification> into the conversation (via
+    # ctx.inject_message) so the model can deliver the result without the user
+    # polling /workflows. CLI-only (no-op in gateway). Result is truncated to
+    # notify_result_preview_chars to protect context.
+    notify_on_complete: bool = True
+    notify_result_preview_chars: int = 2000
     structured_output_mode: str = "auto"
     structured_retries: int = 1
     structured_repair_with_llm: bool = True
@@ -200,6 +206,16 @@ def load_config() -> PluginConfig:
             ),
             default.child_approval_policy,
             {"deny", "smart", "approve"},
+        ),
+        notify_on_complete=_as_bool(
+            os.getenv("HERMES_DYNAMIC_WORKFLOWS_NOTIFY_ON_COMPLETE", raw.get("notify_on_complete")),
+            default.notify_on_complete,
+        ),
+        notify_result_preview_chars=_as_int(
+            raw.get("notify_result_preview_chars"),
+            default.notify_result_preview_chars,
+            minimum=0,
+            maximum=20000,
         ),
         structured_output_mode=_as_mode(
             raw.get("structured_output_mode"),

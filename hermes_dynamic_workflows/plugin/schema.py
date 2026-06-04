@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-_DESCRIPTION = """Execute a Python workflow script that orchestrates multiple Hermes child agents deterministically. The tool starts a background run and returns immediately with a runId and scriptPath. Use /workflows to list runs, /workflows <runId> to inspect progress/results, and /workflow-stop <runId> to stop a run.
+_DESCRIPTION = """Execute a Python workflow script that orchestrates multiple Hermes child agents deterministically. The tool starts a background run and returns immediately with a runId and scriptPath — it is asynchronous. When the run finishes, a <task-notification> carrying the status and (truncated) result is delivered back into the conversation, so you can report the outcome without polling; you can also use /workflows to list runs, /workflows <runId> to inspect progress/results, and /workflow-stop <runId> to stop a run.
 
 A workflow structures work across many agents: to be comprehensive (decompose and cover in parallel), to be confident (independent perspectives and adversarial checks before committing), or to take on scale one context cannot hold (audits, broad sweeps, large reviews). The script encodes what fans out, what verifies, and what synthesizes.
 

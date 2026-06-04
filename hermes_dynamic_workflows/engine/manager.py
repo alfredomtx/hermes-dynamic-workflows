@@ -287,6 +287,8 @@ class WorkflowRunManager:
                 error=f"{type(exc).__name__}: {exc}",
                 agentCache=resume_cache.current,
             )
+        finally:
+            _notify_completion(plugin_context, managed.record, config)
 
     def _update_state(self, managed: ManagedRun, state) -> None:
         snapshot = state.snapshot()
@@ -309,6 +311,76 @@ def _content_from_value(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+
+
+def _notify_completion(plugin_context: Any, record: dict[str, Any], config: PluginConfig) -> None:
+    """On terminal state, inject a Claude-Code-style <task-notification> into the
+    conversation so the model can deliver the result without the user polling
+    /workflows. Best-effort and CLI-only: ctx.inject_message returns False in
+    gateway mode; any failure is swallowed so it never affects the run.
+    """
+    if not config.notify_on_complete or plugin_context is None:
+        return
+    inject = getattr(plugin_context, "inject_message", None)
+    if not callable(inject):
+        return
+    try:
+        inject(_render_task_notification(record, config.notify_result_preview_chars))
+    except Exception:
+        pass
+
+
+def _render_task_notification(record: dict[str, Any], preview_chars: int) -> str:
+    """Mirror Claude Code's LocalAgentTask task-notification block, adapted to a
+    workflow run (tool_uses -> agents, plus errors)."""
+    run_id = record.get("runId") or ""
+    status = str(record.get("status") or "completed")
+    snapshot = record.get("workflow") or {}
+    meta = snapshot.get("meta") or {}
+    name = meta.get("name") or "workflow"
+    totals = snapshot.get("totals") or {}
+
+    if record.get("error"):
+        summary = f'Workflow "{name}" {status}: {record["error"]}'
+    elif status == "completed":
+        summary = f'Workflow "{name}" completed'
+    elif status == "failed":
+        summary = f'Workflow "{name}" failed: all agents errored'
+    elif status == "stopped":
+        summary = f'Workflow "{name}" was stopped'
+    else:
+        summary = f'Workflow "{name}" {status}'
+
+    result = record.get("result")
+    result_text = result if isinstance(result, str) else _content_from_value(result)
+    result_text = result_text or ""
+    truncated = len(result_text) > preview_chars > 0
+    if truncated:
+        result_text = result_text[:preview_chars] + "…"
+
+    done = int(totals.get("done") or 0)
+    agents = int(totals.get("agents") or 0)
+    errors = int(totals.get("errors") or 0)
+    tokens = int(totals.get("tokens") or 0)
+    duration_ms = int(float(snapshot.get("duration_seconds") or 0) * 1000)
+
+    lines = [
+        "<task-notification>",
+        f"<task-id>{run_id}</task-id>",
+        f"<status>{status}</status>",
+        f"<summary>{summary}</summary>",
+    ]
+    if result_text:
+        lines.append(f"<result>{result_text}</result>")
+    lines.append(
+        f"<usage><total_tokens>{tokens}</total_tokens>"
+        f"<agents>{done}/{agents}</agents><errors>{errors}</errors>"
+        f"<duration_ms>{duration_ms}</duration_ms></usage>"
+    )
+    lines.append("</task-notification>")
+    tail = f"Use /workflows {run_id} for full details"
+    tail += " (result truncated above)." if truncated else "."
+    return "\n".join(lines) + "\n" + tail
 
 
 def _derive_run_status(snapshot: dict[str, Any]) -> str:
