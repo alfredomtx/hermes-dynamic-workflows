@@ -23,6 +23,8 @@ from ..engine.structured_tool import (
 )
 from ..engine.types import ChildAgentRequest, ChildAgentResult, ChildAgentRunner
 
+logger = logging.getLogger(__name__)
+
 
 class HermesChildAgentRunner(ChildAgentRunner):
     """Create standalone Hermes AIAgent children without native delegation."""
@@ -193,16 +195,34 @@ class HermesChildAgentRunner(ChildAgentRunner):
         toolsets: list[str],
     ) -> ChildAgentResult:
         timeout = request.timeout_seconds or self.config.child_timeout_seconds
+        approval_callback = _make_child_approval_callback(self.config.child_approval_policy)
+
+        def _init_worker() -> None:
+            # Install the approval callback on the worker thread itself, so the
+            # child's terminal tool has it when a flagged command would prompt.
+            # Mirrors tools/delegate_tool.py's ThreadPoolExecutor(initializer=...)
+            # pattern (see GHSA-qg5c-hvr5-hjgr).
+            if approval_callback is None:
+                return
+            try:
+                from tools.terminal_tool import set_approval_callback
+
+                set_approval_callback(approval_callback)
+            except Exception:
+                pass
 
         def _run() -> dict[str, Any]:
-            _install_noninteractive_terminal_approval()
             _register_task_cwd(lease.task_id, lease.cwd)
             return child.run_conversation(
                 user_message=request.prompt,
                 task_id=lease.task_id,
             )
 
-        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dw-child-agent")
+        executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="dw-child-agent",
+            initializer=_init_worker,
+        )
         with self._active_lock:
             self._active_children.append(child)
         future = executor.submit(_run)
@@ -333,17 +353,61 @@ def _child_clarify_callback(question: str, choices=None) -> str:
     )
 
 
-def _install_noninteractive_terminal_approval() -> None:
-    try:
-        from tools.terminal_tool import set_approval_callback
+def _make_child_approval_callback(policy: str):
+    """Build the non-interactive approval callback for child worker threads.
 
-        set_approval_callback(_workflow_child_auto_deny)
-    except Exception:
-        pass
+    Child agents run every command through Hermes' approval engine
+    (tools/approval.py): hardline blocks, the permanent allowlist, yolo, and
+    smart mode all still apply upstream. This callback only decides what to do
+    when a *flagged* command would otherwise prompt a human who isn't present.
 
+    Policy comes from the plugin's own config key
+    ``dynamic_workflows.child_approval_policy`` (never delegation.*), so a
+    workflow's blast radius is controlled independently of native delegation:
 
-def _workflow_child_auto_deny(command: str, description: str, **kwargs) -> str:
-    return "deny"
+      deny    -> refuse flagged commands (safe default)
+      approve -> allow flagged commands (hardline is still blocked upstream)
+      smart   -> defer to Hermes' _smart_approve auxiliary-LLM guardian;
+                 'escalate' (uncertain) resolves to deny since no human is present
+    """
+    clean = (policy or "deny").strip().lower()
+
+    if clean == "approve":
+        def _approve(command: str, description: str, **_: Any) -> str:
+            logger.warning(
+                "workflow child auto-approved flagged command (policy=approve): %s (%s)",
+                command, description,
+            )
+            return "once"
+        return _approve
+
+    if clean == "smart":
+        def _smart(command: str, description: str, **_: Any) -> str:
+            try:
+                from tools.approval import _smart_approve
+            except Exception:
+                return "deny"
+            try:
+                verdict = _smart_approve(command, description)
+            except Exception:
+                return "deny"
+            if verdict == "approve":
+                logger.warning(
+                    "workflow child smart-approved flagged command: %s (%s)",
+                    command, description,
+                )
+                return "once"
+            # 'deny' and 'escalate' both refuse: no human is present to escalate to.
+            return "deny"
+        return _smart
+
+    def _deny(command: str, description: str, **_: Any) -> str:
+        logger.warning(
+            "workflow child denied flagged command (policy=deny): %s (%s)",
+            command, description,
+        )
+        return "deny"
+    return _deny
 
 
 def _register_task_cwd(task_id: str, cwd: str) -> None:

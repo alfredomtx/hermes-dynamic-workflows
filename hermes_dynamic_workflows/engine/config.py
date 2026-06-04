@@ -34,6 +34,14 @@ class PluginConfig:
     allow_model_override: bool = False
     allow_provider_override: bool = False
     keep_worktrees: bool = False
+    # What a child agent does when Hermes' approval engine flags a command and
+    # no human is present to approve it. The engine itself (hardline blocks,
+    # permanent allowlist, yolo, smart mode) still runs upstream regardless;
+    # this only decides the otherwise-would-prompt case.
+    #   deny    -> refuse flagged commands (safe default)
+    #   approve -> allow flagged commands (hardline still blocked upstream)
+    #   smart   -> defer to Hermes' _smart_approve auxiliary-LLM guardian
+    child_approval_policy: str = "deny"
     # How agent(schema=...) constrains child output:
     #   "auto"/"tool" -> child calls workflow_submit_structured_output, validated
     #       at the tool layer with model retry (Claude-Code-style); falls back to
@@ -179,6 +187,14 @@ def load_config() -> PluginConfig:
         keep_worktrees=_as_bool(
             os.getenv("HERMES_DYNAMIC_WORKFLOWS_KEEP_WORKTREES", raw.get("keep_worktrees")),
             default.keep_worktrees,
+        ),
+        child_approval_policy=_as_mode(
+            os.getenv(
+                "HERMES_DYNAMIC_WORKFLOWS_CHILD_APPROVAL_POLICY",
+                raw.get("child_approval_policy"),
+            ),
+            default.child_approval_policy,
+            {"deny", "smart", "approve"},
         ),
         structured_output_mode=_as_mode(
             raw.get("structured_output_mode"),
