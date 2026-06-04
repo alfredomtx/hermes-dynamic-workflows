@@ -9,6 +9,7 @@ from pathlib import Path
 from hermes_dynamic_workflows.agents.presets import AgentTypeSpec, resolve_agent_type
 from hermes_dynamic_workflows.agents.runner import (
     build_child_system_prompt,
+    build_child_task_message,
     _child_failure_message,
     _make_child_approval_callback,
     _resolve_child_toolsets,
@@ -33,30 +34,43 @@ class ChildAgentTests(unittest.TestCase):
             ["web"],
         )
 
-    def test_prompt_includes_agent_type_instructions(self):
-        request = ChildAgentRequest(
-            id=1,
-            prompt="do it",
-            label="worker",
-            phase="Review",
-            toolsets=[],
-            agent_type="researcher",
-            isolation="worktree",
-            cwd="/tmp/project",
-        )
+    def test_system_prompt_includes_agent_type_instructions(self):
         prompt = build_child_system_prompt(
-            request,
-            workspace="/tmp/project/.worktrees/hermes-wf-worker",
-            agent_type=AgentTypeSpec(
+            AgentTypeSpec(
                 name="researcher",
                 instructions="Search broadly, cite sources, and summarize.",
                 source="test",
-            ),
+            )
         )
-
         self.assertIn("Agent type: researcher", prompt)
         self.assertIn("Search broadly", prompt)
-        self.assertIn("isolated git worktree", prompt)
+
+    def test_system_prompt_excludes_per_task_data_for_cache_sharing(self):
+        # The system prompt must depend only on agent_type (not label/phase/
+        # workspace), so the [tools + system] prefix is byte-identical across a
+        # fan-out and can be cache-shared on eligible models.
+        spec = AgentTypeSpec(name="researcher", instructions="Search.", source="test")
+        prompt = build_child_system_prompt(spec)
+        for per_task in ("alpha", "Review", "Workspace:", "worktree"):
+            self.assertNotIn(per_task, prompt)
+        # No agent type -> identical across all children.
+        self.assertEqual(build_child_system_prompt(None), build_child_system_prompt(None))
+
+    def test_task_message_carries_per_task_context(self):
+        request = ChildAgentRequest(
+            id=1,
+            prompt="do the thing",
+            label="worker",
+            phase="Review",
+            toolsets=[],
+            isolation="worktree",
+        )
+        msg = build_child_task_message(request, workspace="/tmp/project/.worktrees/wf")
+        self.assertIn("Workspace: /tmp/project/.worktrees/wf", msg)
+        self.assertIn("Task label: worker", msg)
+        self.assertIn("Workflow phase: Review", msg)
+        self.assertIn("isolated git worktree", msg)
+        self.assertIn("do the thing", msg)
 
     def test_resolves_project_agent_type_markdown(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -157,7 +157,7 @@ class HermesChildAgentRunner(ChildAgentRunner):
         except Exception as exc:
             raise ChildAgentError(f"could not import Hermes AIAgent: {exc}") from exc
 
-        child_prompt = build_child_system_prompt(request, workspace=lease.cwd, agent_type=agent_type)
+        child_prompt = build_child_system_prompt(agent_type)
         try:
             session_db = _create_session_db()
         except Exception:
@@ -214,7 +214,7 @@ class HermesChildAgentRunner(ChildAgentRunner):
         def _run() -> dict[str, Any]:
             _register_task_cwd(lease.task_id, lease.cwd)
             return child.run_conversation(
-                user_message=request.prompt,
+                user_message=build_child_task_message(request, workspace=lease.cwd),
                 task_id=lease.task_id,
             )
 
@@ -264,24 +264,23 @@ class HermesChildAgentRunner(ChildAgentRunner):
                 pass
 
 
-def build_child_system_prompt(
-    request: ChildAgentRequest,
-    *,
-    workspace: str,
-    agent_type: AgentTypeSpec | None = None,
-) -> str:
+def build_child_system_prompt(agent_type: AgentTypeSpec | None = None) -> str:
+    """Stable, per-task-independent system prompt for a child agent.
+
+    Kept byte-identical across children with the same agent_type so that, on
+    cache-eligible models, the ``[tools + system]`` request prefix is shared and
+    cached across a workflow's fan-out. Hermes' ``system_and_3`` caching places
+    a cache_control breakpoint at the end of the system prompt; if the system
+    prompt carried per-task data (label/phase/workspace) it would vary per child
+    and defeat cross-child reuse of the (identical) tool definitions in front of
+    it. Per-task context lives in the task message instead — see
+    :func:`build_child_task_message`.
+    """
     lines = [
         "You are a focused Hermes child agent spawned by a dynamic workflow.",
         "Work only on the delegated task. Do not ask the user questions.",
         "Use available tools when needed, then return a concise final answer.",
-        f"Workspace: {workspace}",
     ]
-    if request.label:
-        lines.append(f"Task label: {request.label}")
-    if request.phase:
-        lines.append(f"Workflow phase: {request.phase}")
-    if request.isolation == "worktree":
-        lines.append("You are running in an isolated git worktree. Keep all file operations inside the workspace above.")
     if agent_type is not None:
         lines.extend(
             [
@@ -294,6 +293,26 @@ def build_child_system_prompt(
             ]
         )
     return "\n".join(lines)
+
+
+def build_child_task_message(request: ChildAgentRequest, *, workspace: str) -> str:
+    """Per-task context (the variable part) prepended to the child's task.
+
+    This is the child's first user message — the part that legitimately differs
+    per child (workspace, label, phase, worktree note) — kept out of the cached
+    system prefix so it doesn't break cross-child cache reuse.
+    """
+    context = [f"- Workspace: {workspace}"]
+    if request.label:
+        context.append(f"- Task label: {request.label}")
+    if request.phase:
+        context.append(f"- Workflow phase: {request.phase}")
+    if request.isolation == "worktree":
+        context.append(
+            "- You are running in an isolated git worktree; keep all file "
+            "operations inside the workspace above."
+        )
+    return "Task context:\n" + "\n".join(context) + "\n\n" + request.prompt
 
 
 def _apply_agent_type_defaults(
