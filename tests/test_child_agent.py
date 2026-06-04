@@ -9,6 +9,7 @@ from pathlib import Path
 from hermes_dynamic_workflows.agents.presets import AgentTypeSpec, resolve_agent_type
 from hermes_dynamic_workflows.agents.runner import (
     build_child_system_prompt,
+    _child_failure_message,
     _make_child_approval_callback,
     _resolve_child_toolsets,
 )
@@ -82,6 +83,25 @@ Search carefully and return concise notes.
         self.assertEqual(spec.toolsets, ("web", "file"))
         self.assertEqual(spec.isolation, "worktree")
         self.assertIn("Search carefully", spec.instructions)
+
+
+class ChildFailureDetectionTests(unittest.TestCase):
+    def test_error_with_no_content_is_a_failure(self):
+        result = {"final_response": None, "error": "HTTP 400: Model does not exist", "failed": True}
+        self.assertEqual(
+            _child_failure_message(result, ""),
+            "HTTP 400: Model does not exist",
+        )
+
+    def test_error_with_partial_content_is_kept(self):
+        # Partial content despite an error is returned, not dropped.
+        self.assertIsNone(_child_failure_message({"error": "truncated", "final_response": "partial"}, "partial"))
+
+    def test_legitimately_empty_success_is_not_a_failure(self):
+        self.assertIsNone(_child_failure_message({"final_response": "", "completed": True}, ""))
+
+    def test_non_dict_result_is_not_a_failure(self):
+        self.assertIsNone(_child_failure_message("nope", ""))
 
 
 class ChildApprovalPolicyTests(unittest.TestCase):

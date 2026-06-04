@@ -48,11 +48,11 @@ class ResumeCache:
 
 
 def _normalize_previous(raw: Any) -> dict[str, list[Any]]:
-    """Group a stored agentCache into {fingerprint: [results]}.
+    """Load a stored agentCache ({fingerprint: [results]}).
 
-    Accepts the current format ({fingerprint: [results]}) and the legacy
-    sequence-keyed format ({seq: {"fingerprint", "result"}}) so a resume across
-    the format change degrades gracefully instead of crashing.
+    Tolerant of malformed on-disk data (partial/crashed/hand-edited runs):
+    anything that isn't a fingerprint->list entry is ignored, which just yields
+    a cache miss and a benign live re-run rather than a crash.
     """
     grouped: dict[str, list[Any]] = {}
     if not isinstance(raw, dict):
@@ -60,9 +60,6 @@ def _normalize_previous(raw: Any) -> dict[str, list[Any]]:
     for key, value in raw.items():
         if isinstance(value, list):
             grouped.setdefault(str(key), []).extend(value)
-        elif isinstance(value, dict) and "fingerprint" in value:
-            fingerprint = str(value.get("fingerprint"))
-            grouped.setdefault(fingerprint, []).append(value.get("result"))
     return grouped
 
 

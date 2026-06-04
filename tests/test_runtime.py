@@ -289,11 +289,10 @@ class ResumeCacheTests(unittest.TestCase):
         self.assertEqual(run2.get(fp), "r2")
         self.assertTrue(is_cache_miss(run2.get(fp)))
 
-    def test_reads_legacy_sequence_keyed_cache(self):
+    def test_ignores_malformed_cache_without_crashing(self):
         fp = agent_fingerprint("p", {"label": "y"})
-        legacy = {"1": {"fingerprint": fp, "result": "legacy"}}
-        cache = ResumeCache(legacy)
-        self.assertEqual(cache.get(fp), "legacy")
+        # Unexpected shapes (e.g. a crashed/hand-edited run) are ignored -> miss.
+        cache = ResumeCache({fp: {"not": "a list"}, "other": 123})
         self.assertTrue(is_cache_miss(cache.get(fp)))
 
 

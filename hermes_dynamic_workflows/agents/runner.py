@@ -228,9 +228,16 @@ class HermesChildAgentRunner(ChildAgentRunner):
         future = executor.submit(_run)
         result: dict[str, Any] | None = None
         try:
-            result = future.result(timeout=timeout)
-            content = str((result or {}).get("final_response") or "")
-            metadata = _child_metadata(child, result or {}, lease, agent_type, toolsets)
+            result = future.result(timeout=timeout) or {}
+            content = str(result.get("final_response") or "")
+            # A hard child failure (e.g. a non-retryable API error) returns an
+            # "error" string and no usable final_response. Surface it as a real
+            # failure instead of a silent empty "success", so the agent shows as
+            # error in /workflows rather than masking the failure.
+            failure = _child_failure_message(result, content)
+            if failure:
+                raise ChildAgentError(failure)
+            metadata = _child_metadata(child, result, lease, agent_type, toolsets)
             return ChildAgentResult(content=content, metadata=metadata)
         except FuturesTimeoutError as exc:
             try:
@@ -351,6 +358,23 @@ def _child_clarify_callback(question: str, choices=None) -> str:
         "[dynamic workflow child agent: no user is available. "
         "Make the most reasonable assumption and continue.]"
     )
+
+
+def _child_failure_message(result: Any, content: str) -> str | None:
+    """Return an error message when a child result signals a hard failure with
+    no usable content, else None.
+
+    Hermes' conversation loop returns ``{"final_response": None, "error": "..."}``
+    (and completed=False / failed=True) when an API call aborts. Successful
+    turns never set ``error``, so a truthy ``error`` with empty content is an
+    unambiguous failure that should not be reported as an empty success.
+    """
+    if not isinstance(result, dict):
+        return None
+    error_msg = result.get("error")
+    if error_msg and not content:
+        return str(error_msg)
+    return None
 
 
 def _make_child_approval_callback(policy: str):
