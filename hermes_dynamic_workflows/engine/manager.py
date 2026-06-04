@@ -55,6 +55,7 @@ class WorkflowRunManager:
         previous = self.store.load_run(resume_from) if resume_from else None
         resume_cache = ResumeCache.from_run(previous)
         args = params["args"] if "args" in params else None
+        token_budget = _as_positive_int(params.get("token_budget"))
 
         stop_event = threading.Event()
         record = {
@@ -71,6 +72,7 @@ class WorkflowRunManager:
             },
             "resumeFromRunId": resume_from,
             "args": args,
+            "tokenBudget": token_budget,
             "result": None,
             "error": None,
             "display": "",
@@ -85,7 +87,7 @@ class WorkflowRunManager:
 
         thread = threading.Thread(
             target=self._run_thread,
-            args=(managed, source.script, args, config, resume_cache, cwd, plugin_context),
+            args=(managed, source.script, args, config, resume_cache, cwd, plugin_context, token_budget),
             name=f"workflow-{run_id}",
             daemon=True,
         )
@@ -241,6 +243,7 @@ class WorkflowRunManager:
         resume_cache: ResumeCache,
         cwd: str | None,
         plugin_context: Any,
+        token_budget: int | None = None,
     ) -> None:
         try:
             from ..agents.runner import HermesChildAgentRunner
@@ -258,6 +261,7 @@ class WorkflowRunManager:
                     resume_cache=resume_cache,
                     on_update=lambda state: self._update_state(managed, state),
                     plugin_context=plugin_context,
+                    token_budget_total=token_budget,
                 ),
             )
             if managed.stop_event.is_set():
@@ -305,6 +309,17 @@ def _content_from_value(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+
+
+def _as_positive_int(value: Any) -> int | None:
+    """Coerce a per-invocation token_budget to a positive int, or None."""
+    if value in (None, "", False):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 _MANAGER: WorkflowRunManager | None = None

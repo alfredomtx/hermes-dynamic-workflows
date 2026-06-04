@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -9,6 +10,29 @@ from hermes_dynamic_workflows.engine.config import PluginConfig
 from hermes_dynamic_workflows.engine.manager import WorkflowRunManager
 from hermes_dynamic_workflows.engine.types import ChildAgentRequest, ChildAgentResult, ChildAgentRunner
 from hermes_dynamic_workflows.storage.store import WorkflowStore
+
+
+class RecordingRunner(ChildAgentRunner):
+    """Thread-safe runner that records each call's label and returns a stable
+    per-label result, so a resume that reuses cached results makes no new
+    run() calls."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.labels: list[str] = []
+
+    def run(self, request: ChildAgentRequest):
+        with self._lock:
+            self.labels.append(request.label)
+        return f"result:{request.label}"
+
+
+class BudgetRunner(ChildAgentRunner):
+    def __init__(self, tokens: int):
+        self.tokens = tokens
+
+    def run(self, request: ChildAgentRequest):
+        return ChildAgentResult(content=request.label, metadata={"tokens": self.tokens})
 
 
 class CountingRunner(ChildAgentRunner):
@@ -30,6 +54,8 @@ class MetadataRunner(ChildAgentRunner):
                 "isolation": request.isolation or "shared",
                 "model": "test-model",
                 "tokens": 1234,
+                "cache_read_tokens": 2048,
+                "cache_write_tokens": 512,
                 "tool_calls": 5,
             },
         )
@@ -104,6 +130,7 @@ def workflow():
         self.assertIn("meta-agent", detail)
         self.assertIn("test-model", detail)
         self.assertIn("1.2K tok", detail)
+        self.assertIn("2.0K cached read", detail)
         self.assertIn("Saved workflow", saved)
 
     def test_save_named_workflow_writes_reusable_script(self):
@@ -140,6 +167,69 @@ def workflow():
 
             discovered = discover_named_workflows(str(root))
             self.assertIn("repo-audit", discovered)
+
+    def test_resume_reuses_parallel_results(self):
+        # Regression for the content-addressed resume cache: under the old
+        # sequence-keyed cache, parallel()'s non-deterministic reserve order
+        # broke resume after the first parallel block. Fingerprint keying makes
+        # resume order-independent, so the second run reuses all three results
+        # and issues no new child runs.
+        script = """
+meta = {"name": "parallel-resume"}
+
+def workflow():
+    return parallel([
+        lambda: agent("alpha", {"label": "a"}),
+        lambda: agent("beta", {"label": "b"}),
+        lambda: agent("gamma", {"label": "c"}),
+    ])
+"""
+        runner = RecordingRunner()
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(
+                store=WorkflowStore(Path(tmp)), config=PluginConfig(concurrency=3)
+            )
+            with patch(
+                "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                return_value=runner,
+            ):
+                first = manager.start_from_params({"script": script}, cwd=tmp)
+                first_final = manager.wait(first["runId"], timeout=3)
+                self.assertEqual(len(runner.labels), 3)
+                second = manager.start_from_params(
+                    {"script": script, "resumeFromRunId": first["runId"]}, cwd=tmp
+                )
+                second_final = manager.wait(second["runId"], timeout=3)
+
+        self.assertEqual(first_final["status"], "completed")
+        self.assertEqual(second_final["result"], first_final["result"])
+        # No new child runs on resume — all three came from the cache.
+        self.assertEqual(len(runner.labels), 3)
+
+    def test_token_budget_param_gates_run(self):
+        script = """
+meta = {"name": "budget-param"}
+
+def workflow():
+    agent("a", {"label": "a"})
+    return agent("b", {"label": "b"})
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig())
+            with patch(
+                "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                return_value=BudgetRunner(tokens=20),
+            ):
+                record = manager.start_from_params(
+                    {"script": script, "token_budget": 10}, cwd=tmp
+                )
+                final = manager.wait(record["runId"], timeout=2)
+
+        self.assertEqual(record["tokenBudget"], 10)
+        # First agent spends 20 > 10, so the second agent's reservation trips the
+        # hard ceiling and the run errors.
+        self.assertEqual(final["status"], "error")
+        self.assertIn("budget", (final["error"] or "").lower())
 
 
 if __name__ == "__main__":

@@ -28,6 +28,8 @@ class AgentRecord:
     model: str | None = None
     tool_calls: int = 0
     tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
     structured: dict[str, Any] = field(default_factory=dict)
 
     def snapshot(self) -> dict[str, Any]:
@@ -47,6 +49,8 @@ class AgentRecord:
             "model": self.model,
             "tool_calls": self.tool_calls,
             "tokens": self.tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
             "structured": dict(self.structured),
         }
 
@@ -233,6 +237,8 @@ def workflow_totals(snapshot: dict[str, Any]) -> dict[str, int]:
         "errors": 0,
         "tokens": 0,
         "tool_calls": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
     }
     _accumulate_totals(snapshot, totals)
     return totals
@@ -258,6 +264,11 @@ def _accumulate_totals(snapshot: dict[str, Any], totals: dict[str, int]) -> None
             totals["tool_calls"] += int(agent.get("tool_calls") or 0)
         except (TypeError, ValueError):
             pass
+        for cache_key in ("cache_read_tokens", "cache_write_tokens"):
+            try:
+                totals[cache_key] += int(agent.get(cache_key) or 0)
+            except (TypeError, ValueError):
+                pass
     for child in snapshot.get("children") or []:
         if isinstance(child, dict):
             _accumulate_totals(child, totals)

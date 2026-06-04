@@ -458,6 +458,11 @@ def _child_metadata(
         "output_tokens": completion_tokens,
         "reasoning_tokens": reasoning_tokens,
         "tokens": prompt_tokens + completion_tokens + reasoning_tokens,
+        # Hermes auto-enables Anthropic prompt caching for Claude-family models
+        # (agent/prompt_caching.py). Children inherit it, so these counters show
+        # how much each child reused vs wrote to the cache.
+        "cache_read_tokens": _int_attr(child, "session_cache_read_tokens"),
+        "cache_write_tokens": _int_attr(child, "session_cache_write_tokens"),
         "tool_calls": _tool_call_count(child, result),
     }
     return metadata

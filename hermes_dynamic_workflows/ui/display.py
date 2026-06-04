@@ -64,15 +64,20 @@ def render_run_detail(run: dict[str, Any]) -> str:
     name = meta.get("name") or run.get("source", {}).get("ref") or "workflow"
     description = meta.get("description") or ""
     totals = _totals(snapshot)
+    header = (
+        f"{totals['done']}/{totals['agents']} agents . "
+        f"{_format_tokens(totals['tokens'])} tok"
+    )
+    if totals.get("cache_read_tokens"):
+        header += f" ({_format_tokens(totals['cache_read_tokens'])} cached read)"
+    header += (
+        f" . {_format_duration(_duration(run, snapshot))} . "
+        f"{run.get('status')} . {run.get('runId')}"
+    )
     lines = [
         str(name),
         str(description) if description else "",
-        (
-            f"{totals['done']}/{totals['agents']} agents . "
-            f"{_format_tokens(totals['tokens'])} tok . "
-            f"{_format_duration(_duration(run, snapshot))} . "
-            f"{run.get('status')} . {run.get('runId')}"
-        ),
+        header,
         "",
     ]
     _render_frame_detail(lines, snapshot, level=0)
@@ -124,6 +129,10 @@ def render_agent_detail(run: dict[str, Any], selector: str) -> str:
     stats = []
     if agent.get("tokens"):
         stats.append(f"{_format_tokens(agent.get('tokens'))} tok")
+    if agent.get("cache_read_tokens"):
+        stats.append(f"{_format_tokens(agent.get('cache_read_tokens'))} cached read")
+    if agent.get("cache_write_tokens"):
+        stats.append(f"{_format_tokens(agent.get('cache_write_tokens'))} cache write")
     if agent.get("tool_calls"):
         stats.append(f"{agent.get('tool_calls')} tool calls")
     if stats:
@@ -362,6 +371,8 @@ def _totals(snapshot: dict[str, Any]) -> dict[str, int]:
             "errors": _as_int(provided.get("errors")),
             "tokens": _as_int(provided.get("tokens")),
             "tool_calls": _as_int(provided.get("tool_calls")),
+            "cache_read_tokens": _as_int(provided.get("cache_read_tokens")),
+            "cache_write_tokens": _as_int(provided.get("cache_write_tokens")),
         }
     agents = _all_agents(snapshot)
     return {
@@ -371,6 +382,8 @@ def _totals(snapshot: dict[str, Any]) -> dict[str, int]:
         "errors": len(_all_errors(snapshot)) + sum(1 for agent in agents if agent.get("status") == "error"),
         "tokens": sum(_as_int(agent.get("tokens")) for agent in agents),
         "tool_calls": sum(_as_int(agent.get("tool_calls")) for agent in agents),
+        "cache_read_tokens": sum(_as_int(agent.get("cache_read_tokens")) for agent in agents),
+        "cache_write_tokens": sum(_as_int(agent.get("cache_write_tokens")) for agent in agents),
     }
 
 

@@ -121,7 +121,7 @@ class WorkflowAPI:
                 "isolation": isolation,
             },
         )
-        cached = self.resume_cache.get(agent_id, fingerprint)
+        cached = self.resume_cache.get(fingerprint)
         if not is_cache_miss(cached):
             record.status = "done"
             record.result_preview = f"(cached) {preview(cached, 170)}"
@@ -129,7 +129,7 @@ class WorkflowAPI:
                 record.structured = {"status": "cached", "mode": structured_mode, "attempts": 0}
             record.started_at = monotonic()
             record.ended_at = record.started_at
-            self.resume_cache.put(agent_id, fingerprint, cached)
+            self.resume_cache.put(fingerprint, cached)
             self._notify()
             return cached
 
@@ -188,7 +188,7 @@ class WorkflowAPI:
                     result = self._parse_or_repair_structured(result, schema, record, request)
             record.status = "done"
             record.result_preview = preview(result, 180)
-            self.resume_cache.put(agent_id, fingerprint, result)
+            self.resume_cache.put(fingerprint, result)
             return result
         except Exception as exc:
             record.status = "error"
@@ -511,6 +511,8 @@ def _apply_child_metadata(record: AgentRecord, metadata: dict[str, Any]) -> None
     record.agent_type = _optional_str(metadata.get("agent_type")) or record.agent_type
     record.isolation = _optional_str(metadata.get("isolation")) or record.isolation
     record.tokens = _as_int_metadata(metadata.get("tokens"))
+    record.cache_read_tokens = _as_int_metadata(metadata.get("cache_read_tokens"))
+    record.cache_write_tokens = _as_int_metadata(metadata.get("cache_write_tokens"))
     record.tool_calls = _as_int_metadata(metadata.get("tool_calls"))
 
 

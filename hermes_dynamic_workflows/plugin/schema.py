@@ -42,7 +42,7 @@ Available Python globals:
 - phase(title: str) -> None: start a progress phase. Subsequent agent() calls are grouped under this title unless opts.phase is set.
 - log(message) -> None: append a workflow-level progress log.
 - args: any: the JSON value passed as this tool's args input, verbatim. Pass arrays/objects as actual JSON values, NOT as JSON-encoded strings. Use args for target files, research questions, or config values.
-- budget: object: exposes Claude-style token budget fields: total, spent(), and remaining(). total is None unless configured by HERMES_DYNAMIC_WORKFLOWS_TOKEN_BUDGET or plugin config token_budget_total. spent() counts completed child-agent tokens in this workflow run; remaining() returns Infinity when total is None. Once spent reaches total, further agent() calls fail.
+- budget: object: exposes Claude-style token budget fields: total, spent(), and remaining(). Set total per run via the token_budget tool input (preferred, dynamic like Claude Code's per-turn target), or a literal meta["token_budget"], or plugin config/HERMES_DYNAMIC_WORKFLOWS_TOKEN_BUDGET; precedence is token_budget input > meta > config. total is None when none is set. spent() counts completed child-agent tokens (input+output+reasoning) in this workflow run; remaining() returns Infinity when total is None. Once spent reaches total, further agent() calls fail (a hard ceiling). Use for loop-until-budget: while budget.total and budget.remaining() > 50000: ...
 - subworkflow(name_or_ref, args=None) -> any: run another workflow synchronously as a sub-step. Pass a workflow name or {"scriptPath": "..."}. Child workflows share the parent run's agent counter, stop signal, deadline, token budget, resume cache, and global concurrency slots. Nesting is limited to one level.
 - cwd: str, json, math: current working directory string and safe standard helpers.
 
@@ -120,6 +120,15 @@ DYNAMIC_WORKFLOW_SCHEMA = {
                 "description": (
                     "Optional JSON value exposed to the script as global args, verbatim. "
                     "Pass arrays/objects directly, not as JSON-encoded strings."
+                ),
+            },
+            "token_budget": {
+                "type": "integer",
+                "minimum": 1,
+                "description": (
+                    "Optional hard token ceiling for this run, exposed to the script as "
+                    "budget.total. Once budget.spent() reaches it, further agent() calls "
+                    "fail. Overrides meta['token_budget'] and plugin config."
                 ),
             },
             "resumeFromRunId": {

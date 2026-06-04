@@ -4,6 +4,7 @@ import unittest
 import tempfile
 from pathlib import Path
 
+from hermes_dynamic_workflows.engine.cache import ResumeCache, agent_fingerprint, is_cache_miss
 from hermes_dynamic_workflows.engine.config import PluginConfig
 from hermes_dynamic_workflows.engine.runtime import WorkflowOptions, run_workflow
 from hermes_dynamic_workflows.engine.types import ChildAgentRequest, ChildAgentResult, ChildAgentRunner
@@ -273,6 +274,27 @@ def workflow():
                         child_runner=FakeRunner(),
                     ),
                 )
+
+
+class ResumeCacheTests(unittest.TestCase):
+    def test_content_addressed_fifo_for_duplicate_fingerprints(self):
+        fp = agent_fingerprint("same prompt", {"label": "x"})
+        run1 = ResumeCache()
+        run1.put(fp, "r1")
+        run1.put(fp, "r2")
+
+        run2 = ResumeCache(run1.current)
+        # Two identical calls each consume one cached result (FIFO), then miss.
+        self.assertEqual(run2.get(fp), "r1")
+        self.assertEqual(run2.get(fp), "r2")
+        self.assertTrue(is_cache_miss(run2.get(fp)))
+
+    def test_reads_legacy_sequence_keyed_cache(self):
+        fp = agent_fingerprint("p", {"label": "y"})
+        legacy = {"1": {"fingerprint": fp, "result": "legacy"}}
+        cache = ResumeCache(legacy)
+        self.assertEqual(cache.get(fp), "legacy")
+        self.assertTrue(is_cache_miss(cache.get(fp)))
 
 
 if __name__ == "__main__":
