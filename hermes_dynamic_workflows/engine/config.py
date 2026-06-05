@@ -53,13 +53,24 @@ class PluginConfig:
     # What a child agent does when Hermes' approval engine flags a command and
     # no human is present to approve it. The engine itself (hardline blocks,
     # permanent allowlist, yolo, smart mode) still runs upstream regardless;
-    # this only decides the otherwise-would-prompt case.
-    #   deny    -> refuse flagged commands (safe default)
+    # this only decides the otherwise-would-prompt case. When the policy allows
+    # a flagged command, the hook also approve_session()s its pattern so the
+    # decision sticks past Hermes' own context re-gating (which would otherwise
+    # turn a detached gateway child's command into an unanswerable "pending").
+    #   inherit -> follow Hermes' own approvals.mode (manual->ask, smart->smart,
+    #              off->approve); single source of truth (default)
+    #   smart   -> Hermes' _smart_approve auxiliary-LLM guardian (recommended for
+    #              unattended/gateway: lets benign-but-flagged commands run, blocks
+    #              the genuinely dangerous; only flagged commands hit the LLM)
+    #   deny    -> refuse flagged commands
     #   approve -> allow flagged commands (hardline still blocked upstream)
-    #   smart   -> defer to Hermes' _smart_approve auxiliary-LLM guardian
-    #   ask     -> in a gateway session, route to the user for mid-run approval;
-    #              with no interactive channel (CLI background/headless), refuse
-    child_approval_policy: str = "deny"
+    #   ask     -> route to the user if a live approval channel exists (gateway
+    #              buttons); otherwise degrade to ask_fallback (a detached workflow
+    #              child usually has no reachable human in any context)
+    child_approval_policy: str = "inherit"
+    # What `ask` falls back to when no human is reachable (the common case for a
+    # detached workflow child). smart | deny | approve.
+    ask_fallback: str = "smart"
     # How agent(schema=...) constrains child output:
     #   "auto"/"tool" -> child calls workflow_submit_structured_output, validated
     #       at the tool layer with model retry (Claude-Code-style); falls back to
@@ -230,7 +241,12 @@ def load_config() -> PluginConfig:
                 raw.get("child_approval_policy"),
             ),
             default.child_approval_policy,
-            {"deny", "smart", "approve", "ask"},
+            {"deny", "smart", "approve", "ask", "inherit"},
+        ),
+        ask_fallback=_as_mode(
+            os.getenv("HERMES_DYNAMIC_WORKFLOWS_ASK_FALLBACK", raw.get("ask_fallback")),
+            default.ask_fallback,
+            {"smart", "deny", "approve"},
         ),
         notify_on_complete=_as_bool(
             os.getenv("HERMES_DYNAMIC_WORKFLOWS_NOTIFY_ON_COMPLETE", raw.get("notify_on_complete")),

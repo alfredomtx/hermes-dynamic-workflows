@@ -5,6 +5,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from hermes_dynamic_workflows.agents.presets import AgentTypeSpec, resolve_agent_type
 from hermes_dynamic_workflows.agents.runner import (
@@ -217,6 +218,35 @@ class ChildApprovalPolicyTests(unittest.TestCase):
                 sys.modules["tools.approval"] = saved_approval
             else:
                 sys.modules.pop("tools.approval", None)
+
+
+    def test_ask_degrades_to_fallback(self):
+        # A detached child can't grab the CLI prompt, so 'ask' degrades to
+        # ask_fallback. With fallback='deny' a flagged command is refused.
+        cb = _make_child_approval_callback("ask", ask_fallback="deny")
+        self.assertEqual(cb("rm -rf build", "recursive delete"), "deny")
+
+    def test_ask_default_fallback_is_smart(self):
+        # Default ask_fallback is smart -> routes through _smart_approve.
+        approval_mod = types.ModuleType("tools.approval")
+        approval_mod._smart_approve = lambda command, description: "approve"
+        approval_mod._get_approval_mode = lambda: "manual"
+        tools_pkg = types.ModuleType("tools")
+        tools_pkg.__path__ = []
+        tools_pkg.approval = approval_mod
+        with patch.dict(sys.modules, {"tools": tools_pkg, "tools.approval": approval_mod}):
+            cb = _make_child_approval_callback("ask")
+            self.assertEqual(cb("npm test", "script execution"), "once")
+
+    def test_inherit_follows_hermes_mode(self):
+        approval_mod = types.ModuleType("tools.approval")
+        approval_mod._get_approval_mode = lambda: "off"  # off -> approve
+        tools_pkg = types.ModuleType("tools")
+        tools_pkg.__path__ = []
+        tools_pkg.approval = approval_mod
+        with patch.dict(sys.modules, {"tools": tools_pkg, "tools.approval": approval_mod}):
+            cb = _make_child_approval_callback("inherit")
+            self.assertEqual(cb("rm -rf build", "recursive delete"), "once")
 
 
 if __name__ == "__main__":

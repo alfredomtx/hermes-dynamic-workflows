@@ -200,7 +200,10 @@ class HermesChildAgentRunner(ChildAgentRunner):
         toolsets: list[str],
     ) -> ChildAgentResult:
         timeout = request.timeout_seconds or self.config.child_timeout_seconds
-        approval_callback = _make_child_approval_callback(self.config.child_approval_policy)
+        approval_callback = _make_child_approval_callback(
+            self.config.child_approval_policy,
+            getattr(self.config, "ask_fallback", "smart"),
+        )
 
         def _init_worker() -> None:
             # Install the approval callback on the worker thread itself, so the
@@ -410,7 +413,22 @@ def _child_failure_message(result: Any, content: str) -> str | None:
     return None
 
 
-def _make_child_approval_callback(policy: str):
+def _resolve_inherit_policy(policy: str) -> str:
+    """Resolve ``inherit`` to Hermes' own approvals.mode (manual->ask,
+    smart->smart, off->approve). Mirrors approval_hook._resolve_policy so the
+    CLI per-thread callback and the non-CLI hook agree."""
+    if policy != "inherit":
+        return policy
+    try:
+        from tools.approval import _get_approval_mode
+
+        mode = _get_approval_mode()
+    except Exception:
+        return "deny"
+    return {"manual": "ask", "smart": "smart", "off": "approve"}.get(mode, "deny")
+
+
+def _make_child_approval_callback(policy: str, ask_fallback: str = "smart"):
     """Build the non-interactive approval callback for child worker threads.
 
     Child agents run every command through Hermes' approval engine
@@ -422,12 +440,17 @@ def _make_child_approval_callback(policy: str):
     ``dynamic_workflows.child_approval_policy`` (never delegation.*), so a
     workflow's blast radius is controlled independently of native delegation:
 
-      deny    -> refuse flagged commands (safe default)
+      inherit -> follow Hermes' approvals.mode (resolved before we get here)
+      deny    -> refuse flagged commands
       approve -> allow flagged commands (hardline is still blocked upstream)
       smart   -> defer to Hermes' _smart_approve auxiliary-LLM guardian;
                  'escalate' (uncertain) resolves to deny since no human is present
+      ask     -> a detached background child can't grab the CLI's synchronous
+                 prompt, so degrade to ask_fallback (smart|deny|approve)
     """
-    clean = (policy or "deny").strip().lower()
+    clean = _resolve_inherit_policy((policy or "deny").strip().lower())
+    if clean == "ask":
+        clean = ask_fallback if ask_fallback in ("smart", "deny", "approve") else "smart"
 
     if clean == "approve":
         def _approve(command: str, description: str, **_: Any) -> str:
@@ -460,8 +483,8 @@ def _make_child_approval_callback(policy: str):
 
     def _deny(command: str, description: str, **_: Any) -> str:
         logger.warning(
-            "workflow child denied flagged command (policy=deny): %s (%s)",
-            command, description,
+            "workflow child denied flagged command (policy=%s): %s (%s)",
+            clean, command, description,
         )
         return "deny"
     return _deny

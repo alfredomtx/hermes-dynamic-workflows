@@ -64,23 +64,61 @@ class CommandGateTests(unittest.TestCase):
         )
         self.assertEqual(result["action"], "block")
 
-    def test_ask_policy_defers_when_gateway(self):
-        # In a gateway context the command is routed to the user, so the hook
-        # defers (None) to Hermes' check_all_command_guards.
+    def test_ask_defers_when_live_gateway_channel(self):
+        # A live gateway channel exists -> defer (None) to Hermes' gateway
+        # approve/deny buttons.
         self.assertIsNone(
             evaluate_command_gate(
                 "rm -rf /tmp/x", classify=_dangerous, allowlist=set(),
-                policy="ask", smart_approve=_deny, is_gateway=True,
+                policy="ask", smart_approve=_deny, has_gateway_channel=True,
             )
         )
 
-    def test_ask_policy_blocks_without_gateway(self):
-        # No gateway channel (headless): a detached child can't ask, so refuse.
+    def test_ask_degrades_to_smart_without_channel(self):
+        # No reachable human (the common detached-child case): ask degrades to
+        # ask_fallback. With smart approving, the command is allowed.
+        self.assertIsNone(
+            evaluate_command_gate(
+                "rm -rf /tmp/x", classify=_dangerous, allowlist=set(),
+                policy="ask", smart_approve=_approve,
+                has_gateway_channel=False, ask_fallback="smart",
+            )
+        )
+
+    def test_ask_degrades_to_smart_and_blocks_when_smart_denies(self):
         result = evaluate_command_gate(
             "rm -rf /tmp/x", classify=_dangerous, allowlist=set(),
-            policy="ask", smart_approve=_deny, is_gateway=False,
+            policy="ask", smart_approve=_deny,
+            has_gateway_channel=False, ask_fallback="smart",
         )
         self.assertEqual(result["action"], "block")
+
+    def test_ask_degrades_to_deny_when_configured(self):
+        result = evaluate_command_gate(
+            "rm -rf /tmp/x", classify=_dangerous, allowlist=set(),
+            policy="ask", smart_approve=_approve,
+            has_gateway_channel=False, ask_fallback="deny",
+        )
+        self.assertEqual(result["action"], "block")
+
+    def test_on_allow_fires_with_pattern_key_when_allowed(self):
+        seen = []
+        result = evaluate_command_gate(
+            "rm -rf /tmp/x", classify=_dangerous, allowlist=set(),
+            policy="approve", smart_approve=_deny,
+            on_allow=lambda key: seen.append(key),
+        )
+        self.assertIsNone(result)
+        self.assertEqual(seen, ["delete in root path"])
+
+    def test_on_allow_does_not_fire_when_blocked(self):
+        seen = []
+        evaluate_command_gate(
+            "rm -rf /tmp/x", classify=_dangerous, allowlist=set(),
+            policy="deny", smart_approve=_deny,
+            on_allow=lambda key: seen.append(key),
+        )
+        self.assertEqual(seen, [])
 
     def test_smart_eval_failure_blocks(self):
         def boom(_c, _d):
@@ -108,6 +146,41 @@ class HandlerFastPathTests(unittest.TestCase):
         self.assertIsNone(
             pre_tool_call_handler(tool_name="terminal", args={}, task_id="workflow-abc123")
         )
+
+
+class InheritResolutionTests(unittest.TestCase):
+    def _resolve(self, mode):
+        import sys, types
+        from unittest.mock import patch
+
+        appr = types.ModuleType("tools.approval")
+        appr._get_approval_mode = lambda: mode
+        pkg = types.ModuleType("tools")
+        pkg.approval = appr
+        from hermes_dynamic_workflows.engine.approval_hook import _resolve_policy
+
+        class _Cfg:
+            child_approval_policy = "inherit"
+
+        with patch.dict(sys.modules, {"tools": pkg, "tools.approval": appr}):
+            return _resolve_policy(_Cfg())
+
+    def test_inherit_maps_manual_to_ask(self):
+        self.assertEqual(self._resolve("manual"), "ask")
+
+    def test_inherit_maps_smart_to_smart(self):
+        self.assertEqual(self._resolve("smart"), "smart")
+
+    def test_inherit_maps_off_to_approve(self):
+        self.assertEqual(self._resolve("off"), "approve")
+
+    def test_non_inherit_passes_through(self):
+        from hermes_dynamic_workflows.engine.approval_hook import _resolve_policy
+
+        class _Cfg:
+            child_approval_policy = "deny"
+
+        self.assertEqual(_resolve_policy(_Cfg()), "deny")
 
 
 if __name__ == "__main__":

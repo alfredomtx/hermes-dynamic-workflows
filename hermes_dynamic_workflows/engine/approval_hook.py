@@ -34,7 +34,7 @@ def _block(description: str) -> dict[str, str]:
             "BLOCKED by dynamic-workflows child_approval_policy: a background "
             f"workflow child agent may not run this flagged command ({description}). "
             "Find an approach that doesn't require it (or set child_approval_policy "
-            "to 'smart'/'approve' in plugin config)."
+            "to 'smart'/'approve', or ask_fallback to 'smart', in plugin config)."
         ),
     }
 
@@ -46,18 +46,26 @@ def evaluate_command_gate(
     allowlist: Any,
     policy: str,
     smart_approve: Callable[[str, str], str],
-    is_gateway: bool = False,
+    has_gateway_channel: bool = False,
+    ask_fallback: str = "smart",
+    on_allow: Callable[[str], None] | None = None,
 ) -> dict[str, str] | None:
     """Pure policy decision for a workflow-child terminal command in a non-CLI
     context. Returns a block directive, or None to allow.
 
     Only genuinely dangerous, non-allowlisted commands are gated; the hardline
-    floor and the rest of Hermes' engine still run downstream for allowed ones.
+    floor and the rest of Hermes' engine still run downstream.
 
-    ``ask`` defers (returns None) when a gateway approval channel is present
-    so Hermes' check_all_command_guards routes the command to the user (mid-run
-    approve/deny); with no channel it refuses, since a detached child has no way
-    to ask.
+    ``ask`` routes to the user only when a live gateway approval channel exists
+    (``has_gateway_channel``) — then it defers to Hermes' gateway approve/deny.
+    Otherwise (the common case: a detached workflow child has no reachable human
+    in any context, since the gateway notify bridge is torn down when the
+    launching turn ends) it degrades to ``ask_fallback`` (smart | deny | approve).
+
+    When a flagged command is allowed by policy, ``on_allow(pattern_key)`` runs
+    (the handler wires it to ``approve_session``) so the decision sticks past
+    Hermes' own downstream context re-gating — which would otherwise turn a
+    detached gateway child's allowed command into an unanswerable "pending".
     """
     is_dangerous, pattern_key, description = classify(command)
     if not is_dangerous:
@@ -67,16 +75,28 @@ def evaluate_command_gate(
             return None  # user explicitly allowlisted this pattern
     except TypeError:
         pass
-    if policy == "approve":
-        return None
+
     if policy == "ask":
-        return None if is_gateway else _block(description)
-    if policy == "smart":
+        if has_gateway_channel:
+            return None  # defer to Hermes' gateway approve/deny (real buttons)
+        policy = ask_fallback if ask_fallback in ("smart", "deny", "approve") else "smart"
+
+    allow = False
+    if policy == "approve":
+        allow = True
+    elif policy == "smart":
         try:
-            if smart_approve(command, description) == "approve":
-                return None
+            allow = smart_approve(command, description) == "approve"
         except Exception:
-            pass  # smart eval failed -> fall through to block (safe)
+            allow = False  # smart eval failed -> block (safe)
+
+    if allow:
+        if on_allow is not None:
+            try:
+                on_allow(pattern_key)
+            except Exception:
+                pass
+        return None
     return _block(description)
 
 
@@ -91,24 +111,69 @@ def _is_interactive_cli() -> bool:
         return False
 
 
-def _policy() -> str:
+def _config() -> Any:
     try:
         from .config import load_config
 
-        return load_config().child_approval_policy
+        return load_config()
     except Exception:
-        return "deny"
+        return None
 
 
-def _is_gateway_context() -> bool:
-    """True when a gateway approval channel is available on this thread (the
-    runner sets the session vars on the child worker thread)."""
+def _resolve_policy(cfg: Any) -> str:
+    """The configured policy, resolving ``inherit`` to Hermes' own
+    ``approvals.mode`` (manual->ask, smart->smart, off->approve)."""
+    policy = getattr(cfg, "child_approval_policy", "deny") if cfg is not None else "deny"
+    if policy != "inherit":
+        return policy
     try:
-        from tools.approval import _is_gateway_approval_context
+        from tools.approval import _get_approval_mode
 
-        return bool(_is_gateway_approval_context())
+        mode = _get_approval_mode()
+    except Exception:
+        return "deny"  # can't read Hermes config -> safe default
+    return {"manual": "ask", "smart": "smart", "off": "approve"}.get(mode, "deny")
+
+
+def _ask_fallback(cfg: Any) -> str:
+    return getattr(cfg, "ask_fallback", "smart") if cfg is not None else "smart"
+
+
+def _has_gateway_channel() -> bool:
+    """True only when a *live* gateway approval channel is reachable for this
+    thread's session — i.e. Hermes' check_all_command_guards could actually
+    route a prompt to the user. A detached workflow child usually has none (the
+    notify bridge is torn down when the launching turn ends), so ``ask`` then
+    degrades rather than orphaning the command as an unanswerable 'pending'."""
+    try:
+        from tools import approval as _approval
+
+        if not _approval._is_gateway_approval_context():
+            return False
+        session_key = _approval.get_current_session_key()
+        with _approval._lock:
+            return _approval._gateway_notify_cbs.get(session_key) is not None
     except Exception:
         return False
+
+
+def _make_on_allow():
+    """approve_session() the allowed pattern so the decision sticks past
+    Hermes' downstream re-gating (its check_all_command_guards runs again and,
+    for a detached gateway child, would otherwise re-flag the command)."""
+    try:
+        from tools import approval as _approval
+
+        session_key = _approval.get_current_session_key()
+    except Exception:
+        return None
+
+    def _on_allow(pattern_key: str) -> None:
+        from tools.approval import approve_session
+
+        approve_session(session_key, pattern_key)
+
+    return _on_allow
 
 
 def pre_tool_call_handler(
@@ -141,11 +206,14 @@ def pre_tool_call_handler(
         allowlist = load_permanent_allowlist() or set()
     except Exception:
         allowlist = set()
+    cfg = _config()
     return evaluate_command_gate(
         command,
         classify=detect_dangerous_command,
         allowlist=allowlist,
-        policy=_policy(),
+        policy=_resolve_policy(cfg),
         smart_approve=_smart_approve,
-        is_gateway=_is_gateway_context(),
+        has_gateway_channel=_has_gateway_channel(),
+        ask_fallback=_ask_fallback(cfg),
+        on_allow=_make_on_allow(),
     )
