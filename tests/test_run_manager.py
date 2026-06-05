@@ -149,7 +149,7 @@ def workflow():
             root = Path(tmp)
             script_path = root / "workflow.py"
             script_path.write_text(script, encoding="utf-8")
-            manager = WorkflowRunManager(store=WorkflowStore(root / "store"), config=PluginConfig())
+            manager = WorkflowRunManager(store=WorkflowStore(root / "store"), config=PluginConfig(require_launch_approval=False))
             with patch("hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner", return_value=CountingRunner()):
                 record = manager.start_from_params({"scriptPath": str(script_path)}, cwd=str(root))
                 final = manager.wait(record["runId"], timeout=2)
@@ -168,7 +168,7 @@ def workflow():
 """
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            manager = WorkflowRunManager(store=WorkflowStore(root / "store"), config=PluginConfig())
+            manager = WorkflowRunManager(store=WorkflowStore(root / "store"), config=PluginConfig(require_launch_approval=False))
             record = manager.start_from_params({"script": script}, cwd=str(root), plugin_context=RecordingCtx())
             manager.wait(record["runId"], timeout=2)
 
@@ -189,7 +189,7 @@ def workflow():
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             ctx = CliRefCtx(cli_session_id="cli-session", agent_session_id="agent-session")
-            manager = WorkflowRunManager(store=WorkflowStore(root / "store"), config=PluginConfig())
+            manager = WorkflowRunManager(store=WorkflowStore(root / "store"), config=PluginConfig(require_launch_approval=False))
             record = manager.start_from_params({"script": script}, cwd=str(root), plugin_context=ctx)
             manager.wait(record["runId"], timeout=2)
 
@@ -205,7 +205,7 @@ def workflow():
     return "ok"
 """
         with tempfile.TemporaryDirectory() as tmp:
-            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig())
+            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig(require_launch_approval=False))
             with patch.dict(os.environ, {}, clear=True):
                 with self.assertRaises(WorkflowRuntimeError):
                     manager.start_from_params({"script": script}, cwd=tmp)
@@ -221,7 +221,7 @@ def workflow():
     ]
 """
         with tempfile.TemporaryDirectory() as tmp:
-            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig())
+            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig(require_launch_approval=False))
             with patch("hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner", return_value=CountingRunner()):
                 first = manager.start_from_params({"script": script}, cwd=tmp)
                 first_final = manager.wait(first["runId"], timeout=2)
@@ -245,7 +245,7 @@ def workflow():
 """
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            manager = WorkflowRunManager(store=WorkflowStore(root / "store"), config=PluginConfig())
+            manager = WorkflowRunManager(store=WorkflowStore(root / "store"), config=PluginConfig(require_launch_approval=False))
             with patch("hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner", return_value=MetadataRunner()):
                 record = manager.start_from_params({"script": script}, cwd=str(root))
                 final = manager.wait(record["runId"], timeout=2)
@@ -270,7 +270,7 @@ def workflow():
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store = WorkflowStore(root / "store")
-            manager = WorkflowRunManager(store=store, config=PluginConfig())
+            manager = WorkflowRunManager(store=store, config=PluginConfig(require_launch_approval=False))
             with patch("hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner", return_value=CountingRunner()):
                 record = manager.start_from_params({"script": script}, cwd=str(root))
                 final = manager.wait(record["runId"], timeout=2)
@@ -312,7 +312,7 @@ def workflow():
         runner = RecordingRunner()
         with tempfile.TemporaryDirectory() as tmp:
             manager = WorkflowRunManager(
-                store=WorkflowStore(Path(tmp)), config=PluginConfig(concurrency=3)
+                store=WorkflowStore(Path(tmp)), config=PluginConfig(concurrency=3, require_launch_approval=False)
             )
             with patch(
                 "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
@@ -340,7 +340,7 @@ def workflow():
     return agent("b", {"label": "b"})
 """
         with tempfile.TemporaryDirectory() as tmp:
-            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig())
+            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig(require_launch_approval=False))
             with patch(
                 "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
                 return_value=BudgetRunner(tokens=20),
@@ -368,7 +368,7 @@ def workflow():
 """
         with tempfile.TemporaryDirectory() as tmp:
             manager = WorkflowRunManager(
-                store=WorkflowStore(Path(tmp)), config=PluginConfig(concurrency=2)
+                store=WorkflowStore(Path(tmp)), config=PluginConfig(concurrency=2, require_launch_approval=False)
             )
             with patch(
                 "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
@@ -392,7 +392,7 @@ def workflow():
 """
         with tempfile.TemporaryDirectory() as tmp:
             manager = WorkflowRunManager(
-                store=WorkflowStore(Path(tmp)), config=PluginConfig(concurrency=2)
+                store=WorkflowStore(Path(tmp)), config=PluginConfig(concurrency=2, require_launch_approval=False)
             )
             with patch(
                 "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
@@ -413,7 +413,7 @@ def workflow():
 """
         ctx = RecordingCtx()
         with tempfile.TemporaryDirectory() as tmp:
-            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig())
+            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig(require_launch_approval=False))
             with patch(
                 "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
                 return_value=CountingRunner(),
@@ -450,7 +450,7 @@ def workflow():
         ]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            manager = WorkflowRunManager(store=WorkflowStore(root / "store"), config=PluginConfig())
+            manager = WorkflowRunManager(store=WorkflowStore(root / "store"), config=PluginConfig(require_launch_approval=False))
             with patch(
                 "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
                 return_value=TranscriptRunner(),
@@ -485,7 +485,7 @@ def workflow():
         with tempfile.TemporaryDirectory() as tmp:
             manager = WorkflowRunManager(
                 store=WorkflowStore(Path(tmp)),
-                config=PluginConfig(notify_on_complete=False),
+                config=PluginConfig(notify_on_complete=False, require_launch_approval=False),
             )
             with patch(
                 "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
@@ -505,7 +505,7 @@ def workflow():
 """
         ctx = RecordingCtx(fail=True)  # inject_message raises (e.g. gateway/edge)
         with tempfile.TemporaryDirectory() as tmp:
-            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig())
+            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig(require_launch_approval=False))
             with patch(
                 "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
                 return_value=CountingRunner(),

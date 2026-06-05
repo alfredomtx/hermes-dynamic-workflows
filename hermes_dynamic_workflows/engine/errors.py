@@ -36,6 +36,11 @@ class ChildAgentError(WorkflowRuntimeError):
     """Raised when a child agent fails."""
 
 
+class WorkflowLaunchDenied(DynamicWorkflowError):
+    """Raised when a top-level launch is not approved by the user (or no
+    approval channel is available). The caller should tell the user, not retry."""
+
+
 class WorkflowTimeout(ChildAgentError):
     """A single child agent exceeded its own timeout.
 

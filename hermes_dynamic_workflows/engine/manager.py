@@ -11,7 +11,7 @@ from typing import Any
 
 from .cache import ResumeCache
 from .config import PluginConfig, load_config
-from .errors import WorkflowRuntimeError
+from .errors import WorkflowLaunchDenied, WorkflowRuntimeError
 from .sandbox import extract_meta, parse_script
 from ..storage.store import (
     WorkflowStore,
@@ -61,6 +61,12 @@ class WorkflowRunManager:
         cwd_value = cwd or os.environ.get("TERMINAL_CWD") or os.getcwd()
         source = resolve_workflow_source(params, store=self.store, cwd=cwd)
         meta = extract_meta(parse_script(source.script, config))
+        approved, reason = _approve_launch(meta, config, plugin_context)
+        if not approved:
+            raise WorkflowLaunchDenied(
+                f'Workflow "{meta.get("name") or "workflow"}" was not launched: {reason}. '
+                "Do not retry; tell the user it needs their approval."
+            )
         run_id = new_run_id()
         task_id = new_task_id()
         workflow_session_id = _resolve_workflow_session_id(
@@ -548,6 +554,71 @@ def _get_hermes_session_env(name: str) -> str:
         return str(get_session_env(name, "") or "").strip()
     except Exception:
         return os.getenv(name, "").strip()
+
+
+def _approve_launch(meta: dict[str, Any], config: PluginConfig, plugin_context: Any) -> tuple[bool, str]:
+    """Gate a top-level workflow launch when ``require_launch_approval`` is on.
+
+    Runs in the launching (parent) foreground turn, so the session context is
+    native — no cross-thread propagation needed. Returns ``(approved, reason)``.
+    Channels: gateway -> approve/deny buttons (blocks until tapped); CLI ->
+    synchronous confirm; no interactive channel (headless) -> deny.
+    """
+    if not config.require_launch_approval:
+        return True, ""
+
+    name = str(meta.get("name") or "workflow")
+    desc = str(meta.get("description") or "")
+    label = f"workflow-launch:{name}"
+    human = f'Launch dynamic workflow "{name}"' + (f" - {desc}" if desc else "")
+
+    try:
+        from tools import approval as _approval
+    except Exception:
+        return False, "launch approval required but Hermes' approval engine is unavailable"
+
+    # Gateway: reuse the session-keyed approve/deny flow (blocks until resolved).
+    try:
+        if _approval._is_gateway_approval_context():
+            session_key = _approval.get_current_session_key()
+            notify_cb = _approval._gateway_notify_cbs.get(session_key)
+            if notify_cb is None:
+                return False, "launch approval required but no gateway approval channel is registered"
+            decision = _approval._await_gateway_decision(
+                session_key,
+                notify_cb,
+                {
+                    "command": label,
+                    "pattern_key": "workflow_launch",
+                    "pattern_keys": ["workflow_launch"],
+                    "description": human,
+                },
+                surface="gateway",
+            )
+            ok = bool(decision.get("resolved")) and decision.get("choice") not in (None, "deny")
+            return (True, "") if ok else (False, "workflow launch was denied or timed out")
+    except Exception as exc:
+        return False, f"launch approval failed: {type(exc).__name__}: {exc}"
+
+    # CLI interactive: synchronous confirm via the established callback pattern.
+    if (os.environ.get("HERMES_INTERACTIVE") or "").strip().lower() in ("1", "true", "yes", "on"):
+        try:
+            from tools.terminal_tool import _get_approval_callback
+
+            cb = _get_approval_callback()
+        except Exception:
+            cb = None
+        try:
+            choice = _approval.prompt_dangerous_approval(label, human, approval_callback=cb)
+        except Exception as exc:
+            return False, f"launch approval prompt failed: {type(exc).__name__}: {exc}"
+        return (True, "") if (choice and choice != "deny") else (False, "workflow launch was denied")
+
+    return False, (
+        "launch approval required but no interactive channel "
+        "(set require_launch_approval=false / HERMES_DYNAMIC_WORKFLOWS_REQUIRE_LAUNCH_APPROVAL=0 "
+        "for unattended/headless use)"
+    )
 
 
 def _capture_gateway_session_context() -> dict[str, str] | None:
