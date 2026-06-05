@@ -62,6 +62,11 @@ class HermesChildAgentRunner(ChildAgentRunner):
             toolsets = toolsets + [STRUCTURED_OUTPUT_TOOLSET]
         _prepare_mcp_tool_registry(self.config)
         child = self._build_agent(request, runtime, toolsets, lease, agent_type)
+        if request.on_start is not None:
+            try:
+                request.on_start(_child_metadata(child, {}, lease, agent_type, toolsets))
+            except Exception:
+                logger.debug("dynamic workflow child start callback failed", exc_info=True)
         if structured_tool:
             register_expectation(lease.task_id, request.schema)
         try:

@@ -2,6 +2,84 @@
 
 from __future__ import annotations
 
+import json
+import os
+import traceback
+from typing import Any
+
+from ..engine.manager import get_run_manager
+
+
+def workflow(params: dict[str, Any], *, plugin_context: Any = None, **kwargs: Any) -> str:
+    try:
+        manager = get_run_manager()
+        tool_use_id = (
+            kwargs.get("tool_use_id")
+            or kwargs.get("toolUseId")
+            or kwargs.get("tool_call_id")
+            or kwargs.get("toolCallId")
+        )
+        record = manager.start_from_params(
+            params or {},
+            cwd=os.environ.get("TERMINAL_CWD") or os.getcwd(),
+            plugin_context=plugin_context,
+            tool_use_id=str(tool_use_id) if tool_use_id else None,
+            host_session_id=_host_session_id_from_kwargs(kwargs),
+        )
+        return _launch_message(record)
+    except Exception as exc:
+        return json.dumps(
+            {
+                "error": f"{type(exc).__name__}: {exc}",
+                "trace": _short_traceback(),
+            },
+            ensure_ascii=False,
+        )
+
+
+def _launch_message(record: dict[str, Any]) -> str:
+    run_id = record.get("runId") or ""
+    task_id = record.get("taskId") or run_id
+    summary = record.get("summary") or "Dynamic workflow"
+    transcript_dir = record.get("transcriptDir") or ""
+    script_path = record.get("scriptPath") or ""
+    return "\n".join(
+        [
+            f"Workflow launched in background. Task ID: {task_id}",
+            f"Summary: {summary}",
+            f"Transcript dir: {transcript_dir}",
+            f"Script file: {script_path}",
+            f"Run ID: {run_id}",
+            (
+                "To resume after editing the script: "
+                f"Workflow({{scriptPath: {json.dumps(script_path, ensure_ascii=False)}, "
+                f"resumeFromRunId: {json.dumps(run_id)}}})"
+            ),
+            "You will be notified when it completes. Use /workflows to watch live progress.",
+        ]
+    )
+
+
+def _short_traceback() -> str:
+    lines = traceback.format_exc(limit=4).strip().splitlines()
+    return "\n".join(lines[-8:])
+
+
+def _host_session_id_from_kwargs(kwargs: dict[str, Any]) -> str | None:
+    for key in (
+        "session_id",
+        "sessionId",
+        "current_session_id",
+        "currentSessionId",
+        "task_id",
+        "taskId",
+    ):
+        value = kwargs.get(key)
+        if value:
+            return str(value)
+    return None
+
+
 _DESCRIPTION = """Execute a Python workflow script that orchestrates multiple Hermes child agents deterministically. The tool starts a background run and returns immediately with a runId and scriptPath — it is asynchronous. When the run finishes, a <task-notification> carrying the status and (truncated) result is delivered back into the conversation, so you can report the outcome without polling; you can also use /workflows to list runs, /workflows <runId> to inspect progress/results, and /workflow-stop <runId> to stop a run.
 
 A workflow structures work across many agents: to be comprehensive (decompose and cover in parallel), to be confident (independent perspectives and adversarial checks before committing), or to take on scale one context cannot hold (audits, broad sweeps, large reviews). The script encodes what fans out, what verifies, and what synthesizes.

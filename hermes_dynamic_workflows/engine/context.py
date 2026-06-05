@@ -28,6 +28,7 @@ class WorkflowExecutionContext:
     deadline: float
     root: WorkflowFrame
     on_update: Callable[[WorkflowState], None] | None = None
+    on_journal: Callable[[dict[str, Any]], None] | None = None
     plugin_context: Any = None
     token_budget_total: int | None = None
     state: WorkflowState = field(init=False)
@@ -150,5 +151,13 @@ class WorkflowExecutionContext:
             return
         try:
             self.on_update(self.state)
+        except Exception:
+            pass
+
+    def journal(self, event: dict[str, Any]) -> None:
+        if self.on_journal is None:
+            return
+        try:
+            self.on_journal(event)
         except Exception:
             pass

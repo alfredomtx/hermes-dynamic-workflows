@@ -138,6 +138,14 @@ class WorkflowStore:
                 break
         return runs
 
+    def find_run_by_task_id(self, task_id: str) -> dict[str, Any] | None:
+        wanted = str(task_id)
+        for path in sorted(self.runs_dir.glob("wf_*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            data = self.load_run(path.stem)
+            if data and str(data.get("taskId") or "") == wanted:
+                return data
+        return None
+
     def find_named_workflow(self, name: str, cwd: str | None = None) -> Path | None:
         clean = _safe_workflow_name(name)
         candidates: list[Path] = []
