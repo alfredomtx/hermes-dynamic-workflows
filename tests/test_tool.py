@@ -79,7 +79,7 @@ def workflow():
         with tempfile.TemporaryDirectory() as tmp:
             manager = WorkflowRunManager(
                 store=WorkflowStore(Path(tmp)),
-                config=PluginConfig(),
+                config=PluginConfig(require_launch_approval=False),
             )
             with (
                 patch("hermes_dynamic_workflows.plugin.task_output.get_run_manager", return_value=manager),

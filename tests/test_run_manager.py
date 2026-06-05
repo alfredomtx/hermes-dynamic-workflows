@@ -490,7 +490,10 @@ def workflow():
         fake_messages = [{"role": "user", "content": "running message"}]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            manager = WorkflowRunManager(store=WorkflowStore(root / "store"), config=PluginConfig())
+            manager = WorkflowRunManager(
+                store=WorkflowStore(root / "store"),
+                config=PluginConfig(require_launch_approval=False),
+            )
             with patch(
                 "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
                 return_value=runner,
@@ -576,7 +579,10 @@ def workflow():
 """
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            manager = WorkflowRunManager(store=WorkflowStore(root / "store"), config=PluginConfig())
+            manager = WorkflowRunManager(
+                store=WorkflowStore(root / "store"),
+                config=PluginConfig(require_launch_approval=False),
+            )
             with patch(
                 "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
                 return_value=DictRunner(),
