@@ -11,7 +11,11 @@ from typing import Any, Callable, Iterator
 
 from .cache import ResumeCache
 from .config import PluginConfig
-from .errors import WorkflowRuntimeError, WorkflowStopped, WorkflowTimeout
+from .errors import (
+    WorkflowDeadlineExceeded,
+    WorkflowLimitExceeded,
+    WorkflowStopped,
+)
 from .types import ChildAgentRunner, WorkflowFrame, WorkflowState, normalize_phase_specs
 
 
@@ -33,6 +37,7 @@ class WorkflowExecutionContext:
     _frame_counter: int = 0
     _agent_count: int = 0
     _spent_tokens: int = 0
+    _loop_ticks: int = 0
 
     def __post_init__(self) -> None:
         self.state = WorkflowState(self.root)
@@ -61,11 +66,11 @@ class WorkflowExecutionContext:
         self.check_runtime()
         with self._lock:
             if self._agent_count >= self.config.max_agents:
-                raise WorkflowRuntimeError(
+                raise WorkflowLimitExceeded(
                     f"workflow agent count exceeded ({self.config.max_agents})"
                 )
             if self.token_budget_total is not None and self._spent_tokens >= self.token_budget_total:
-                raise WorkflowRuntimeError(
+                raise WorkflowLimitExceeded(
                     f"workflow token budget exceeded ({self.token_budget_total})"
                 )
             self._agent_counter += 1
@@ -116,9 +121,29 @@ class WorkflowExecutionContext:
         if self.stop_event.is_set():
             raise WorkflowStopped("workflow was stopped")
         if monotonic() > self.deadline:
-            raise WorkflowTimeout(
+            raise WorkflowDeadlineExceeded(
                 f"workflow timed out after {self.config.workflow_timeout_seconds:.0f}s"
             )
+
+    def tick_loop(self) -> bool:
+        """Cooperative guard injected into every ``while`` loop test by the
+        sandbox. Makes the wall-clock deadline and user-stop actually fire
+        inside a pure-compute loop (one that never calls agent()), and caps
+        total loop iterations as a runaway backstop. Returns True so the
+        original loop test still controls the loop.
+
+        Lock-free on purpose: the deadline/stop reads are already thread-safe,
+        and the iteration counter is only an approximate backstop, so a racy
+        increment under concurrent loops is acceptable and keeps tight loops
+        cheap.
+        """
+        self.check_runtime()
+        self._loop_ticks += 1
+        if self._loop_ticks > self.config.max_loop_iterations:
+            raise WorkflowLimitExceeded(
+                f"workflow loop iteration cap exceeded ({self.config.max_loop_iterations})"
+            )
+        return True
 
     def notify(self) -> None:
         if self.on_update is None:

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from hermes_dynamic_workflows.engine.cache import ResumeCache, agent_fingerprint, is_cache_miss
 from hermes_dynamic_workflows.engine.config import PluginConfig
+from hermes_dynamic_workflows.engine.errors import WorkflowLimitExceeded
 from hermes_dynamic_workflows.engine.runtime import WorkflowOptions, run_workflow
 from hermes_dynamic_workflows.engine.types import ChildAgentRequest, ChildAgentResult, ChildAgentRunner
 
@@ -276,7 +277,10 @@ def workflow():
     agent("a", {"label": "a"})
     return agent("b", {"label": "b"})
 """
-        with self.assertRaises(Exception):
+        # Budget exhaustion is a hard ceiling: it raises WorkflowLimitExceeded,
+        # a WorkflowHalt (BaseException) a script's `except Exception` cannot
+        # swallow — so it is NOT an `Exception` subclass.
+        with self.assertRaises(WorkflowLimitExceeded):
             run_workflow(
                 script,
                 WorkflowOptions(
@@ -284,6 +288,7 @@ def workflow():
                     child_runner=TokenRunner(tokens=20),
                 ),
             )
+        self.assertFalse(issubclass(WorkflowLimitExceeded, Exception))
 
     def test_subworkflow_nesting_is_one_level(self):
         parent = """
@@ -339,6 +344,86 @@ class ResumeCacheTests(unittest.TestCase):
         # Unexpected shapes (e.g. a crashed/hand-edited run) are ignored -> miss.
         cache = ResumeCache({fp: {"not": "a list"}, "other": 123})
         self.assertTrue(is_cache_miss(cache.get(fp)))
+
+
+class ControlFlowRuntimeTests(unittest.TestCase):
+    def test_while_loop_runs_end_to_end(self):
+        script = """
+meta = {"name": "while-ok"}
+
+def workflow():
+    results = []
+    i = 0
+    while i < 3:
+        results.append(agent("x" + str(i)))
+        i = i + 1
+    return results
+"""
+        runner = FakeRunner()
+        result = run_workflow(script, WorkflowOptions(child_runner=runner))
+        self.assertEqual(len(result.value), 3)
+        self.assertEqual([r.prompt for r in runner.requests], ["x0", "x1", "x2"])
+
+    def test_try_except_handles_recoverable_error(self):
+        script = """
+meta = {"name": "try-ok"}
+
+def workflow():
+    try:
+        y = 1 / 0
+    except Exception:
+        y = "caught"
+    agent("a")
+    return y
+"""
+        result = run_workflow(script, WorkflowOptions(child_runner=TokenRunner(tokens=1)))
+        self.assertEqual(result.value, "caught")
+
+    def test_except_exception_cannot_swallow_budget_halt(self):
+        # A while loop that catches Exception around agent() must STILL halt when
+        # the token budget is exhausted — the halt is BaseException, not caught.
+        script = """
+meta = {"name": "no-swallow"}
+
+def workflow():
+    out = []
+    while True:
+        try:
+            out.append(agent("x"))
+        except Exception:
+            out.append("swallowed")
+    return out
+"""
+        with self.assertRaises(WorkflowLimitExceeded):
+            run_workflow(
+                script,
+                WorkflowOptions(
+                    config=PluginConfig(token_budget_total=10),
+                    child_runner=TokenRunner(tokens=20),
+                ),
+            )
+
+    def test_compute_only_loop_is_bounded_by_iteration_cap(self):
+        # A pure-compute infinite loop (never calls agent()) is bounded by the
+        # injected loop guard's iteration cap — proving the deadline/stop check
+        # actually fires inside such a loop.
+        script = """
+meta = {"name": "spin"}
+
+def workflow():
+    agent("a")
+    while True:
+        pass
+    return 1
+"""
+        with self.assertRaises(WorkflowLimitExceeded):
+            run_workflow(
+                script,
+                WorkflowOptions(
+                    config=PluginConfig(max_loop_iterations=100),
+                    child_runner=TokenRunner(tokens=1),
+                ),
+            )
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ from .api import WorkflowAPI
 from .cache import ResumeCache
 from .config import PluginConfig, load_config
 from .context import WorkflowExecutionContext
-from .sandbox import extract_meta, parse_script
+from .sandbox import LOOP_GUARD_NAME, extract_meta, parse_script
 from .types import ChildAgentRunner, WorkflowFrame, WorkflowState, normalize_phase_specs
 
 
@@ -73,6 +73,17 @@ SAFE_BUILTINS = {
     "sum": sum,
     "tuple": tuple,
     "zip": zip,
+    # Exception types a script may catch to handle recoverable failures (a
+    # failed child agent, a subworkflow error, bad result indexing). Halt
+    # signals (stop/deadline/limits) are BaseException and deliberately absent,
+    # so `except Exception` cannot swallow them.
+    "Exception": Exception,
+    "ValueError": ValueError,
+    "TypeError": TypeError,
+    "KeyError": KeyError,
+    "IndexError": IndexError,
+    "ZeroDivisionError": ZeroDivisionError,
+    "ArithmeticError": ArithmeticError,
 }
 
 
@@ -151,7 +162,9 @@ def run_workflow(script: str, options: WorkflowOptions | None = None) -> Workflo
             raise WorkflowRuntimeError("workflow must call agent() at least once")
         frame.status = "completed"
         return WorkflowResult(value=value, state=state)
-    except Exception as exc:
+    except BaseException as exc:
+        # BaseException so a WorkflowHalt (stop/deadline/limit) still records
+        # frame status before propagating to the run thread.
         frame.status = "stopped" if context.stop_event.is_set() else "error"
         frame.errors.append(f"{type(exc).__name__}: {exc}")
         raise
@@ -188,6 +201,8 @@ def _build_namespace(api: WorkflowAPI) -> dict[str, Any]:
         "None": None,
     }
     namespace.update(api.globals())
+    # Per-iteration guard injected into every `while` test by the sandbox.
+    namespace[LOOP_GUARD_NAME] = api.context.tick_loop
     return namespace
 
 

@@ -341,7 +341,10 @@ class WorkflowRunManager:
                 display=render_workflow_text(snapshot, completed=True),
                 agentCache=resume_cache.current,
             )
-        except Exception as exc:
+        except BaseException as exc:
+            # BaseException so a WorkflowHalt (stop / deadline / hard limit),
+            # which derives from BaseException, is recorded as the run's final
+            # status instead of dying as an unhandled thread exception.
             status = "stopped" if managed.stop_event.is_set() else "error"
             self._update(
                 managed,

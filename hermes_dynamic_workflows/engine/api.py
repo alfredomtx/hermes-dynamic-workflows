@@ -18,7 +18,7 @@ from .structured import (
 )
 from .structured_tool import build_tool_schema_instruction
 from ..ui.display import preview
-from .errors import WorkflowRuntimeError, WorkflowStopped, WorkflowTimeout
+from .errors import WorkflowHalt, WorkflowRuntimeError, WorkflowTimeout
 from .types import AgentRecord, ChildAgentRequest, ChildAgentResult, WorkflowFrame
 
 
@@ -200,8 +200,10 @@ class WorkflowAPI:
                 record.result_preview = preview(result, 180)
                 self.resume_cache.put(fingerprint, result)
                 return result
-            except WorkflowStopped:
-                raise  # a stop is not a child failure — never retry or swallow it
+            except WorkflowHalt:
+                # A run-level halt (stop / deadline / token/agent/loop limit) is
+                # not a child failure — never retry or swallow it.
+                raise
             except Exception as exc:
                 record.attempts = attempt + 1
                 # Don't retry timeouts (would multiply long waits); retry other

@@ -16,6 +16,10 @@ class PluginConfig:
     concurrency: int = field(default_factory=default_concurrency)
     max_concurrency: int = 16
     max_agents: int = 1000
+    # Runaway-loop backstop: caps total `while`-loop iterations across the run.
+    # Generous so legitimate loop-until-budget/dry never trips it; the wall-clock
+    # deadline is the primary bound (now enforced inside loops via tick_loop).
+    max_loop_iterations: int = 10_000_000
     workflow_timeout_seconds: float = 900.0
     child_timeout_seconds: float = 300.0
     script_max_chars: int = 524288
@@ -158,6 +162,14 @@ def load_config() -> PluginConfig:
         concurrency=min(concurrency, max_concurrency),
         max_concurrency=max_concurrency,
         max_agents=_as_int(raw.get("max_agents"), default.max_agents, minimum=1, maximum=1000),
+        max_loop_iterations=_as_int(
+            os.getenv(
+                "HERMES_DYNAMIC_WORKFLOWS_MAX_LOOP_ITERATIONS",
+                raw.get("max_loop_iterations"),
+            ),
+            default.max_loop_iterations,
+            minimum=1000,
+        ),
         workflow_timeout_seconds=_as_float(
             raw.get("workflow_timeout_seconds"),
             default.workflow_timeout_seconds,

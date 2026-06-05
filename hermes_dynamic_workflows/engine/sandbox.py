@@ -14,6 +14,13 @@ from typing import Any
 from .config import PluginConfig
 from .errors import SandboxViolation, WorkflowParseError
 
+# We gate CAPABILITY (what a script can touch), not CONTROL FLOW (how it loops
+# or branches). while/try/raise are pure control flow — harmless on their own
+# and required by the documented loop-until-budget / loop-until-dry / catch-
+# gracefully patterns — so they are allowed. Imports, file/process/network
+# access, dunder traversal and dynamic eval stay forbidden; that is the real
+# integrity+escape boundary (all world-access must go through child agents and
+# Hermes' approval engine, never the orchestration script itself).
 FORBIDDEN_NODES = (
     ast.AsyncFor,
     ast.AsyncFunctionDef,
@@ -25,9 +32,6 @@ FORBIDDEN_NODES = (
     ast.Import,
     ast.ImportFrom,
     ast.Nonlocal,
-    ast.Raise,
-    ast.Try,
-    ast.While,
     ast.With,
 )
 
@@ -77,7 +81,7 @@ def parse_script(script: str, config: PluginConfig) -> ast.Module:
     except SyntaxError as exc:
         raise WorkflowParseError(f"invalid Python workflow script: {exc.msg} at line {exc.lineno}") from exc
     validate_ast(tree)
-    return tree
+    return instrument_loops(tree)
 
 
 def validate_ast(tree: ast.AST) -> None:
@@ -102,6 +106,9 @@ def validate_ast(tree: ast.AST) -> None:
 
         if isinstance(node, ast.Call):
             _validate_call(node)
+
+        if isinstance(node, ast.ExceptHandler):
+            _validate_except_handler(node)
 
 
 def extract_meta(tree: ast.Module) -> dict[str, Any]:
@@ -189,3 +196,60 @@ def _validate_call(node: ast.Call) -> None:
             raise SandboxViolation(f"forbidden method call: {func.attr}")
     else:
         raise SandboxViolation("dynamic call targets are not allowed")
+
+
+def _validate_except_handler(node: ast.ExceptHandler) -> None:
+    """Forbid wildcard catches that could swallow a ``WorkflowHalt``.
+
+    A ``WorkflowHalt`` (user stop / deadline / hard limit) derives from
+    ``BaseException``, so ``except Exception`` cannot catch it — but a bare
+    ``except:`` or ``except BaseException`` would. Reject those so a run stays
+    cancellable and bounded no matter what the script catches. Scripts may
+    still ``except Exception`` (or a specific exposed type) to handle
+    recoverable failures gracefully.
+    """
+    if node.type is None:
+        raise SandboxViolation(
+            "bare 'except:' is not allowed; catch Exception or a specific type"
+        )
+    handlers = node.type.elts if isinstance(node.type, ast.Tuple) else [node.type]
+    for handler_type in handlers:
+        if isinstance(handler_type, ast.Name) and handler_type.id == "BaseException":
+            raise SandboxViolation(
+                "'except BaseException' is not allowed; catch Exception instead"
+            )
+
+
+# Name of the guard call the loop instrumenter injects; the runtime binds it in
+# the script namespace. Dunder-prefixed so a script cannot define or shadow it
+# (the validator forbids names starting with "__").
+LOOP_GUARD_NAME = "__wf_tick__"
+
+
+class _LoopGuard(ast.NodeTransformer):
+    """Rewrite ``while TEST:`` into ``while __wf_tick__() and (TEST):``.
+
+    ``__wf_tick__()`` checks stop/deadline and the loop-iteration cap (raising a
+    WorkflowHalt if exceeded) and otherwise returns True, so the original TEST
+    still controls the loop. This makes the cooperative deadline fire inside a
+    pure-compute loop that never calls agent().
+    """
+
+    def visit_While(self, node: ast.While) -> ast.While:
+        self.generic_visit(node)
+        guard = ast.Call(
+            func=ast.Name(id=LOOP_GUARD_NAME, ctx=ast.Load()), args=[], keywords=[]
+        )
+        node.test = ast.BoolOp(op=ast.And(), values=[guard, node.test])
+        return node
+
+
+def instrument_loops(tree: ast.Module) -> ast.Module:
+    """Inject the per-iteration loop guard into every ``while`` loop.
+
+    Runs after ``validate_ast`` (the injected nodes are trusted and not
+    re-validated). ``for`` loops are bounded by their iterable and left alone.
+    """
+    _LoopGuard().visit(tree)
+    ast.fix_missing_locations(tree)
+    return tree

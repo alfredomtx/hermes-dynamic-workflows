@@ -1,10 +1,23 @@
-"""Workflow-specific exceptions."""
+"""Workflow-specific exceptions.
+
+Two families, split on purpose:
+
+* ``DynamicWorkflowError`` (→ ``Exception``): recoverable. A workflow script may
+  ``try/except Exception`` around these (e.g. a child agent that failed, a
+  subworkflow error, bad indexing of results) and handle them gracefully.
+* ``WorkflowHalt`` (→ ``BaseException``): run-level halts — user stop, the
+  workflow deadline, and hard limits (token budget / agent cap / loop cap).
+  These derive from ``BaseException`` so a script's ``except Exception`` cannot
+  swallow them; the run stays cancellable and bounded no matter what the script
+  catches. The sandbox additionally forbids bare ``except:`` / ``except
+  BaseException`` so they cannot be caught by a wildcard either.
+"""
 
 from __future__ import annotations
 
 
 class DynamicWorkflowError(Exception):
-    """Base class for plugin errors."""
+    """Base class for recoverable plugin errors (catchable by scripts)."""
 
 
 class WorkflowParseError(DynamicWorkflowError):
@@ -16,16 +29,37 @@ class SandboxViolation(DynamicWorkflowError):
 
 
 class WorkflowRuntimeError(DynamicWorkflowError):
-    """Raised when workflow execution fails."""
-
-
-class WorkflowTimeout(WorkflowRuntimeError):
-    """Raised when a workflow or child agent exceeds its timeout."""
-
-
-class WorkflowStopped(WorkflowRuntimeError):
-    """Raised when a workflow run is stopped by the user."""
+    """Raised when workflow execution fails (API misuse, bad return, etc.)."""
 
 
 class ChildAgentError(WorkflowRuntimeError):
     """Raised when a child agent fails."""
+
+
+class WorkflowTimeout(ChildAgentError):
+    """A single child agent exceeded its own timeout.
+
+    Recoverable and per-agent: ``agent()`` records it and returns None (it is
+    not retried, to avoid multiplying long waits). This is NOT the whole-run
+    deadline — that is ``WorkflowDeadlineExceeded`` below.
+    """
+
+
+class WorkflowHalt(BaseException):
+    """Base for run-level halts that a script must never be able to catch.
+
+    Derives from ``BaseException`` (not ``Exception``) so ``except Exception``
+    in a workflow script cannot swallow it.
+    """
+
+
+class WorkflowStopped(WorkflowHalt):
+    """Raised when a workflow run is stopped by the user."""
+
+
+class WorkflowDeadlineExceeded(WorkflowHalt):
+    """Raised when the whole workflow exceeds its wall-clock deadline."""
+
+
+class WorkflowLimitExceeded(WorkflowHalt):
+    """Raised when a hard run limit is hit: token budget, agent cap, loop cap."""
