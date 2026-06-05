@@ -121,6 +121,7 @@ class WorkflowAPI:
                 "isolation": isolation,
             },
         )
+        journal_key = f"v2:{fingerprint}"
         cached = self.resume_cache.get(fingerprint)
         if not is_cache_miss(cached):
             record.status = "done"
@@ -130,8 +131,21 @@ class WorkflowAPI:
             record.started_at = monotonic()
             record.ended_at = record.started_at
             self.resume_cache.put(fingerprint, cached)
+            self._journal(
+                {
+                    "type": "result",
+                    "key": journal_key,
+                    "agentId": str(agent_id),
+                    "cached": True,
+                    "result": cached,
+                }
+            )
             self._notify()
             return cached
+
+        def on_child_start(metadata: dict[str, Any]) -> None:
+            _apply_child_metadata(record, metadata)
+            self._notify()
 
         request = ChildAgentRequest(
             id=agent_id,
@@ -148,6 +162,7 @@ class WorkflowAPI:
             cwd=self.frame.cwd,
             request_overrides=request_overrides,
             structured_tool=use_tool_channel,
+            on_start=on_child_start,
         )
         if schema:
             if use_tool_channel:
@@ -167,6 +182,13 @@ class WorkflowAPI:
         max_attempts = 1 + retries
         record.status = "running"
         record.started_at = monotonic()
+        self._journal(
+            {
+                "type": "started",
+                "key": journal_key,
+                "agentId": str(agent_id),
+            }
+        )
         self._notify()
 
         accumulated_tokens = 0
@@ -199,6 +221,14 @@ class WorkflowAPI:
                 record.tokens = accumulated_tokens
                 record.result_preview = preview(result, 180)
                 self.resume_cache.put(fingerprint, result)
+                self._journal(
+                    {
+                        "type": "result",
+                        "key": journal_key,
+                        "agentId": str(agent_id),
+                        "result": result,
+                    }
+                )
                 return result
             except WorkflowHalt:
                 # A run-level halt (stop / deadline / token/agent/loop limit) is
@@ -224,6 +254,14 @@ class WorkflowAPI:
                 record.error = f"{type(exc).__name__}: {exc}{suffix}"
                 with self._lock:
                     self.frame.errors.append(f"{label}: {record.error}")
+                self._journal(
+                    {
+                        "type": "error",
+                        "key": journal_key,
+                        "agentId": str(agent_id),
+                        "error": record.error,
+                    }
+                )
                 return None
             finally:
                 record.ended_at = monotonic()
@@ -375,6 +413,7 @@ class WorkflowAPI:
             toolsets=[],
             schema=schema,
             request_overrides=None,
+            on_start=None,
         )
         with self.context.agent_slot():
             raw_result = self.runner.run(repair_request)
@@ -480,6 +519,9 @@ class WorkflowAPI:
 
     def _notify(self) -> None:
         self.context.notify()
+
+    def _journal(self, event: dict[str, Any]) -> None:
+        self.context.journal(event)
 
 
 def _normalize_toolsets(value: Any) -> list[str]:

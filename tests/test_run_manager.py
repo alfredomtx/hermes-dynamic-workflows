@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import threading
@@ -93,6 +94,34 @@ class TranscriptRunner(ChildAgentRunner):
         )
 
 
+class LiveTranscriptRunner(ChildAgentRunner):
+    def __init__(self):
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def run(self, request: ChildAgentRequest):
+        metadata = {
+            "runner": "standalone",
+            "task_id": "live-child-session",
+            "session_id": "live-child-session",
+            "hermes_session_id": "live-child-session",
+            "workspace": request.cwd,
+            "isolation": request.isolation or "shared",
+            "model": "test-model",
+            "tokens": 0,
+            "tool_calls": 0,
+        }
+        if request.on_start is not None:
+            request.on_start(metadata)
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise TimeoutError("test runner was not released")
+        return ChildAgentResult(
+            content=f"done:{request.label}",
+            metadata={**metadata, "tokens": 11, "tool_calls": 3},
+        )
+
+
 class MetadataRunner(ChildAgentRunner):
     def run(self, request: ChildAgentRequest):
         return ChildAgentResult(
@@ -109,6 +138,19 @@ class MetadataRunner(ChildAgentRunner):
                 "tool_calls": 5,
             },
         )
+
+
+class DictRunner(ChildAgentRunner):
+    def run(self, request: ChildAgentRequest):
+        return {
+            "items": [
+                {
+                    "title": request.label,
+                    "summary": "structured result",
+                    "source": "unit-test",
+                }
+            ]
+        }
 
 
 class RunManagerTests(unittest.TestCase):
@@ -437,6 +479,50 @@ def workflow():
         self.assertTrue(msg.strip().endswith("</task-notification>"))
         self.assertTrue(Path(final["outputFile"]).is_file())
 
+    def test_child_transcript_files_are_written_while_running(self):
+        script = """
+meta = {"name": "live-transcripts"}
+
+def workflow():
+    return agent("do it", {"label": "worker"})
+"""
+        runner = LiveTranscriptRunner()
+        fake_messages = [{"role": "user", "content": "running message"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = WorkflowRunManager(store=WorkflowStore(root / "store"), config=PluginConfig())
+            with patch(
+                "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                return_value=runner,
+            ), patch(
+                "hermes_dynamic_workflows.engine.manager._load_session_messages",
+                side_effect=lambda session_id: list(fake_messages),
+            ):
+                rec = manager.start_from_params({"script": script}, cwd=str(root), plugin_context=RecordingCtx())
+                self.assertTrue(runner.started.wait(timeout=2))
+
+                running = manager.get(rec["runId"])
+                self.assertEqual(running["status"], "running")
+                transcript_path = Path(running["transcriptFiles"][0])
+                meta_path = Path(running["transcriptMetaFiles"][0])
+                self.assertEqual(transcript_path.name, "agent-live-child-session.jsonl")
+                self.assertEqual(meta_path.name, "agent-live-child-session.meta.json")
+                self.assertTrue(transcript_path.is_file())
+                self.assertTrue(meta_path.is_file())
+                self.assertIn("running message", transcript_path.read_text(encoding="utf-8"))
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                self.assertEqual(meta["session_id"], "live-child-session")
+                self.assertEqual(meta["agent_label"], "worker")
+
+                fake_messages.append({"role": "assistant", "content": "final message"})
+                runner.release.set()
+                final = manager.wait(rec["runId"], timeout=2)
+
+            final_path = Path(final["transcriptFiles"][0])
+            self.assertIn("final message", final_path.read_text(encoding="utf-8"))
+            self.assertEqual(final["workflow"]["agents"][0]["transcript_path"], str(final_path))
+            self.assertEqual(final["workflow"]["agents"][0]["transcript_meta_path"], str(meta_path))
+
     def test_completion_exports_child_transcripts_after_run(self):
         script = """
 meta = {"name": "transcripts"}
@@ -467,12 +553,61 @@ def workflow():
             self.assertEqual(len(files), 1)
             transcript_path = Path(files[0])
             self.assertEqual(transcript_path.parent, transcript_dir)
+            self.assertEqual(transcript_path.name, "agent-child-session-1.jsonl")
+            meta_files = final["transcriptMetaFiles"]
+            self.assertEqual(len(meta_files), 1)
+            meta_path = Path(meta_files[0])
+            self.assertEqual(meta_path.name, "agent-child-session-1.meta.json")
             content = transcript_path.read_text(encoding="utf-8")
-            self.assertIn('"type": "metadata"', content)
-            self.assertIn('"session_id": "child-session-1"', content)
             self.assertIn('"content": "done"', content)
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.assertEqual(meta["session_id"], "child-session-1")
+            self.assertEqual(meta["agent_label"], "worker")
             agent = final["workflow"]["agents"][0]
             self.assertEqual(agent["transcript_path"], str(transcript_path))
+            self.assertEqual(agent["transcript_meta_path"], str(meta_path))
+
+    def test_journal_records_started_and_full_agent_result(self):
+        script = """
+meta = {"name": "journal"}
+
+def workflow():
+    return agent("do it", {"label": "worker"})
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = WorkflowRunManager(store=WorkflowStore(root / "store"), config=PluginConfig())
+            with patch(
+                "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                return_value=DictRunner(),
+            ):
+                rec = manager.start_from_params({"script": script}, cwd=str(root), plugin_context=RecordingCtx())
+                final = manager.wait(rec["runId"], timeout=2)
+
+            journal_path = Path(final["journalFile"])
+            self.assertEqual(journal_path.parent, Path(final["transcriptDir"]))
+            events = [
+                json.loads(line)
+                for line in journal_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+        self.assertEqual([event["type"] for event in events], ["started", "result"])
+        self.assertTrue(events[0]["key"].startswith("v2:"))
+        self.assertEqual(events[0]["agentId"], "1")
+        self.assertEqual(events[1]["agentId"], "1")
+        self.assertEqual(
+            events[1]["result"],
+            {
+                "items": [
+                    {
+                        "title": "worker",
+                        "summary": "structured result",
+                        "source": "unit-test",
+                    }
+                ]
+            },
+        )
 
     def test_completion_notification_disabled(self):
         script = """

@@ -12,8 +12,8 @@ from hermes_dynamic_workflows.engine.structured_tool import (
     submit_structured_output_handler,
 )
 from hermes_dynamic_workflows.plugin import registrar
-from hermes_dynamic_workflows.plugin.schema import DYNAMIC_WORKFLOW_SCHEMA
-from hermes_dynamic_workflows.plugin.tool import workflow
+from hermes_dynamic_workflows.plugin.task_output import TASK_OUTPUT_SCHEMA, task_output
+from hermes_dynamic_workflows.plugin.workflow import DYNAMIC_WORKFLOW_SCHEMA, workflow
 from hermes_dynamic_workflows.ui.commands import (
     discover_named_workflows,
     make_named_workflow_handler,
@@ -38,6 +38,13 @@ def register(ctx) -> None:
             "Run deterministic Python workflow scripts that orchestrate "
             "multiple Hermes child agents with agent(), parallel(), and pipeline()."
         ),
+    )
+    ctx.register_tool(
+        name="task_output",
+        toolset="workflow",
+        schema=TASK_OUTPUT_SCHEMA,
+        handler=task_output,
+        description="Read output/logs from a background dynamic workflow task.",
     )
     # Child-agent-only tool: a schema'd agent() call submits its final answer
     # through this tool, validated at the tool layer with model retry. Lives in

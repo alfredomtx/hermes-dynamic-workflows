@@ -18,6 +18,7 @@ from ..storage.store import (
     new_run_id,
     new_task_id,
     resolve_workflow_source,
+    sanitize_filename,
     utc_now_iso,
 )
 from ..ui.display import (
@@ -38,7 +39,71 @@ class ManagedRun:
     record: dict[str, Any]
     thread: threading.Thread | None = None
     child_runner: Any = None
+    transcript_exporters: dict[str, "LiveTranscriptExporter"] = field(default_factory=dict)
     lock: threading.RLock = field(default_factory=threading.RLock)
+
+
+class LiveTranscriptExporter:
+    """Keep a child agent transcript file refreshed from Hermes SessionDB."""
+
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        transcript_path: Path,
+        meta_path: Path,
+        metadata: dict[str, Any],
+        interval_seconds: float = 0.5,
+    ) -> None:
+        self.session_id = session_id
+        self.transcript_path = transcript_path
+        self.meta_path = meta_path
+        self.interval_seconds = interval_seconds
+        self._metadata = dict(metadata)
+        self._metadata_lock = threading.RLock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._loop,
+            name=f"workflow-transcript-{sanitize_filename(session_id)[:32]}",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self.flush()
+        self._thread.start()
+
+    def update_metadata(self, metadata: dict[str, Any]) -> None:
+        with self._metadata_lock:
+            self._metadata.update(metadata)
+
+    def stop(self, *, final: bool = True) -> None:
+        self._stop.set()
+        if self._thread.is_alive() and threading.current_thread() is not self._thread:
+            self._thread.join(timeout=2)
+        if final:
+            self.flush()
+
+    def flush(self) -> None:
+        messages = _load_session_messages(self.session_id)
+        with self._metadata_lock:
+            metadata = dict(self._metadata)
+        _write_agent_transcript_files(
+            self.transcript_path,
+            self.meta_path,
+            metadata=metadata,
+            messages=messages,
+        )
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self.interval_seconds):
+            try:
+                self.flush()
+            except Exception:
+                pass
+        try:
+            self.flush()
+        except Exception:
+            pass
 
 
 class WorkflowRunManager:
@@ -75,6 +140,9 @@ class WorkflowRunManager:
             meta=meta,
         )
         transcript_dir = self.store.transcript_dir(cwd_value, workflow_session_id, run_id)
+        journal_path = transcript_dir / "journal.jsonl"
+        transcript_dir.mkdir(parents=True, exist_ok=True)
+        journal_path.touch(exist_ok=True)
         resume_from = str(params.get("resumeFromRunId") or "").strip() or None
         previous = self.store.load_run(resume_from) if resume_from else None
         resume_cache = ResumeCache.from_run(previous)
@@ -97,6 +165,7 @@ class WorkflowRunManager:
             "workflowSessionId": workflow_session_id,
             "scriptPath": str(saved_path),
             "transcriptDir": str(transcript_dir),
+            "journalFile": str(journal_path),
             "summary": meta.get("description") or meta.get("name") or "workflow",
             "source": {
                 "type": source.source_type,
@@ -112,6 +181,7 @@ class WorkflowRunManager:
             "agentCache": {},
             "outputFile": None,
             "transcriptFiles": [],
+            "transcriptMetaFiles": [],
         }
         managed = ManagedRun(run_id=run_id, stop_event=stop_event, record=record)
 
@@ -136,6 +206,16 @@ class WorkflowRunManager:
             with managed.lock:
                 return self._public_record(dict(managed.record))
         record = self.store.load_run(run_id)
+        return self._public_record(record) if record else None
+
+    def get_by_task_id(self, task_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            managed_runs = list(self._runs.values())
+        for managed in managed_runs:
+            with managed.lock:
+                if str(managed.record.get("taskId") or "") == str(task_id):
+                    return self._public_record(dict(managed.record))
+        record = self.store.find_run_by_task_id(str(task_id))
         return self._public_record(record) if record else None
 
     def list(self, limit: int = 20) -> list[dict[str, Any]]:
@@ -322,12 +402,14 @@ class WorkflowRunManager:
                     stop_event=managed.stop_event,
                     resume_cache=resume_cache,
                     on_update=lambda state: self._update_state(managed, state),
+                    on_journal=lambda event: self._append_journal_event(managed, event),
                     plugin_context=plugin_context,
                     token_budget_total=token_budget,
                     source_ref=str(managed.record.get("scriptPath") or ""),
                 ),
             )
             snapshot = result.state.snapshot()
+            self._sync_live_child_transcripts(managed, snapshot)
             if managed.stop_event.is_set():
                 status = "stopped"
             else:
@@ -354,6 +436,7 @@ class WorkflowRunManager:
                 agentCache=resume_cache.current,
             )
         finally:
+            self._stop_live_transcript_exporters(managed)
             self._finalize_completion_artifacts(managed)
             _notify_completion(plugin_context, managed.record, config)
 
@@ -372,11 +455,58 @@ class WorkflowRunManager:
 
     def _update_state(self, managed: ManagedRun, state) -> None:
         snapshot = state.snapshot()
+        self._sync_live_child_transcripts(managed, snapshot)
         self._update(
             managed,
             workflow=snapshot,
             display=render_workflow_text(snapshot, completed=False),
         )
+
+    def _sync_live_child_transcripts(self, managed: ManagedRun, snapshot: dict[str, Any]) -> None:
+        transcript_dir_raw = managed.record.get("transcriptDir")
+        if not transcript_dir_raw:
+            return
+        transcript_dir = Path(str(transcript_dir_raw))
+        transcript_dir.mkdir(parents=True, exist_ok=True)
+        with managed.lock:
+            transcript_files = managed.record.setdefault("transcriptFiles", [])
+            meta_files = managed.record.setdefault("transcriptMetaFiles", [])
+            for agent in _iter_agent_snapshots(snapshot):
+                session_id = _agent_session_id(agent)
+                if not session_id:
+                    continue
+                path = _agent_transcript_path(transcript_dir, session_id)
+                meta_path = _agent_meta_path(path)
+                metadata = _agent_transcript_metadata(managed.record, agent, session_id)
+                agent["transcript_path"] = str(path)
+                agent["transcript_meta_path"] = str(meta_path)
+                _append_unique(transcript_files, str(path))
+                _append_unique(meta_files, str(meta_path))
+                exporter = managed.transcript_exporters.get(session_id)
+                if exporter is None:
+                    exporter = LiveTranscriptExporter(
+                        session_id=session_id,
+                        transcript_path=path,
+                        meta_path=meta_path,
+                        metadata=metadata,
+                    )
+                    managed.transcript_exporters[session_id] = exporter
+                    try:
+                        exporter.start()
+                    except Exception as exc:
+                        managed.record["transcriptExportError"] = f"{type(exc).__name__}: {exc}"
+                else:
+                    exporter.update_metadata(metadata)
+
+    def _stop_live_transcript_exporters(self, managed: ManagedRun) -> None:
+        with managed.lock:
+            exporters = list(managed.transcript_exporters.values())
+        for exporter in exporters:
+            try:
+                exporter.stop(final=True)
+            except Exception as exc:
+                with managed.lock:
+                    managed.record["transcriptExportError"] = f"{type(exc).__name__}: {exc}"
 
     def _update(self, managed: ManagedRun, **fields: Any) -> None:
         with managed.lock:
@@ -385,6 +515,19 @@ class WorkflowRunManager:
 
     def _public_record(self, record: dict[str, Any]) -> dict[str, Any]:
         return dict(record)
+
+    def _append_journal_event(self, managed: ManagedRun, event: dict[str, Any]) -> None:
+        with managed.lock:
+            path_raw = str(managed.record.get("journalFile") or "")
+            if not path_raw:
+                return
+            path = Path(path_raw)
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+            except Exception as exc:
+                managed.record["journalError"] = f"{type(exc).__name__}: {exc}"
 
 
 def _content_from_value(value: Any) -> str:
@@ -425,24 +568,22 @@ def _export_child_transcripts(record: dict[str, Any], store: WorkflowStore) -> N
         return
     transcript_dir = Path(str(transcript_dir_raw))
     transcript_dir.mkdir(parents=True, exist_ok=True)
-    run_id = str(record.get("runId") or "")
     files: list[str] = []
+    meta_files: list[str] = []
     for agent in _iter_agent_snapshots(snapshot):
-        session_id = str(
-            agent.get("hermes_session_id")
-            or agent.get("session_id")
-            or agent.get("task_id")
-            or ""
-        )
+        session_id = _agent_session_id(agent)
         if not session_id:
             continue
-        agent_id = str(agent.get("id") or len(files) + 1)
-        path = transcript_dir / f"agent-{run_id}-{agent_id}.jsonl"
+        path = _agent_transcript_path(transcript_dir, session_id)
+        meta_path = _agent_meta_path(path)
         _write_agent_transcript(path, record=record, agent=agent, session_id=session_id)
         agent["transcript_path"] = str(path)
+        agent["transcript_meta_path"] = str(meta_path)
         files.append(str(path))
+        meta_files.append(str(meta_path))
     if files:
         record["transcriptFiles"] = files
+        record["transcriptMetaFiles"] = meta_files
         record["transcriptsExportedAt"] = utc_now_iso()
 
 
@@ -454,32 +595,92 @@ def _write_agent_transcript(
     session_id: str,
 ) -> None:
     messages = _load_session_messages(session_id)
+    _write_agent_transcript_files(
+        path,
+        _agent_meta_path(path),
+        metadata=_agent_transcript_metadata(record, agent, session_id),
+        messages=messages,
+    )
+
+
+def _write_agent_transcript_files(
+    path: Path,
+    meta_path: Path,
+    *,
+    metadata: dict[str, Any],
+    messages: list[dict[str, Any]],
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as fh:
-        fh.write(
-            json.dumps(
-                {
-                    "type": "metadata",
-                    "run_id": record.get("runId"),
-                    "task_id": record.get("taskId"),
-                    "agent_id": agent.get("id"),
-                    "label": agent.get("label"),
-                    "session_id": session_id,
-                },
-                ensure_ascii=False,
-                default=str,
-            )
-            + "\n"
-        )
-        for message in messages:
-            fh.write(
-                json.dumps(
-                    {"type": "message", "message": message},
-                    ensure_ascii=False,
-                    default=str,
-                )
-                + "\n"
-            )
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json_atomic(meta_path, metadata)
+    lines = [
+        json.dumps({"type": "message", "message": message}, ensure_ascii=False, default=str)
+        for message in messages
+    ]
+    _write_text_atomic(path, "".join(f"{line}\n" for line in lines))
+
+
+def _write_json_atomic(path: Path, value: Any) -> None:
+    _write_text_atomic(path, json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n")
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def _agent_session_id(agent: dict[str, Any]) -> str:
+    return str(
+        agent.get("hermes_session_id")
+        or agent.get("session_id")
+        or agent.get("task_id")
+        or ""
+    )
+
+
+def _agent_transcript_path(transcript_dir: Path, session_id: str) -> Path:
+    return transcript_dir / f"agent-{sanitize_filename(session_id)}.jsonl"
+
+
+def _agent_meta_path(transcript_path: Path) -> Path:
+    return transcript_path.with_suffix(".meta.json")
+
+
+def _agent_transcript_metadata(
+    record: dict[str, Any],
+    agent: dict[str, Any],
+    session_id: str,
+) -> dict[str, Any]:
+    return {
+        "run_id": record.get("runId"),
+        "workflow_task_id": record.get("taskId"),
+        "tool_use_id": record.get("toolUseId"),
+        "workflow_session_id": record.get("workflowSessionId"),
+        "agent_id": agent.get("id"),
+        "agent_label": agent.get("label"),
+        "agent_status": agent.get("status"),
+        "agent_type": agent.get("agent_type"),
+        "phase": agent.get("phase"),
+        "session_id": session_id,
+        "runner": agent.get("runner"),
+        "model": agent.get("model"),
+        "workspace": agent.get("workspace"),
+        "isolation": agent.get("isolation"),
+        "prompt": agent.get("prompt"),
+        "prompt_preview": agent.get("prompt_preview"),
+        "tokens": agent.get("tokens"),
+        "tool_calls": agent.get("tool_calls"),
+        "updated_at": utc_now_iso(),
+    }
+
+
+def _append_unique(items: Any, value: str) -> None:
+    if not isinstance(items, list):
+        return
+    if value not in items:
+        items.append(value)
 
 
 def _load_session_messages(session_id: str) -> list[dict[str, Any]]:

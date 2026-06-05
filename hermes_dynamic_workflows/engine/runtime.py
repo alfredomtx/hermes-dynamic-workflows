@@ -27,6 +27,7 @@ class WorkflowOptions:
     stop_event: threading.Event | None = None
     resume_cache: ResumeCache | None = None
     on_update: Callable[[WorkflowState], None] | None = None
+    on_journal: Callable[[dict[str, Any]], None] | None = None
     context: WorkflowExecutionContext | None = None
     parent_frame: WorkflowFrame | None = None
     frame: WorkflowFrame | None = None
@@ -121,6 +122,7 @@ def run_workflow(script: str, options: WorkflowOptions | None = None) -> Workflo
             deadline=monotonic() + config.workflow_timeout_seconds,
             root=root,
             on_update=options.on_update,
+            on_journal=options.on_journal,
             plugin_context=options.plugin_context,
             token_budget_total=(
                 options.token_budget_total

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from time import monotonic
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 AgentStatus = Literal["queued", "running", "done", "error", "skipped"]
 
@@ -207,6 +207,7 @@ class ChildAgentRequest:
     cwd: str | None = None
     request_overrides: dict[str, Any] | None = None
     structured_tool: bool = False
+    on_start: Callable[[dict[str, Any]], None] | None = None
 
 
 class ChildAgentRunner:
