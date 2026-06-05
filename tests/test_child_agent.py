@@ -151,6 +151,21 @@ class ToolCallCountTests(unittest.TestCase):
         self.assertEqual(_tool_call_count({}), 0)
 
 
+class RunnerSessionContextTests(unittest.TestCase):
+    def test_runner_stores_session_context(self):
+        from hermes_dynamic_workflows.agents.runner import HermesChildAgentRunner
+
+        ctx = {"platform": "telegram", "session_key": "k1", "chat_id": "c1"}
+        runner = HermesChildAgentRunner(PluginConfig(), session_context=ctx)
+        self.assertEqual(runner._session_context["platform"], "telegram")
+        self.assertEqual(runner._session_context["session_key"], "k1")
+
+    def test_runner_session_context_defaults_none(self):
+        from hermes_dynamic_workflows.agents.runner import HermesChildAgentRunner
+
+        self.assertIsNone(HermesChildAgentRunner(PluginConfig())._session_context)
+
+
 class ConfigDefaultsTests(unittest.TestCase):
     def test_model_override_on_provider_override_off_by_default(self):
         # Aligns with Claude Code: per-agent model routing is allowed by default

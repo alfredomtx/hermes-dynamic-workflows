@@ -46,6 +46,8 @@ class PluginConfig:
     #   deny    -> refuse flagged commands (safe default)
     #   approve -> allow flagged commands (hardline still blocked upstream)
     #   smart   -> defer to Hermes' _smart_approve auxiliary-LLM guardian
+    #   ask     -> in a gateway session, route to the user for mid-run approval;
+    #              with no interactive channel (CLI background/headless), refuse
     child_approval_policy: str = "deny"
     # How agent(schema=...) constrains child output:
     #   "auto"/"tool" -> child calls workflow_submit_structured_output, validated
@@ -205,7 +207,7 @@ def load_config() -> PluginConfig:
                 raw.get("child_approval_policy"),
             ),
             default.child_approval_policy,
-            {"deny", "smart", "approve"},
+            {"deny", "smart", "approve", "ask"},
         ),
         notify_on_complete=_as_bool(
             os.getenv("HERMES_DYNAMIC_WORKFLOWS_NOTIFY_ON_COMPLETE", raw.get("notify_on_complete")),

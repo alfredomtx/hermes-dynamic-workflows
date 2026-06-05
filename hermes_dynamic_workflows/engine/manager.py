@@ -80,6 +80,9 @@ class WorkflowRunManager:
         resume_cache = ResumeCache.from_run(previous)
         args = params["args"] if "args" in params else None
         token_budget = _as_positive_int(params.get("token_budget"))
+        # Captured in the launching (parent) context, which carries the gateway
+        # session vars when the run is started from a gateway session.
+        session_context = _capture_gateway_session_context()
 
         stop_event = threading.Event()
         record = {
@@ -118,7 +121,7 @@ class WorkflowRunManager:
 
         thread = threading.Thread(
             target=self._run_thread,
-            args=(managed, source.script, args, config, resume_cache, cwd, plugin_context, token_budget),
+            args=(managed, source.script, args, config, resume_cache, cwd, plugin_context, token_budget, session_context),
             name=f"workflow-{run_id}",
             daemon=True,
         )
@@ -302,11 +305,12 @@ class WorkflowRunManager:
         cwd: str | None,
         plugin_context: Any,
         token_budget: int | None = None,
+        session_context: dict[str, str] | None = None,
     ) -> None:
         try:
             from ..agents.runner import HermesChildAgentRunner
 
-            managed.child_runner = HermesChildAgentRunner(config)
+            managed.child_runner = HermesChildAgentRunner(config, session_context=session_context)
             self._update(managed, status="running", startedAt=utc_now_iso())
             result = run_workflow(
                 script,
@@ -541,6 +545,32 @@ def _get_hermes_session_env(name: str) -> str:
         return str(get_session_env(name, "") or "").strip()
     except Exception:
         return os.getenv(name, "").strip()
+
+
+def _capture_gateway_session_context() -> dict[str, str] | None:
+    """Capture the launching gateway session vars (parent context only).
+
+    Returns None outside a gateway session. Used so a child worker thread can
+    re-apply them and route a flagged command to the originating user for
+    mid-run approval (child_approval_policy="ask").
+    """
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        return None
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    if not platform:
+        return None  # not a gateway session
+    keys = {
+        "platform": "HERMES_SESSION_PLATFORM",
+        "chat_id": "HERMES_SESSION_CHAT_ID",
+        "chat_name": "HERMES_SESSION_CHAT_NAME",
+        "thread_id": "HERMES_SESSION_THREAD_ID",
+        "user_id": "HERMES_SESSION_USER_ID",
+        "user_name": "HERMES_SESSION_USER_NAME",
+        "session_key": "HERMES_SESSION_KEY",
+    }
+    return {field: get_session_env(env, "") for field, env in keys.items()}
 
 
 def _notify_completion(plugin_context: Any, record: dict[str, Any], config: PluginConfig) -> None:

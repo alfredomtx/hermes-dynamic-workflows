@@ -29,8 +29,13 @@ logger = logging.getLogger(__name__)
 class HermesChildAgentRunner(ChildAgentRunner):
     """Create standalone Hermes AIAgent children without native delegation."""
 
-    def __init__(self, config: PluginConfig):
+    def __init__(self, config: PluginConfig, session_context: dict[str, str] | None = None):
         self.config = config
+        # Captured gateway session vars (platform/session_key/chat_id/...) from
+        # the launching session, re-applied on each child worker thread so a
+        # child's dangerous command can route to the user for mid-run approval
+        # (child_approval_policy="ask"). None outside gateway.
+        self._session_context = session_context or None
         self._active_children: list[Any] = []
         self._active_lock = threading.RLock()
 
@@ -202,14 +207,23 @@ class HermesChildAgentRunner(ChildAgentRunner):
             # child's terminal tool has it when a flagged command would prompt.
             # Mirrors tools/delegate_tool.py's ThreadPoolExecutor(initializer=...)
             # pattern (see GHSA-qg5c-hvr5-hjgr).
-            if approval_callback is None:
-                return
-            try:
-                from tools.terminal_tool import set_approval_callback
+            if approval_callback is not None:
+                try:
+                    from tools.terminal_tool import set_approval_callback
 
-                set_approval_callback(approval_callback)
-            except Exception:
-                pass
+                    set_approval_callback(approval_callback)
+                except Exception:
+                    pass
+            # Re-apply the launching gateway session context (contextvars don't
+            # cross into detached threads) so check_all_command_guards can route
+            # a flagged command to the originating user for mid-run approval.
+            if self._session_context:
+                try:
+                    from gateway.session_context import set_session_vars
+
+                    set_session_vars(**self._session_context)
+                except Exception:
+                    pass
 
         def _run() -> dict[str, Any]:
             _register_task_cwd(lease.task_id, lease.cwd)

@@ -46,12 +46,18 @@ def evaluate_command_gate(
     allowlist: Any,
     policy: str,
     smart_approve: Callable[[str, str], str],
+    is_gateway: bool = False,
 ) -> dict[str, str] | None:
     """Pure policy decision for a workflow-child terminal command in a non-CLI
     context. Returns a block directive, or None to allow.
 
     Only genuinely dangerous, non-allowlisted commands are gated; the hardline
     floor and the rest of Hermes' engine still run downstream for allowed ones.
+
+    ``ask`` defers (returns None) when a gateway approval channel is present
+    so Hermes' check_all_command_guards routes the command to the user (mid-run
+    approve/deny); with no channel it refuses, since a detached child has no way
+    to ask.
     """
     is_dangerous, pattern_key, description = classify(command)
     if not is_dangerous:
@@ -63,6 +69,8 @@ def evaluate_command_gate(
         pass
     if policy == "approve":
         return None
+    if policy == "ask":
+        return None if is_gateway else _block(description)
     if policy == "smart":
         try:
             if smart_approve(command, description) == "approve":
@@ -90,6 +98,17 @@ def _policy() -> str:
         return load_config().child_approval_policy
     except Exception:
         return "deny"
+
+
+def _is_gateway_context() -> bool:
+    """True when a gateway approval channel is available on this thread (the
+    runner sets the session vars on the child worker thread)."""
+    try:
+        from tools.approval import _is_gateway_approval_context
+
+        return bool(_is_gateway_approval_context())
+    except Exception:
+        return False
 
 
 def pre_tool_call_handler(
@@ -128,4 +147,5 @@ def pre_tool_call_handler(
         allowlist=allowlist,
         policy=_policy(),
         smart_approve=_smart_approve,
+        is_gateway=_is_gateway_context(),
     )

@@ -64,6 +64,24 @@ class CommandGateTests(unittest.TestCase):
         )
         self.assertEqual(result["action"], "block")
 
+    def test_ask_policy_defers_when_gateway(self):
+        # In a gateway context the command is routed to the user, so the hook
+        # defers (None) to Hermes' check_all_command_guards.
+        self.assertIsNone(
+            evaluate_command_gate(
+                "rm -rf /tmp/x", classify=_dangerous, allowlist=set(),
+                policy="ask", smart_approve=_deny, is_gateway=True,
+            )
+        )
+
+    def test_ask_policy_blocks_without_gateway(self):
+        # No gateway channel (headless): a detached child can't ask, so refuse.
+        result = evaluate_command_gate(
+            "rm -rf /tmp/x", classify=_dangerous, allowlist=set(),
+            policy="ask", smart_approve=_deny, is_gateway=False,
+        )
+        self.assertEqual(result["action"], "block")
+
     def test_smart_eval_failure_blocks(self):
         def boom(_c, _d):
             raise RuntimeError("llm down")
