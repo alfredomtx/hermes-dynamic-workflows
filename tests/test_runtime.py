@@ -313,6 +313,59 @@ return await agent("work", {"agentType": "planner"})
         self.assertEqual(len(runner.requests), 1)
         self.assertIsNone(runner.requests[0].model)
 
+    def test_phase_model_applies_to_agent_without_explicit_model(self):
+        script = """
+meta = {
+    "name": "phase-model",
+    "description": "Test workflow",
+    "phases": [{"title": "Search", "model": "sonnet"}],
+}
+
+phase("Search")
+return await agent("work")
+"""
+        runner = FakeRunner()
+        run_workflow(script, WorkflowOptions(child_runner=runner))
+
+        self.assertEqual(len(runner.requests), 1)
+        self.assertEqual(runner.requests[0].phase, "Search")
+        self.assertEqual(runner.requests[0].model, "sonnet")
+
+    def test_agent_phase_option_uses_matching_phase_model(self):
+        script = """
+meta = {
+    "name": "opts-phase-model",
+    "description": "Test workflow",
+    "phases": [{"title": "Verify", "model": "haiku"}],
+}
+
+return await agent("work", {"phase": "Verify"})
+"""
+        runner = FakeRunner()
+        run_workflow(script, WorkflowOptions(child_runner=runner))
+
+        self.assertEqual(len(runner.requests), 1)
+        self.assertEqual(runner.requests[0].phase, "Verify")
+        self.assertEqual(runner.requests[0].model, "haiku")
+
+    def test_agent_model_overrides_phase_model(self):
+        script = """
+meta = {
+    "name": "explicit-model",
+    "description": "Test workflow",
+    "phases": [{"title": "Search", "model": "sonnet"}],
+}
+
+phase("Search")
+return await agent("work", {"model": "opus"})
+"""
+        runner = FakeRunner()
+        run_workflow(script, WorkflowOptions(child_runner=runner))
+
+        self.assertEqual(len(runner.requests), 1)
+        self.assertEqual(runner.requests[0].phase, "Search")
+        self.assertEqual(runner.requests[0].model, "opus")
+
     def test_public_isolation_only_accepts_worktree(self):
         script = """
 meta = {"name": "strict-isolation", "description": "Test workflow"}

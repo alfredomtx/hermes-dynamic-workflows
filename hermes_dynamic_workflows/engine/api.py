@@ -95,16 +95,17 @@ class WorkflowAPI:
                 validate_json_schema(schema)
             except StructuredOutputError as exc:
                 raise WorkflowRuntimeError(str(exc)) from exc
+        phase_name = str(opts.get("phase") or self.frame.current_phase or "") or None
         resolved = _resolve_agent_spec(
             opts,
             cwd=self.frame.cwd,
             config=self.config,
             structured_output=schema is not None,
+            phase_model=_phase_model(self.frame, phase_name),
         )
 
         with self._lock:
             agent_id = self.context.reserve_agent()
-            phase_name = str(opts.get("phase") or self.frame.current_phase or "") or None
             label = str(opts.get("label") or f"agent-{agent_id}")
             record = AgentRecord(
                 id=agent_id,
@@ -114,6 +115,7 @@ class WorkflowAPI:
                 prompt_preview=preview(prompt, 160),
                 agent_type=resolved.agent_type_name,
                 isolation=resolved.isolation or "shared",
+                model=resolved.model,
             )
             self.frame.agents.append(record)
             self._notify()
@@ -455,6 +457,7 @@ def _resolve_agent_spec(
     cwd: str,
     config: Any,
     structured_output: bool,
+    phase_model: str | None = None,
 ) -> ResolvedAgentSpec:
     from ..agent.presets import list_agent_types, resolve_agent_type
     from ..agent.runner import (
@@ -479,6 +482,8 @@ def _resolve_agent_spec(
     model = _normalize_agent_model(
         opts.get("model")
         if opts.get("model")
+        else phase_model
+        if phase_model
         else getattr(agent_type_spec, "model", None)
     )
     _prepare_mcp_tool_registry(config)
@@ -505,6 +510,15 @@ def _resolve_agent_spec(
         system_prompt_hash=hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         workspace=str(Path(cwd).expanduser().resolve()),
     )
+
+
+def _phase_model(frame: WorkflowFrame, phase_name: str | None) -> str | None:
+    if not phase_name:
+        return None
+    for phase in frame.phases:
+        if phase.title == phase_name:
+            return _normalize_agent_model(phase.model)
+    return None
 
 
 def _normalize_workflow_ref(name_or_ref: Any) -> dict[str, str]:
