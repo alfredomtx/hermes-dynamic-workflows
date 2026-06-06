@@ -16,7 +16,7 @@ from .presets import AgentTypeSpec, list_agent_types, resolve_agent_type
 from .worktree import WorkspaceLease, create_workspace_lease
 from ..core.config import PluginConfig
 from ..core.errors import ChildAgentError, ChildAgentSkipped, WorkflowTimeout
-from ..plugin.structured_output import (
+from .structured_output import (
     MAX_STRUCTURED_OUTPUT_RETRIES,
     STRUCTURED_OUTPUT_CONTINUE_MESSAGE,
     STRUCTURED_OUTPUT_TOOL_NAME,

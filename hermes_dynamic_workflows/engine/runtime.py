@@ -112,7 +112,7 @@ async def _run_workflow_async(script: str, options: WorkflowOptions | None = Non
 
     if context is None:
         if options.child_runner is None:
-            from ..agent.runner import HermesChildAgentRunner
+            from ..child.runner import HermesChildAgentRunner
 
             child_runner = HermesChildAgentRunner(config)
         else:

@@ -68,7 +68,7 @@ class ControlTests(unittest.TestCase):
             client = ControlClient(store)
             try:
                 with patch(
-                    "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
+                    "hermes_dynamic_workflows.child.runner.HermesChildAgentRunner",
                     return_value=runner,
                 ):
                     record = manager.start_from_params(
@@ -117,7 +117,7 @@ class ControlTests(unittest.TestCase):
             try:
                 blocking = SequentialRunner()
                 with patch(
-                    "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
+                    "hermes_dynamic_workflows.child.runner.HermesChildAgentRunner",
                     return_value=blocking,
                 ):
                     active = manager.start_from_params(
@@ -138,7 +138,7 @@ class ControlTests(unittest.TestCase):
                 self.assertEqual(final["status"], "stopped")
 
                 with patch(
-                    "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
+                    "hermes_dynamic_workflows.child.runner.HermesChildAgentRunner",
                     return_value=ImmediateRunner(),
                 ):
                     restarted = client.request(
@@ -169,7 +169,7 @@ class ControlTests(unittest.TestCase):
             try:
                 with (
                     patch(
-                        "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
+                        "hermes_dynamic_workflows.child.runner.HermesChildAgentRunner",
                         return_value=runner,
                     ),
                     patch(
@@ -261,7 +261,7 @@ listener.stop()
             )
             try:
                 with patch(
-                    "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
+                    "hermes_dynamic_workflows.child.runner.HermesChildAgentRunner",
                     return_value=ImmediateRunner(),
                 ):
                     record = manager.start_from_params(
@@ -293,7 +293,7 @@ listener.stop()
             )
             try:
                 with patch(
-                    "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
+                    "hermes_dynamic_workflows.child.runner.HermesChildAgentRunner",
                     return_value=ImmediateRunner(),
                 ):
                     record = manager.start_from_params(
@@ -357,7 +357,7 @@ result = await agent("work", {"label": "worker"})
                     enable_control=True,
                 )
             with patch(
-                "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
+                "hermes_dynamic_workflows.child.runner.HermesChildAgentRunner",
                 return_value=ImmediateRunner(),
             ):
                 record = manager.start_from_params(

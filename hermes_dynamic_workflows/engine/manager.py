@@ -962,7 +962,7 @@ class WorkflowRunManager:
         session_context: dict[str, str] | None = None,
     ) -> None:
         try:
-            from ..agent.runner import HermesChildAgentRunner
+            from ..child.runner import HermesChildAgentRunner
 
             managed.child_runner = HermesChildAgentRunner(
                 config,

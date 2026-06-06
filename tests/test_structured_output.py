@@ -13,7 +13,7 @@ from hermes_dynamic_workflows.core.types import (
     ChildAgentResult,
     ChildAgentRunner,
 )
-from hermes_dynamic_workflows.plugin.structured_output import (
+from hermes_dynamic_workflows.child.structured_output import (
     STRUCTURED_OUTPUT_SUCCESS,
     STRUCTURED_OUTPUT_TOOL_SCHEMA,
     build_tool_schema_instruction,
@@ -198,7 +198,7 @@ class DynamicToolSchemaTests(unittest.TestCase):
 
         registry = Registry()
         with patch(
-            "hermes_dynamic_workflows.plugin.structured_output._tool_registry",
+            "hermes_dynamic_workflows.child.structured_output._tool_registry",
             return_value=registry,
         ):
             self.assertIsNone(registry.entry)

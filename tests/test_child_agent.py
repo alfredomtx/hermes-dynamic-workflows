@@ -8,8 +8,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from hermes_dynamic_workflows.agent.presets import AgentTypeSpec, list_agent_types, resolve_agent_type
-from hermes_dynamic_workflows.agent.runner import (
+from hermes_dynamic_workflows.child.presets import AgentTypeSpec, list_agent_types, resolve_agent_type
+from hermes_dynamic_workflows.child.runner import (
     HermesChildAgentRunner,
     build_child_system_prompt,
     build_child_task_message,
@@ -22,11 +22,11 @@ from hermes_dynamic_workflows.agent.runner import (
     _resolve_child_toolsets,
     _tool_call_count,
 )
-from hermes_dynamic_workflows.agent.worktree import WorkspaceLease
+from hermes_dynamic_workflows.child.worktree import WorkspaceLease
 from hermes_dynamic_workflows.core.config import PluginConfig
 from hermes_dynamic_workflows.core.errors import ChildAgentError
 from hermes_dynamic_workflows.core.types import ChildAgentRequest
-from hermes_dynamic_workflows.plugin.structured_output import (
+from hermes_dynamic_workflows.child.structured_output import (
     MAX_STRUCTURED_OUTPUT_RETRIES,
     STRUCTURED_OUTPUT_CONTINUE_MESSAGE,
     clear_expectation,
@@ -74,7 +74,7 @@ class ChildAgentTests(unittest.TestCase):
 
     def test_explicit_agent_type_does_not_gain_discoverable_toolsets(self):
         with patch(
-            "hermes_dynamic_workflows.agent.runner._discoverable_child_toolsets",
+            "hermes_dynamic_workflows.child.runner._discoverable_child_toolsets",
             return_value=["mcp-github", "plugin-extra"],
         ):
             self.assertEqual(
@@ -544,7 +544,7 @@ class ToolCallCountTests(unittest.TestCase):
 
 class RunnerSessionContextTests(unittest.TestCase):
     def test_runner_stores_session_context(self):
-        from hermes_dynamic_workflows.agent.runner import HermesChildAgentRunner
+        from hermes_dynamic_workflows.child.runner import HermesChildAgentRunner
 
         ctx = {"platform": "telegram", "session_key": "k1", "chat_id": "c1"}
         runner = HermesChildAgentRunner(PluginConfig(), session_context=ctx)
@@ -552,7 +552,7 @@ class RunnerSessionContextTests(unittest.TestCase):
         self.assertEqual(runner._session_context["session_key"], "k1")
 
     def test_runner_session_context_defaults_none(self):
-        from hermes_dynamic_workflows.agent.runner import HermesChildAgentRunner
+        from hermes_dynamic_workflows.child.runner import HermesChildAgentRunner
 
         self.assertIsNone(HermesChildAgentRunner(PluginConfig())._session_context)
 

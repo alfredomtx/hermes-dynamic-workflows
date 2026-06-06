@@ -86,7 +86,7 @@ return budget.total
             )
             with (
                 patch("hermes_dynamic_workflows.plugin.workflow.get_run_manager", return_value=manager),
-                patch("hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner", return_value=FakeRunner()),
+                patch("hermes_dynamic_workflows.child.runner.HermesChildAgentRunner", return_value=FakeRunner()),
             ):
                 with_budget = workflow(
                     {"script": script, "token_budget": 1},
@@ -131,7 +131,7 @@ return await agent("do it", {"label": "worker"})
             )
             with (
                 patch("hermes_dynamic_workflows.plugin.workflow.get_run_manager", return_value=manager),
-                patch("hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner", return_value=FakeRunner()),
+                patch("hermes_dynamic_workflows.child.runner.HermesChildAgentRunner", return_value=FakeRunner()),
             ):
                 result = workflow({"script": script, "args": ["x"]}, task_id="tool-session")
                 match = re.search(r"^Run ID: (wf_[a-z0-9]{8}-[a-z0-9]{3})$", result, re.MULTILINE)
@@ -185,7 +185,7 @@ return await agent("do it", {"label": "worker"})
             with (
                 patch("hermes_dynamic_workflows.plugin.workflow.get_run_manager", return_value=manager),
                 patch(
-                    "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
+                    "hermes_dynamic_workflows.child.runner.HermesChildAgentRunner",
                     side_effect=runner_factory,
                 ),
             ):
@@ -223,7 +223,7 @@ return await agent("wait", {"label": "worker"})
             with (
                 patch("hermes_dynamic_workflows.plugin.workflow.get_run_manager", return_value=manager),
                 patch("hermes_dynamic_workflows.plugin.task_stop.get_run_manager", return_value=manager),
-                patch("hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner", return_value=runner),
+                patch("hermes_dynamic_workflows.child.runner.HermesChildAgentRunner", return_value=runner),
             ):
                 launch = workflow({"script": script}, task_id="tool-session")
                 run_id = re.search(
@@ -286,7 +286,7 @@ return await agent("wait", {"label": "worker"})
             )
             with (
                 patch("hermes_dynamic_workflows.plugin.workflow.get_run_manager", return_value=manager),
-                patch("hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner", return_value=runner),
+                patch("hermes_dynamic_workflows.child.runner.HermesChildAgentRunner", return_value=runner),
             ):
                 launch = workflow({"script": script}, task_id="tool-session")
                 run_id = re.search(

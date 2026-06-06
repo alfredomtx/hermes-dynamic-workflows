@@ -459,8 +459,8 @@ def _resolve_agent_spec(
     structured_output: bool,
     phase_model: str | None = None,
 ) -> ResolvedAgentSpec:
-    from ..agent.presets import list_agent_types, resolve_agent_type
-    from ..agent.runner import (
+    from ..child.presets import list_agent_types, resolve_agent_type
+    from ..child.runner import (
         _prepare_mcp_tool_registry,
         _resolve_child_toolsets,
         build_child_system_prompt,

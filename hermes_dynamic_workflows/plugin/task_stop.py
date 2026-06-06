@@ -6,7 +6,7 @@ import json
 from typing import Any
 
 from ..engine.manager import get_run_manager
-from .tool_errors import tool_error
+from ..core.tool_errors import tool_error
 
 _DESCRIPTION = """
 - Stop a running workflow by its Task ID
