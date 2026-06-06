@@ -31,137 +31,58 @@ def render_workflow_text(snapshot: dict[str, Any], *, completed: bool = True, ma
     return "\n".join(parts)
 
 
-def render_runs_list(runs: list[dict[str, Any]]) -> str:
+def render_agent_overview(runs: list[dict[str, Any]], *, max_agents_per_run: int = 6) -> str:
     if not runs:
-        return "No workflow runs found."
+        return "No workflow runs found.\n\nRun `hermes-workflows` in a terminal for live monitoring and controls."
     running = sum(1 for run in runs if run.get("status") in {"queued", "running", "paused", "stopping"})
     completed = sum(1 for run in runs if run.get("status") == "completed")
     lines = ["Dynamic workflows", f"{running} running . {completed} completed", ""]
-    for index, run in enumerate(runs, start=1):
+    for run in runs:
         snapshot = run.get("workflow") or {}
         meta = snapshot.get("meta") or {}
         name = meta.get("name") or run.get("source", {}).get("ref") or "workflow"
-        marker = ">" if index == 1 and run.get("status") in {"queued", "running", "paused", "stopping"} else " "
         totals = _totals(snapshot)
         errors = totals.get("errors") or 0
-        error_note = f" . {errors} err" if errors else ""
-        lines.append(
-            f"{marker} {status_icon(run.get('status'))} {name}  "
-            f"{totals['agents']} agents . {_format_tokens(totals['tokens'])} tok{error_note} . "
-            f"{_format_duration(_duration(run, snapshot))} . {run.get('runId')}"
+        if errors:
+            status_line = f"{totals['done']}/{totals['agents']} agents done . {errors} err"
+        else:
+            status_line = f"{totals['done']}/{totals['agents']} agents done"
+        if totals["running"]:
+            status_line += f" . {totals['running']} running"
+        status_line += (
+            f" . {_format_tokens(totals['tokens'])} tok . "
+            f"{_format_duration(_duration(run, snapshot))} . {run.get('status')}"
         )
-    lines.extend(
-        [
-            "",
-            "Use: /workflows <runId> . /workflows <runId> phase <name|index> . "
-            "/workflows <runId> agent <id|label> . /workflow-stop <runId>",
-        ]
-    )
-    return "\n".join(lines)
-
-
-def render_run_detail(run: dict[str, Any]) -> str:
-    snapshot = run.get("workflow") or {}
-    meta = snapshot.get("meta") or {}
-    name = meta.get("name") or run.get("source", {}).get("ref") or "workflow"
-    description = meta.get("description") or ""
-    totals = _totals(snapshot)
-    header = (
-        f"{totals['done']}/{totals['agents']} agents . "
-        f"{_format_tokens(totals['tokens'])} tok"
-    )
-    if totals.get("cache_read_tokens"):
-        header += f" ({_format_tokens(totals['cache_read_tokens'])} cached read)"
-    header += (
-        f" . {_format_duration(_duration(run, snapshot))} . "
-        f"{run.get('status')} . {run.get('runId')}"
-    )
-    lines = [
-        str(name),
-        str(description) if description else "",
-        header,
-        "",
-    ]
-    _render_frame_detail(lines, snapshot, level=0)
-    errors = _all_errors(snapshot)
-    if errors:
-        lines.append("Errors")
-        lines.extend(f"- {preview(error, 180)}" for error in errors)
+        task_id = str(run.get("taskId") or "")
+        task_part = f"Task: {task_id} . " if task_id else ""
+        lines.append(f"{status_icon(run.get('status'))} {name}  {run.get('runId')}")
+        lines.append(f"  {task_part}{status_line}")
+        agents = _all_agents(snapshot)
+        if agents:
+            for agent in agents[:max_agents_per_run]:
+                lines.append(f"  - {render_agent_row(agent)}")
+            hidden = len(agents) - max_agents_per_run
+            if hidden > 0:
+                lines.append(f"  - ... {hidden} more agent(s)")
+        else:
+            lines.append("  - no agents started")
         lines.append("")
-    if run.get("result") is not None:
-        lines.append("Result")
-        lines.append(preview(run.get("result"), 1000))
-    return "\n".join(line for line in lines if line is not None).rstrip()
-
-
-def render_phase_detail(run: dict[str, Any], selector: str) -> str:
-    snapshot = run.get("workflow") or {}
-    phases = _phase_names(snapshot, recursive=True)
-    phase = _select_phase(phases, selector)
-    if phase is None:
-        return f"Phase not found: {selector}"
-    agents = [agent for agent in _all_agents(snapshot) if agent.get("phase") == phase]
-    lines = [f"{phase} . {len(agents)} agents", ""]
-    if not agents:
-        lines.append("Not started yet")
-    else:
-        lines.extend(render_agent_row(agent) for agent in agents)
-    return "\n".join(lines)
-
-
-def render_agent_detail(run: dict[str, Any], selector: str) -> str:
-    snapshot = run.get("workflow") or {}
-    agent = _select_agent(_all_agents(snapshot), selector)
-    if agent is None:
-        return f"Agent not found: {selector}"
-    lines = [
-        f"agent #{agent.get('id')} {agent.get('label')}",
-        f"Status: {agent.get('status')}",
-    ]
-    if agent.get("phase"):
-        lines.append(f"Phase: {agent.get('phase')}")
-    if agent.get("agent_type"):
-        lines.append(f"Agent type: {agent.get('agent_type')}")
-    if agent.get("isolation"):
-        lines.append(f"Isolation: {agent.get('isolation')}")
-    if agent.get("workspace"):
-        lines.append(f"Workspace: {agent.get('workspace')}")
-    if agent.get("model"):
-        lines.append(f"Model: {agent.get('model')}")
-    if agent.get("hermes_session_id"):
-        lines.append(f"Hermes session: {agent.get('hermes_session_id')}")
-    if agent.get("transcript_path"):
-        lines.append(f"Transcript: {agent.get('transcript_path')}")
-    stats = []
-    if agent.get("tokens"):
-        stats.append(f"{_format_tokens(agent.get('tokens'))} tok")
-    if agent.get("cache_read_tokens"):
-        stats.append(f"{_format_tokens(agent.get('cache_read_tokens'))} cached read")
-    if agent.get("cache_write_tokens"):
-        stats.append(f"{_format_tokens(agent.get('cache_write_tokens'))} cache write")
-    if agent.get("tool_calls"):
-        stats.append(f"{agent.get('tool_calls')} tool calls")
-    if int(agent.get("attempts") or 0) > 1:
-        stats.append(f"{agent.get('attempts')} attempts")
-    if stats:
-        lines.append("Stats: " + " . ".join(stats))
-    structured = agent.get("structured")
-    if isinstance(structured, dict) and structured:
-        lines.extend(["", "Structured output"])
-        lines.append(f"Status: {structured.get('status') or 'unknown'}")
-        if structured.get("mode"):
-            lines.append(f"Mode: {structured.get('mode')}")
-        if structured.get("attempts") is not None:
-            lines.append(f"Attempts: {structured.get('attempts')}")
-        if structured.get("error"):
-            lines.append(f"Error: {structured.get('error')}")
-    lines.extend(["", "Prompt", preview(agent.get("prompt") or agent.get("prompt_preview") or "", 2000)])
-    lines.extend(["", "Outcome", agent.get("result_preview") or agent.get("error") or "Still running..."])
-    return "\n".join(lines)
+    lines.append("Run `hermes-workflows` in a terminal for live monitoring and controls.")
+    return "\n".join(lines).rstrip()
 
 
 def render_saved_markdown(run: dict[str, Any]) -> str:
-    return "# Workflow Run\n\n" + render_run_detail(run) + "\n"
+    snapshot = run.get("workflow") or {}
+    completed = run.get("status") not in {"queued", "running", "paused", "stopping"}
+    lines = ["# Workflow Run", "", render_workflow_text(snapshot, completed=completed), ""]
+    if run.get("result") is not None:
+        lines.extend(["## Result", "", preview(run.get("result"), 4000), ""])
+    errors = _all_errors(snapshot)
+    if errors:
+        lines.extend(["## Errors", ""])
+        lines.extend(f"- {preview(error, 300)}" for error in errors)
+        lines.append("")
+    return "\n".join(lines)
 
 
 def render_agent_row(agent: dict[str, Any]) -> str:
@@ -172,6 +93,10 @@ def render_agent_row(agent: dict[str, Any]) -> str:
         parts.append(str(agent.get("model")))
     if agent.get("tokens"):
         parts.append(f"{_format_tokens(agent.get('tokens'))} tok")
+    if agent.get("cache_read_tokens"):
+        parts.append(f"{_format_tokens(agent.get('cache_read_tokens'))} cached read")
+    if agent.get("cache_write_tokens"):
+        parts.append(f"{_format_tokens(agent.get('cache_write_tokens'))} cache write")
     if agent.get("tool_calls"):
         parts.append(f"{agent.get('tool_calls')} tools")
     if agent.get("agent_type"):
@@ -235,36 +160,6 @@ def _render_frame_tree(parts: list[str], frame: dict[str, Any], *, indent: str, 
         _render_frame_tree(parts, child, indent=indent + "  ", max_agents=max_agents)
 
 
-def _render_frame_detail(lines: list[str], frame: dict[str, Any], *, level: int) -> None:
-    prefix = "  " * level
-    if level > 0:
-        meta = frame.get("meta") or {}
-        name = meta.get("name") or frame.get("source_ref") or "workflow"
-        totals = _totals(frame)
-        lines.append(f"{prefix}> {name} . {totals['done']}/{totals['agents']} agents")
-    phases = _phase_names(frame, recursive=False)
-    agents = frame.get("agents") or []
-    if phases:
-        lines.append(f"{prefix}Phases")
-        for index, phase in enumerate(phases, start=1):
-            phase_agents = [agent for agent in agents if agent.get("phase") == phase]
-            phase_done = sum(1 for agent in phase_agents if agent.get("status") == "done")
-            suffix = "not started" if not phase_agents else f"{phase_done}/{len(phase_agents)}"
-            current = ">" if phase == frame.get("current_phase") else " "
-            lines.append(f"{prefix}{current} {index} {phase} {suffix}")
-        lines.append("")
-    for phase in phases or ["Agents"]:
-        phase_agents = agents if phase == "Agents" else [agent for agent in agents if agent.get("phase") == phase]
-        if not phase_agents:
-            continue
-        lines.append(f"{prefix}{phase} . {len(phase_agents)} agents")
-        for agent in phase_agents:
-            lines.append(prefix + "  " + render_agent_row(agent))
-        lines.append("")
-    for child in frame.get("children") or []:
-        _render_frame_detail(lines, child, level=level + 1)
-
-
 def _render_agent(agent: dict[str, Any], indent: str) -> str:
     marker = {
         "queued": ".",
@@ -302,34 +197,6 @@ def _phase_names(snapshot: dict[str, Any], *, recursive: bool) -> list[str]:
                 if phase not in phases:
                     phases.append(phase)
     return phases
-
-
-def _select_phase(phases: list[str], selector: str) -> str | None:
-    clean = str(selector or "").strip()
-    if not clean:
-        return None
-    if clean.isdigit():
-        index = int(clean) - 1
-        if 0 <= index < len(phases):
-            return phases[index]
-    for phase in phases:
-        if phase == clean or phase.lower() == clean.lower():
-            return phase
-    return None
-
-
-def _select_agent(agents: list[dict[str, Any]], selector: str) -> dict[str, Any] | None:
-    clean = str(selector or "").strip()
-    if not clean:
-        return None
-    for agent in agents:
-        if str(agent.get("id")) == clean or str(agent.get("label")) == clean:
-            return agent
-    lowered = clean.lower()
-    for agent in agents:
-        if str(agent.get("label") or "").lower() == lowered:
-            return agent
-    return None
 
 
 def _all_agents(snapshot: dict[str, Any]) -> list[dict[str, Any]]:

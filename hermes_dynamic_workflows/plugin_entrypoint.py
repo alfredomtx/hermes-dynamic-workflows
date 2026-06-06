@@ -5,20 +5,13 @@ from __future__ import annotations
 import os
 
 from hermes_dynamic_workflows.engine.approval_hook import pre_tool_call_handler
-from hermes_dynamic_workflows.plugin import registrar
 from hermes_dynamic_workflows.plugin.task_stop import TASK_STOP_SCHEMA, task_stop
 from hermes_dynamic_workflows.plugin.workflow import get_dynamic_workflow_schema, workflow
-from hermes_dynamic_workflows.ui.commands import (
-    discover_named_workflows,
-    make_named_workflow_handler,
-    workflow_stop_command,
-    workflows_command,
-)
+from hermes_dynamic_workflows.ui.commands import workflows_command
 
 
 def register(ctx) -> None:
     """Register the workflow tool and commands with Hermes."""
-    registrar.set_plugin_context(ctx)
     cwd = os.environ.get("TERMINAL_CWD") or os.getcwd()
 
     def _workflow_handler(params, **kwargs):
@@ -52,32 +45,6 @@ def register(ctx) -> None:
     ctx.register_command(
         name="workflows",
         handler=workflows_command,
-        description="List dynamic workflow runs or show one run by ID.",
-        args_hint="[runId]",
+        description="Show a compact overview of dynamic workflow agents.",
+        args_hint="",
     )
-    ctx.register_command(
-        name="workflow-stop",
-        handler=workflow_stop_command,
-        description="Stop a running dynamic workflow.",
-        args_hint="<runId>",
-    )
-    _register_saved_workflow_commands(ctx)
-
-
-def _register_saved_workflow_commands(ctx) -> None:
-    """Expose saved workflows as slash commands."""
-    cwd = os.environ.get("TERMINAL_CWD") or os.getcwd()
-    try:
-        names = discover_named_workflows(cwd)
-    except Exception:
-        names = []
-    for name in names:
-        try:
-            ctx.register_command(
-                name=name,
-                handler=make_named_workflow_handler(name),
-                description=f"Run saved dynamic workflow '{name}'.",
-                args_hint="[args]",
-            )
-        except Exception:
-            continue

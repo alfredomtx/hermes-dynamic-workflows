@@ -524,7 +524,7 @@ return [
         self.assertEqual(second_final["result"], ["1:a", "2:b"])
         self.assertEqual(CountingRunner.calls, 2)
 
-    def test_formats_agent_detail_and_saves_markdown(self):
+    def test_formats_agent_overview(self):
         script = """
 meta = {"name": "inspectable", "description": "Test workflow", "phases": ["Search"]}
 
@@ -543,50 +543,14 @@ return await agent("inspect metadata", {"label": "meta-agent", "agentType": "res
             with patch("hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner", return_value=MetadataRunner()):
                 record = manager.start_from_params({"script": script}, cwd=str(root))
                 final = manager.wait(record["runId"], timeout=2)
-                detail = manager.format_agent(final["runId"], "1")
-                saved = manager.save_markdown(final["runId"])
+                overview = manager.format_agent_overview()
 
-        self.assertIn("meta-agent", detail)
-        self.assertIn("test-model", detail)
-        self.assertIn("1.2K tok", detail)
-        self.assertIn("2.0K cached read", detail)
-        self.assertIn("Saved workflow", saved)
-
-    def test_save_named_workflow_writes_reusable_script(self):
-        from hermes_dynamic_workflows.ui.commands import discover_named_workflows
-
-        script = """
-meta = {"name": "audit", "description": "Test workflow"}
-
-return await agent("audit", {"label": "auditor"})
-"""
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            store = WorkflowStore(root / "store")
-            manager = WorkflowRunManager(store=store, config=PluginConfig(require_launch_approval=False))
-            with patch("hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner", return_value=CountingRunner()):
-                record = manager.start_from_params({"script": script}, cwd=str(root))
-                final = manager.wait(record["runId"], timeout=2)
-
-            project = manager.save_named_workflow(final["runId"], "repo-audit", scope="project", cwd=str(root))
-            user = manager.save_named_workflow(final["runId"], "user-audit", scope="user", cwd=str(root))
-            reserved = manager.save_named_workflow(final["runId"], "workflows", scope="project", cwd=str(root))
-
-            self.assertTrue(project["ok"])
-            self.assertEqual(project["name"], "repo-audit")
-            project_path = Path(project["path"])
-            self.assertEqual(project_path, root / ".hermes" / "workflows" / "repo-audit.py")
-            saved_script = project_path.read_text(encoding="utf-8")
-            self.assertIn("return await agent", saved_script)
-            self.assertNotIn("def workflow()", saved_script)
-
-            self.assertTrue(user["ok"])
-            self.assertEqual(Path(user["path"]), store.workflows_dir / "user-audit.py")
-
-            self.assertFalse(reserved["ok"])
-
-            discovered = discover_named_workflows(str(root))
-            self.assertIn("repo-audit", discovered)
+        self.assertIn("inspectable", overview)
+        self.assertIn(final["runId"], overview)
+        self.assertIn("meta-agent", overview)
+        self.assertIn("test-model", overview)
+        self.assertIn("1.2K tok", overview)
+        self.assertIn("2.0K cached read", overview)
 
     def test_resume_reuses_parallel_results(self):
         # Regression for the content-addressed resume cache: under the old

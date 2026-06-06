@@ -27,10 +27,7 @@ from ..storage.store import (
 )
 from ..storage.control import ControlListener, new_control_owner
 from ..ui.display import (
-    render_agent_detail,
-    render_phase_detail,
-    render_run_detail,
-    render_runs_list,
+    render_agent_overview,
     render_saved_markdown,
     render_workflow_text,
 )
@@ -897,27 +894,9 @@ class WorkflowRunManager:
             }
         return {"ok": False, "action": action, "runId": run_id, "message": f"Unsupported control action: {action}"}
 
-    def format_list(self, limit: int = 10) -> str:
+    def format_agent_overview(self, limit: int = 12) -> str:
         runs = self.list(limit=limit)
-        return render_runs_list(runs)
-
-    def format_detail(self, run_id: str) -> str:
-        run = self.get(run_id)
-        if not run:
-            return f"Workflow run not found: {run_id}"
-        return render_run_detail(run)
-
-    def format_phase(self, run_id: str, selector: str) -> str:
-        run = self.get(run_id)
-        if not run:
-            return f"Workflow run not found: {run_id}"
-        return render_phase_detail(run, selector)
-
-    def format_agent(self, run_id: str, selector: str) -> str:
-        run = self.get(run_id)
-        if not run:
-            return f"Workflow run not found: {run_id}"
-        return render_agent_detail(run, selector)
+        return render_agent_overview(runs)
 
     def _script_path_for_source(
         self,
@@ -945,62 +924,6 @@ class WorkflowRunManager:
             name=str(meta.get("name") or "dynamic-workflow"),
             script=source.script,
         )
-
-    def save_markdown(self, run_id: str, path: str | None = None) -> str:
-        run = self.get(run_id)
-        if not run:
-            return f"Workflow run not found: {run_id}"
-        if path:
-            target = Path(path).expanduser()
-            if not target.is_absolute():
-                target = Path(run.get("cwd") or os.getcwd()) / target
-        else:
-            target = self.store.exports_dir / f"{run_id}.md"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(render_saved_markdown(run), encoding="utf-8")
-        return f"Saved workflow {run_id} to {target}"
-
-    def save_named_workflow(
-        self,
-        run_id: str,
-        name: str,
-        *,
-        scope: str = "project",
-        cwd: str | None = None,
-    ) -> dict[str, Any]:
-        """Save a run's script as a reusable named workflow.
-
-        Writes to ``<cwd>/.hermes/workflows/<name>.py`` (project scope) or the
-        user store's ``workflows/<name>.py`` (user scope). Either location is
-        resolvable later by passing ``name`` to the workflow tool, and the
-        caller can register a ``/<name>`` slash command for it.
-        """
-        from ..storage.store import _RESERVED_WORKFLOW_NAMES, _safe_workflow_name
-
-        run = self.get(run_id)
-        if not run:
-            return {"ok": False, "message": f"Workflow run not found: {run_id}"}
-        script = self._load_run_script(run, run_id)
-        if not script:
-            return {"ok": False, "message": f"No saved script found for run {run_id}"}
-        try:
-            safe = _safe_workflow_name(name)
-        except ValueError as exc:
-            return {"ok": False, "message": str(exc)}
-        if safe in _RESERVED_WORKFLOW_NAMES:
-            return {"ok": False, "message": f"'{safe}' is reserved; choose another name"}
-
-        if scope == "user":
-            target = self.store.workflows_dir / f"{safe}.py"
-        else:
-            base = Path(cwd or run.get("cwd") or os.getcwd()).expanduser()
-            target = base / ".hermes" / "workflows" / f"{safe}.py"
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(script, encoding="utf-8")
-        except OSError as exc:
-            return {"ok": False, "message": f"Could not write {target}: {exc}"}
-        return {"ok": True, "name": safe, "path": str(target), "scope": scope}
 
     def _load_run_script(self, run: dict[str, Any], run_id: str) -> str | None:
         candidates: list[Path] = []
