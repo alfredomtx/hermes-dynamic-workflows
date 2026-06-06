@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
@@ -14,7 +15,13 @@ from .api import WorkflowAPI
 from .cache import ResumeCache
 from .config import PluginConfig, load_config
 from .context import PauseGate, WorkflowExecutionContext
-from .sandbox import LOOP_GUARD_NAME, extract_meta, parse_script
+from .sandbox import (
+    ENTRYPOINT_NAME,
+    LOOP_GUARD_NAME,
+    build_execution_tree,
+    extract_meta,
+    parse_script,
+)
 from .types import ChildAgentRunner, WorkflowFrame, WorkflowState, normalize_phase_specs
 
 
@@ -36,6 +43,7 @@ class WorkflowOptions:
     source_ref: str | None = None
     plugin_context: Any = None
     token_budget_total: int | None = None
+    store: Any = None
 
 
 @dataclass
@@ -69,14 +77,13 @@ SAFE_BUILTINS = {
     "repr": repr,
     "reversed": reversed,
     "round": round,
-    "set": set,
     "sorted": sorted,
     "str": str,
     "sum": sum,
     "tuple": tuple,
     "zip": zip,
     # Exception types a script may catch to handle recoverable failures (a
-    # failed child agent, a subworkflow error, bad result indexing). Halt
+    # failed child agent, a nested workflow error, bad result indexing). Halt
     # signals (stop/deadline/limits) are BaseException and deliberately absent,
     # so `except Exception` cannot swallow them.
     "Exception": Exception,
@@ -90,6 +97,10 @@ SAFE_BUILTINS = {
 
 
 def run_workflow(script: str, options: WorkflowOptions | None = None) -> WorkflowResult:
+    return asyncio.run(_run_workflow_async(script, options))
+
+
+async def _run_workflow_async(script: str, options: WorkflowOptions | None = None) -> WorkflowResult:
     options = options or WorkflowOptions()
     config = options.config or load_config()
     args = options.args
@@ -101,7 +112,7 @@ def run_workflow(script: str, options: WorkflowOptions | None = None) -> Workflo
 
     if context is None:
         if options.child_runner is None:
-            from ..agents.runner import HermesChildAgentRunner
+            from ..agent.runner import HermesChildAgentRunner
 
             child_runner = HermesChildAgentRunner(config)
         else:
@@ -128,6 +139,7 @@ def run_workflow(script: str, options: WorkflowOptions | None = None) -> Workflo
             on_journal=options.on_journal,
             plugin_context=options.plugin_context,
             token_budget_total=options.token_budget_total,
+            store=options.store,
         )
         frame = root
     else:
@@ -153,14 +165,11 @@ def run_workflow(script: str, options: WorkflowOptions | None = None) -> Workflo
         depth=options.depth,
     )
     namespace = _build_namespace(api)
-
     try:
         context.check_runtime()
-        compiled = compile(tree, filename="<workflow>", mode="exec")
+        compiled = compile(build_execution_tree(tree), filename="<workflow>", mode="exec")
         exec(compiled, namespace, namespace)
-        value = _resolve_workflow_value(namespace)
-        if _frame_agent_count(frame) == 0:
-            raise WorkflowRuntimeError("workflow must call agent() at least once")
+        value = await namespace[ENTRYPOINT_NAME]()
         context.check_runtime()
         frame.status = "completed"
         return WorkflowResult(value=value, state=state)
@@ -188,20 +197,3 @@ def _build_namespace(api: WorkflowAPI) -> dict[str, Any]:
     # Per-iteration guard injected into every `while` test by the sandbox.
     namespace[LOOP_GUARD_NAME] = api.context.tick_loop
     return namespace
-
-
-def _resolve_workflow_value(namespace: dict[str, Any]) -> Any:
-    workflow = namespace.get("workflow")
-    if callable(workflow):
-        return workflow()
-    if "return_value" in namespace:
-        return namespace["return_value"]
-    if "result" in namespace:
-        return namespace["result"]
-    raise WorkflowRuntimeError(
-        "workflow script must define workflow(), return_value, or result"
-    )
-
-
-def _frame_agent_count(frame: WorkflowFrame) -> int:
-    return len(frame.agents) + sum(_frame_agent_count(child) for child in frame.children)

@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 from hermes_dynamic_workflows.engine.config import PluginConfig
 from hermes_dynamic_workflows.engine.errors import WorkflowRuntimeError
-from hermes_dynamic_workflows.engine.manager import WorkflowRunManager
+from hermes_dynamic_workflows.engine.manager import (
+    WorkflowRunManager,
+    _capture_parent_runtime,
+    _gateway_running_agent,
+)
 from hermes_dynamic_workflows.engine.types import ChildAgentRequest, ChildAgentResult, ChildAgentRunner
 from hermes_dynamic_workflows.storage.store import WorkflowStore
 
@@ -58,6 +64,70 @@ class CliRefCtx:
         agent = type("Agent", (), {"session_id": agent_session_id})() if agent_session_id else None
         cli = type("Cli", (), {"session_id": cli_session_id, "agent": agent})()
         self._manager = type("PluginManager", (), {"_cli_ref": cli})()
+
+
+class ParentRuntimeTests(unittest.TestCase):
+    def test_cli_plugin_context_supplies_current_agent_runtime(self):
+        parent = SimpleNamespace(
+            model="cli-session-model",
+            provider="cli-provider",
+            base_url="https://cli.example/v1",
+            api_key="cli-secret",
+            api_mode="chat_completions",
+        )
+        ctx = SimpleNamespace(
+            _manager=SimpleNamespace(
+                _cli_ref=SimpleNamespace(agent=parent),
+            ),
+        )
+
+        runtime = _capture_parent_runtime(None, plugin_context=ctx)
+
+        self.assertEqual(runtime["model"], "cli-session-model")
+        self.assertEqual(runtime["api_key"], "cli-secret")
+
+    def test_gateway_running_agent_is_used_when_tool_dispatch_has_no_parent_agent(self):
+        parent = SimpleNamespace(
+            model="gateway-session-model",
+            provider="gateway-provider",
+            base_url="https://gateway.example/v1",
+            api_key="gateway-secret",
+            api_mode="chat_completions",
+        )
+
+        with patch(
+            "hermes_dynamic_workflows.engine.manager._gateway_running_agent",
+            return_value=parent,
+        ):
+            runtime = _capture_parent_runtime(None)
+
+        self.assertEqual(runtime["model"], "gateway-session-model")
+        self.assertEqual(runtime["provider"], "gateway-provider")
+        self.assertEqual(runtime["api_key"], "gateway-secret")
+
+    def test_gateway_session_agent_falls_back_to_cached_agent(self):
+        cached = SimpleNamespace(model="cached-session-model")
+        runner = SimpleNamespace(
+            _running_agents={},
+            _agent_cache={"gateway-key": (cached, "signature")},
+        )
+        gateway_run = ModuleType("gateway.run")
+        gateway_run._gateway_runner_ref = lambda: runner
+        gateway_pkg = ModuleType("gateway")
+        gateway_pkg.__path__ = []
+        gateway_pkg.run = gateway_run
+
+        with (
+            patch(
+                "hermes_dynamic_workflows.engine.manager._get_hermes_session_env",
+                return_value="gateway-key",
+            ),
+            patch.dict(
+                sys.modules,
+                {"gateway": gateway_pkg, "gateway.run": gateway_run},
+            ),
+        ):
+            self.assertIs(_gateway_running_agent(), cached)
 
 
 class FailingRunner(ChildAgentRunner):
@@ -122,6 +192,25 @@ class LiveTranscriptRunner(ChildAgentRunner):
         )
 
 
+class SkipAwareRunner(ChildAgentRunner):
+    def __init__(self):
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.skipped: list[str] = []
+
+    def run(self, request: ChildAgentRequest):
+        if request.on_start is not None:
+            request.on_start({"task_id": "child-to-skip", "session_id": "child-to-skip"})
+        self.started.set()
+        self.release.wait(timeout=5)
+        return "released"
+
+    def skip_child(self, task_id: str) -> bool:
+        self.skipped.append(task_id)
+        self.release.set()
+        return True
+
+
 class MetadataRunner(ChildAgentRunner):
     def run(self, request: ChildAgentRequest):
         return ChildAgentResult(
@@ -180,19 +269,43 @@ class RunManagerTests(unittest.TestCase):
                     override_path = store.task_output_path("/repo", "session-2", "task-2")
             override_path.relative_to(Path(output_tmp))
 
+    def test_manager_routes_internal_single_agent_skip(self):
+        script = """
+meta = {"name": "skip-one", "description": "Test workflow"}
+
+return await agent("wait", {"label": "worker"})
+"""
+        runner = SkipAwareRunner()
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(
+                store=WorkflowStore(Path(tmp)),
+                config=PluginConfig(require_launch_approval=False),
+            )
+            with patch(
+                "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
+                return_value=runner,
+            ):
+                record = manager.start_from_params({"script": script}, cwd=tmp)
+                self.assertTrue(runner.started.wait(timeout=2))
+                self.assertTrue(manager.pause(record["runId"]))
+                self.assertTrue(manager.skip_agent(record["taskId"], "child-to-skip"))
+                self.assertTrue(manager.resume(record["runId"]))
+                manager.wait(record["runId"], timeout=2)
+
+        self.assertEqual(runner.skipped, ["child-to-skip"])
+
     def test_script_path_run(self):
         script = """
-meta = {"name": "from-path"}
+meta = {"name": "from-path", "description": "Test workflow"}
 
-def workflow():
-    return agent("work", {"label": "path-agent"})
+return await agent("work", {"label": "path-agent"})
 """
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             script_path = root / "workflow.py"
             script_path.write_text(script, encoding="utf-8")
             manager = WorkflowRunManager(store=WorkflowStore(root / "store"), config=PluginConfig(require_launch_approval=False))
-            with patch("hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner", return_value=CountingRunner()):
+            with patch("hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner", return_value=CountingRunner()):
                 record = manager.start_from_params({"scriptPath": str(script_path)}, cwd=str(root))
                 final = manager.wait(record["runId"], timeout=2)
 
@@ -203,10 +316,9 @@ def workflow():
 
     def test_inline_script_saved_under_session_workflow_scripts(self):
         script = """
-meta = {"name": "Inline Save"}
+meta = {"name": "Inline Save", "description": "Test workflow"}
 
-def workflow():
-    return "ok"
+return "ok"
 """
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -223,10 +335,9 @@ def workflow():
 
     def test_cli_ref_session_id_is_used_for_workflow_layout(self):
         script = """
-meta = {"name": "cli session"}
+meta = {"name": "cli session", "description": "Test workflow"}
 
-def workflow():
-    return "ok"
+return "ok"
 """
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -241,10 +352,9 @@ def workflow():
 
     def test_missing_host_session_id_fails_instead_of_synthesizing(self):
         script = """
-meta = {"name": "no session"}
+meta = {"name": "no session", "description": "Test workflow"}
 
-def workflow():
-    return "ok"
+return "ok"
 """
         with tempfile.TemporaryDirectory() as tmp:
             manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig(require_launch_approval=False))
@@ -254,17 +364,16 @@ def workflow():
 
     def test_resume_reuses_unchanged_prefix(self):
         script = """
-meta = {"name": "resume"}
+meta = {"name": "resume", "description": "Test workflow"}
 
-def workflow():
-    return [
-        agent("a", {"label": "a"}),
-        agent("b", {"label": "b"}),
-    ]
+return [
+    await agent("a", {"label": "a"}),
+    await agent("b", {"label": "b"}),
+]
 """
         with tempfile.TemporaryDirectory() as tmp:
             manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig(require_launch_approval=False))
-            with patch("hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner", return_value=CountingRunner()):
+            with patch("hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner", return_value=CountingRunner()):
                 first = manager.start_from_params({"script": script}, cwd=tmp)
                 first_final = manager.wait(first["runId"], timeout=2)
                 second = manager.start_from_params(
@@ -279,16 +388,21 @@ def workflow():
 
     def test_formats_agent_detail_and_saves_markdown(self):
         script = """
-meta = {"name": "inspectable", "phases": ["Search"]}
+meta = {"name": "inspectable", "description": "Test workflow", "phases": ["Search"]}
 
-def workflow():
-    phase("Search")
-    return agent("inspect metadata", {"label": "meta-agent", "agentType": "researcher"})
+phase("Search")
+return await agent("inspect metadata", {"label": "meta-agent", "agentType": "researcher"})
 """
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            agent_types = root / ".hermes" / "dynamic-workflows" / "agents"
+            agent_types.mkdir(parents=True)
+            (agent_types / "researcher.md").write_text(
+                "Inspect carefully and return raw findings.",
+                encoding="utf-8",
+            )
             manager = WorkflowRunManager(store=WorkflowStore(root / "store"), config=PluginConfig(require_launch_approval=False))
-            with patch("hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner", return_value=MetadataRunner()):
+            with patch("hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner", return_value=MetadataRunner()):
                 record = manager.start_from_params({"script": script}, cwd=str(root))
                 final = manager.wait(record["runId"], timeout=2)
                 detail = manager.format_agent(final["runId"], "1")
@@ -304,16 +418,15 @@ def workflow():
         from hermes_dynamic_workflows.ui.commands import discover_named_workflows
 
         script = """
-meta = {"name": "audit"}
+meta = {"name": "audit", "description": "Test workflow"}
 
-def workflow():
-    return agent("audit", {"label": "auditor"})
+return await agent("audit", {"label": "auditor"})
 """
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store = WorkflowStore(root / "store")
             manager = WorkflowRunManager(store=store, config=PluginConfig(require_launch_approval=False))
-            with patch("hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner", return_value=CountingRunner()):
+            with patch("hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner", return_value=CountingRunner()):
                 record = manager.start_from_params({"script": script}, cwd=str(root))
                 final = manager.wait(record["runId"], timeout=2)
 
@@ -325,7 +438,9 @@ def workflow():
             self.assertEqual(project["name"], "repo-audit")
             project_path = Path(project["path"])
             self.assertEqual(project_path, root / ".hermes" / "workflows" / "repo-audit.py")
-            self.assertIn("def workflow()", project_path.read_text(encoding="utf-8"))
+            saved_script = project_path.read_text(encoding="utf-8")
+            self.assertIn("return await agent", saved_script)
+            self.assertNotIn("def workflow()", saved_script)
 
             self.assertTrue(user["ok"])
             self.assertEqual(Path(user["path"]), store.workflows_dir / "user-audit.py")
@@ -342,14 +457,13 @@ def workflow():
         # resume order-independent, so the second run reuses all three results
         # and issues no new child runs.
         script = """
-meta = {"name": "parallel-resume"}
+meta = {"name": "parallel-resume", "description": "Test workflow"}
 
-def workflow():
-    return parallel([
-        lambda: agent("alpha", {"label": "a"}),
-        lambda: agent("beta", {"label": "b"}),
-        lambda: agent("gamma", {"label": "c"}),
-    ])
+return await parallel([
+    lambda: agent("alpha", {"label": "a"}),
+    lambda: agent("beta", {"label": "b"}),
+    lambda: agent("gamma", {"label": "c"}),
+])
 """
         runner = RecordingRunner()
         with tempfile.TemporaryDirectory() as tmp:
@@ -357,7 +471,7 @@ def workflow():
                 store=WorkflowStore(Path(tmp)), config=PluginConfig(concurrency=3, require_launch_approval=False)
             )
             with patch(
-                "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
                 return_value=runner,
             ):
                 first = manager.start_from_params({"script": script}, cwd=tmp)
@@ -375,16 +489,15 @@ def workflow():
 
     def test_internal_token_budget_gates_run(self):
         script = """
-meta = {"name": "budget-param"}
+meta = {"name": "budget-param", "description": "Test workflow"}
 
-def workflow():
-    agent("a", {"label": "a"})
-    return agent("b", {"label": "b"})
+await agent("a", {"label": "a"})
+return await agent("b", {"label": "b"})
 """
         with tempfile.TemporaryDirectory() as tmp:
             manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig(require_launch_approval=False))
             with patch(
-                "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
                 return_value=BudgetRunner(tokens=20_000),
             ):
                 record = manager.start_from_params(
@@ -396,50 +509,48 @@ def workflow():
 
         self.assertEqual(record["tokenBudget"], 10_000)
         # First agent spends 20k > 10k, so the second agent's reservation trips the
-        # hard ceiling and the run errors.
-        self.assertEqual(final["status"], "error")
+        # hard ceiling and the run fails.
+        self.assertEqual(final["status"], "failed")
         self.assertIn("budget", (final["error"] or "").lower())
 
-    def test_all_agents_failed_marks_run_failed(self):
+    def test_all_agents_failed_inside_parallel_still_completes_with_none_results(self):
         script = """
-meta = {"name": "all-fail"}
+meta = {"name": "all-fail", "description": "Test workflow"}
 
-def workflow():
-    return parallel([
-        lambda: agent("a", {"label": "a"}),
-        lambda: agent("b", {"label": "b"}),
-    ])
+return await parallel([
+    lambda: agent("a", {"label": "a"}),
+    lambda: agent("b", {"label": "b"}),
+])
 """
         with tempfile.TemporaryDirectory() as tmp:
             manager = WorkflowRunManager(
                 store=WorkflowStore(Path(tmp)), config=PluginConfig(concurrency=2, require_launch_approval=False)
             )
             with patch(
-                "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
                 return_value=FailingRunner(),
             ):
                 rec = manager.start_from_params({"script": script}, cwd=tmp)
                 final = manager.wait(rec["runId"], timeout=3)
 
-        self.assertEqual(final["status"], "failed")
+        self.assertEqual(final["status"], "completed")
         self.assertEqual(final["result"], [None, None])
 
     def test_partial_failure_stays_completed(self):
         script = """
-meta = {"name": "partial"}
+meta = {"name": "partial", "description": "Test workflow"}
 
-def workflow():
-    return parallel([
-        lambda: agent("a", {"label": "a"}),
-        lambda: agent("b", {"label": "b"}),
-    ])
+return await parallel([
+    lambda: agent("a", {"label": "a"}),
+    lambda: agent("b", {"label": "b"}),
+])
 """
         with tempfile.TemporaryDirectory() as tmp:
             manager = WorkflowRunManager(
                 store=WorkflowStore(Path(tmp)), config=PluginConfig(concurrency=2, require_launch_approval=False)
             )
             with patch(
-                "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
                 return_value=HalfFailingRunner(),
             ):
                 rec = manager.start_from_params({"script": script}, cwd=tmp)
@@ -450,16 +561,15 @@ def workflow():
 
     def test_completion_injects_task_notification(self):
         script = """
-meta = {"name": "notify-me"}
+meta = {"name": "notify-me", "description": "Test workflow"}
 
-def workflow():
-    return agent("do it", {"label": "worker"})
+return await agent("do it", {"label": "worker"})
 """
         ctx = RecordingCtx()
         with tempfile.TemporaryDirectory() as tmp:
             manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig(require_launch_approval=False))
             with patch(
-                "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
                 return_value=CountingRunner(),
             ):
                 rec = manager.start_from_params({"script": script}, cwd=tmp, plugin_context=ctx)
@@ -481,12 +591,42 @@ def workflow():
         self.assertTrue(msg.strip().endswith("</task-notification>"))
         self.assertTrue(Path(final["outputFile"]).is_file())
 
+    def test_runtime_failure_injects_failed_task_notification_without_result(self):
+        script = """
+meta = {"name": "runtime-boom", "description": "Runtime boom"}
+
+raise Exception("boom")
+"""
+        ctx = RecordingCtx()
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig(require_launch_approval=False))
+            with patch(
+                "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
+                return_value=CountingRunner(),
+            ):
+                rec = manager.start_from_params({"script": script}, cwd=tmp, plugin_context=ctx)
+                final = manager.wait(rec["runId"], timeout=2)
+
+        self.assertEqual(final["status"], "failed")
+        self.assertIn("Exception: boom", final["error"])
+        self.assertEqual(len(ctx.messages), 1)
+        msg = ctx.messages[0]
+        self.assertIn("<task-notification>", msg)
+        self.assertIn(f"<task-id>{rec['taskId']}</task-id>", msg)
+        self.assertIn("<output-file>", msg)
+        self.assertIn("<status>failed</status>", msg)
+        self.assertIn('Dynamic workflow "runtime-boom" failed: Exception: boom', msg)
+        self.assertIn(f"<recovery>Agent transcripts: {final['transcriptDir']}</recovery>", msg)
+        self.assertIn("<agent_count>0</agent_count>", msg)
+        self.assertNotIn("<result>", msg)
+        self.assertTrue(Path(final["outputFile"]).is_file())
+        self.assertIn("Exception: boom", Path(final["outputFile"]).read_text(encoding="utf-8"))
+
     def test_child_transcript_files_are_written_while_running(self):
         script = """
-meta = {"name": "live-transcripts"}
+meta = {"name": "live-transcripts", "description": "Test workflow"}
 
-def workflow():
-    return agent("do it", {"label": "worker"})
+return await agent("do it", {"label": "worker"})
 """
         runner = LiveTranscriptRunner()
         fake_messages = [{"role": "user", "content": "running message"}]
@@ -497,7 +637,7 @@ def workflow():
                 config=PluginConfig(require_launch_approval=False),
             )
             with patch(
-                "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
                 return_value=runner,
             ), patch(
                 "hermes_dynamic_workflows.engine.manager._load_session_messages",
@@ -530,10 +670,9 @@ def workflow():
 
     def test_completion_exports_child_transcripts_after_run(self):
         script = """
-meta = {"name": "transcripts"}
+meta = {"name": "transcripts", "description": "Test workflow"}
 
-def workflow():
-    return agent("do it", {"label": "worker"})
+return await agent("do it", {"label": "worker"})
 """
         fake_messages = [
             {"role": "user", "content": "do it"},
@@ -543,7 +682,7 @@ def workflow():
             root = Path(tmp)
             manager = WorkflowRunManager(store=WorkflowStore(root / "store"), config=PluginConfig(require_launch_approval=False))
             with patch(
-                "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
                 return_value=TranscriptRunner(),
             ), patch(
                 "hermes_dynamic_workflows.engine.manager._load_session_messages",
@@ -574,10 +713,9 @@ def workflow():
 
     def test_journal_records_started_and_full_agent_result(self):
         script = """
-meta = {"name": "journal"}
+meta = {"name": "journal", "description": "Test workflow"}
 
-def workflow():
-    return agent("do it", {"label": "worker"})
+return await agent("do it", {"label": "worker"})
 """
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -586,7 +724,7 @@ def workflow():
                 config=PluginConfig(require_launch_approval=False),
             )
             with patch(
-                "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
                 return_value=DictRunner(),
             ):
                 rec = manager.start_from_params({"script": script}, cwd=str(root), plugin_context=RecordingCtx())
@@ -619,10 +757,9 @@ def workflow():
 
     def test_completion_notification_disabled(self):
         script = """
-meta = {"name": "quiet"}
+meta = {"name": "quiet", "description": "Test workflow"}
 
-def workflow():
-    return agent("do it", {"label": "worker"})
+return await agent("do it", {"label": "worker"})
 """
         ctx = RecordingCtx()
         with tempfile.TemporaryDirectory() as tmp:
@@ -631,7 +768,7 @@ def workflow():
                 config=PluginConfig(notify_on_complete=False, require_launch_approval=False),
             )
             with patch(
-                "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
                 return_value=CountingRunner(),
             ):
                 rec = manager.start_from_params({"script": script}, cwd=tmp, plugin_context=ctx)
@@ -641,16 +778,15 @@ def workflow():
 
     def test_completion_notification_failure_does_not_break_run(self):
         script = """
-meta = {"name": "notify-fail"}
+meta = {"name": "notify-fail", "description": "Test workflow"}
 
-def workflow():
-    return agent("do it", {"label": "worker"})
+return await agent("do it", {"label": "worker"})
 """
         ctx = RecordingCtx(fail=True)  # inject_message raises (e.g. gateway/edge)
         with tempfile.TemporaryDirectory() as tmp:
             manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig(require_launch_approval=False))
             with patch(
-                "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
                 return_value=CountingRunner(),
             ):
                 rec = manager.start_from_params({"script": script}, cwd=tmp, plugin_context=ctx)

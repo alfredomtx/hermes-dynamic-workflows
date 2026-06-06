@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,7 @@ class ManagedRun:
     child_runner: Any = None
     plugin_context: Any = None
     session_context: dict[str, str] | None = None
+    parent_runtime: dict[str, Any] | None = field(default=None, repr=False)
     transcript_exporters: dict[str, "LiveTranscriptExporter"] = field(default_factory=dict)
     lock: threading.RLock = field(default_factory=threading.RLock)
 
@@ -161,13 +163,14 @@ class WorkflowRunManager:
         *,
         cwd: str | None = None,
         plugin_context: Any = None,
-        tool_use_id: str | None = None,
+        parent_agent: Any = None,
         host_session_id: str | None = None,
         user_task: str | None = None,
         launch_approved: bool = False,
         restart_from_run_id: str | None = None,
         token_budget_total_override: int | None = None,
         session_context_override: dict[str, str] | None = None,
+        parent_runtime_override: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         config = self.config
         cwd_value = cwd or os.environ.get("TERMINAL_CWD") or os.getcwd()
@@ -220,13 +223,17 @@ class WorkflowRunManager:
             if session_context_override is not None
             else _capture_gateway_session_context()
         )
+        parent_runtime = (
+            dict(parent_runtime_override)
+            if parent_runtime_override is not None
+            else _capture_parent_runtime(parent_agent, plugin_context=plugin_context)
+        )
 
         stop_event = threading.Event()
         pause_gate = PauseGate()
         record = {
             "runId": run_id,
             "taskId": task_id,
-            "toolUseId": tool_use_id,
             "status": "queued",
             "createdAt": utc_now_iso(),
             "startedAt": None,
@@ -262,6 +269,7 @@ class WorkflowRunManager:
             record=record,
             plugin_context=plugin_context,
             session_context=session_context,
+            parent_runtime=parent_runtime,
         )
 
         with self._lock:
@@ -345,6 +353,26 @@ class WorkflowRunManager:
                     pass
             return result
         return None
+
+    def skip_agent(self, task_id: str, child_task_id: str) -> bool:
+        """Skip one active child agent without stopping its workflow run."""
+        wanted = str(task_id or "")
+        child_wanted = str(child_task_id or "")
+        if not wanted or not child_wanted:
+            return False
+        with self._lock:
+            managed_runs = list(self._runs.values())
+        for managed in managed_runs:
+            with managed.lock:
+                if str(managed.record.get("taskId") or "") != wanted:
+                    continue
+                if managed.record.get("status") not in {"queued", "running", "paused"}:
+                    return False
+                runner = managed.child_runner
+            if runner is None or not hasattr(runner, "skip_child"):
+                return False
+            return bool(runner.skip_child(child_wanted))
+        return False
 
     def list(self, limit: int = 20) -> list[dict[str, Any]]:
         return [self._public_record(run) for run in self.store.list_runs(limit=limit)]
@@ -431,6 +459,7 @@ class WorkflowRunManager:
             restart_from_run_id=run_id,
             token_budget_total_override=record.get("tokenBudget"),
             session_context_override=managed.session_context if managed is not None else None,
+            parent_runtime_override=managed.parent_runtime if managed is not None else None,
         )
 
     def _handle_control_request(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -466,7 +495,7 @@ class WorkflowRunManager:
             restarted = self.restart(run_id)
             if restarted is None:
                 return {"ok": False, "action": action, "runId": run_id, "message": f"Workflow run not found: {run_id}"}
-            new_run_id = restarted.get("runId")
+            new_run_id = str(restarted.get("runId") or "")
             return {
                 "ok": True,
                 "action": action,
@@ -619,12 +648,18 @@ class WorkflowRunManager:
         session_context: dict[str, str] | None = None,
     ) -> None:
         try:
-            from ..agents.runner import HermesChildAgentRunner
+            from ..agent.runner import HermesChildAgentRunner
 
-            managed.child_runner = HermesChildAgentRunner(config, session_context=session_context)
-            with managed.lock:
-                start_status = "paused" if managed.pause_gate.is_paused else "running"
-            self._update(managed, status=start_status, startedAt=utc_now_iso())
+            managed.child_runner = HermesChildAgentRunner(
+                config,
+                session_context=session_context,
+                parent_runtime=managed.parent_runtime,
+            )
+            self._update(
+                managed,
+                status="paused" if managed.pause_gate.is_paused else "running",
+                startedAt=utc_now_iso(),
+            )
             result = run_workflow(
                 script,
                 WorkflowOptions(
@@ -640,6 +675,7 @@ class WorkflowRunManager:
                     plugin_context=plugin_context,
                     token_budget_total=token_budget,
                     source_ref=str(managed.record.get("scriptPath") or ""),
+                    store=self.store,
                 ),
             )
             snapshot = result.state.snapshot()
@@ -647,7 +683,7 @@ class WorkflowRunManager:
             if managed.stop_event.is_set():
                 status = "stopped"
             else:
-                status = _derive_run_status(snapshot)
+                status = "completed"
             self._update(
                 managed,
                 status=status,
@@ -661,12 +697,12 @@ class WorkflowRunManager:
             # BaseException so a WorkflowHalt (stop / deadline / hard limit),
             # which derives from BaseException, is recorded as the run's final
             # status instead of dying as an unhandled thread exception.
-            status = "stopped" if managed.stop_event.is_set() else "error"
+            status = "stopped" if managed.stop_event.is_set() else "failed"
             self._update(
                 managed,
                 status=status,
                 finishedAt=utc_now_iso(),
-                error=f"{type(exc).__name__}: {exc}",
+                error=_runtime_error_text(exc),
                 agentCache=resume_cache.current,
             )
         finally:
@@ -776,6 +812,14 @@ def _completion_output_text(record: dict[str, Any]) -> str:
     if record.get("error"):
         return str(record.get("error") or "")
     return ""
+
+
+def _runtime_error_text(exc: BaseException) -> str:
+    message = f"{type(exc).__name__}: {exc}"
+    frames = traceback.format_tb(exc.__traceback__, limit=8)
+    if frames:
+        return message + "\n" + "".join(frames).rstrip()
+    return message
 
 
 def _write_output_file(record: dict[str, Any], store: WorkflowStore) -> None:
@@ -890,7 +934,6 @@ def _agent_transcript_metadata(
     return {
         "run_id": record.get("runId"),
         "workflow_task_id": record.get("taskId"),
-        "tool_use_id": record.get("toolUseId"),
         "workflow_session_id": record.get("workflowSessionId"),
         "agent_id": agent.get("id"),
         "agent_label": agent.get("label"),
@@ -974,6 +1017,91 @@ def _plugin_context_cli_ref(plugin_context: Any) -> Any:
     if manager is not None:
         return getattr(manager, "_cli_ref", None)
     return None
+
+
+def _capture_parent_runtime(parent_agent: Any, *, plugin_context: Any = None) -> dict[str, Any] | None:
+    """Snapshot the launching agent runtime for child-model inheritance.
+
+    The snapshot stays on ManagedRun only. It must never be added to the
+    persisted run record because it can contain credentials and live pools.
+    """
+    agent = parent_agent
+    if agent is None:
+        cli_ref = _plugin_context_cli_ref(plugin_context)
+        agent = getattr(cli_ref, "agent", None) if cli_ref is not None else None
+    if agent is None:
+        agent = _gateway_running_agent()
+    if agent is None:
+        return None
+
+    model = str(getattr(agent, "model", "") or "").strip()
+    if not model:
+        return None
+
+    runtime: dict[str, Any] = {"model": model}
+    for key in (
+        "provider",
+        "base_url",
+        "api_key",
+        "api_mode",
+        "acp_command",
+        "reasoning_config",
+        "service_tier",
+        "max_tokens",
+    ):
+        value = getattr(agent, key, None)
+        if value is not None:
+            runtime[key] = value
+    if not runtime.get("api_key"):
+        client_kwargs = getattr(agent, "_client_kwargs", None)
+        if isinstance(client_kwargs, dict) and client_kwargs.get("api_key"):
+            runtime["api_key"] = client_kwargs["api_key"]
+
+    acp_args = getattr(agent, "acp_args", None)
+    if acp_args:
+        runtime["acp_args"] = list(acp_args)
+
+    credential_pool = getattr(agent, "_credential_pool", None)
+    if credential_pool is not None:
+        runtime["credential_pool"] = credential_pool
+
+    fallback_chain = getattr(agent, "_fallback_chain", None)
+    if fallback_chain:
+        runtime["fallback_model"] = list(fallback_chain)
+    else:
+        fallback_model = getattr(agent, "_fallback_model", None)
+        if fallback_model:
+            runtime["fallback_model"] = fallback_model
+
+    request_overrides = getattr(agent, "request_overrides", None)
+    if isinstance(request_overrides, dict) and request_overrides:
+        runtime["request_overrides"] = dict(request_overrides)
+    return runtime
+
+
+def _gateway_running_agent() -> Any:
+    """Return the active or cached agent for the current gateway session."""
+    session_key = _get_hermes_session_env("HERMES_SESSION_KEY")
+    if not session_key:
+        return None
+    try:
+        from gateway.run import _gateway_runner_ref
+
+        runner = _gateway_runner_ref()
+        if runner is None:
+            return None
+        running = getattr(runner, "_running_agents", None)
+        if isinstance(running, dict):
+            agent = running.get(session_key)
+            if getattr(agent, "model", None):
+                return agent
+        cache = getattr(runner, "_agent_cache", None)
+        cached = cache.get(session_key) if isinstance(cache, dict) else None
+        if isinstance(cached, tuple):
+            cached = cached[0] if cached else None
+        return cached if getattr(cached, "model", None) else None
+    except Exception:
+        return None
 
 
 def _get_hermes_session_env(name: str) -> str:
@@ -1105,17 +1233,19 @@ def _render_task_notification(record: dict[str, Any], preview_chars: int) -> str
     totals = snapshot.get("totals") or {}
 
     if record.get("error"):
-        summary = f'Dynamic workflow "{name}" {status}: {record["error"]}'
+        if status == "failed":
+            summary = f'Dynamic workflow "{name}" failed: {record["error"]}'
+        else:
+            summary = f'Dynamic workflow "{name}" {status}: {record["error"]}'
     elif status == "completed":
         summary = f'Dynamic workflow "{name}" completed'
-    elif status == "failed":
-        summary = f'Dynamic workflow "{name}" failed: all agents errored'
     elif status == "stopped":
         summary = f'Dynamic workflow "{name}" was stopped'
     else:
         summary = f'Dynamic workflow "{name}" {status}'
 
-    result_text = _completion_output_text(record)
+    include_result = not record.get("error")
+    result_text = _completion_output_text(record) if include_result else ""
     truncated = len(result_text) > preview_chars > 0
     if truncated:
         remaining = len(result_text) - preview_chars
@@ -1135,9 +1265,6 @@ def _render_task_notification(record: dict[str, Any], preview_chars: int) -> str
         "<task-notification>",
         f"<task-id>{task_id}</task-id>",
     ]
-    tool_use_id = str(record.get("toolUseId") or "")
-    if tool_use_id:
-        lines.append(f"<tool-use-id>{tool_use_id}</tool-use-id>")
     output_file = str(record.get("outputFile") or "")
     if output_file:
         lines.append(f"<output-file>{output_file}</output-file>")
@@ -1149,6 +1276,9 @@ def _render_task_notification(record: dict[str, Any], preview_chars: int) -> str
     )
     if result_text:
         lines.append(f"<result>{result_text}</result>")
+    recovery = str(record.get("transcriptDir") or "")
+    if record.get("error") and recovery:
+        lines.append(f"<recovery>Agent transcripts: {recovery}</recovery>")
     lines.append(
         f"<usage><agent_count>{agents}</agent_count>"
         f"<subagent_tokens>{tokens}</subagent_tokens>"
@@ -1157,19 +1287,6 @@ def _render_task_notification(record: dict[str, Any], preview_chars: int) -> str
     )
     lines.append("</task-notification>")
     return "\n".join(lines)
-
-
-def _derive_run_status(snapshot: dict[str, Any]) -> str:
-    """A run that finished but where every agent errored is 'failed', not
-    'completed'. Partial failures stay 'completed' (surfaced via the error
-    count in the display)."""
-    totals = snapshot.get("totals") or {}
-    agents = int(totals.get("agents") or 0)
-    done = int(totals.get("done") or 0)
-    if agents > 0 and done == 0:
-        return "failed"
-    return "completed"
-
 
 _MANAGER: WorkflowRunManager | None = None
 _MANAGER_LOCK = threading.Lock()

@@ -12,15 +12,16 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from dataclasses import replace
 from typing import Any
 
-from .presets import AgentTypeSpec, resolve_agent_type
+from .presets import AgentTypeSpec, list_agent_types, resolve_agent_type
 from .worktree import WorkspaceLease, create_workspace_lease
 from ..engine.config import PluginConfig
-from ..engine.errors import ChildAgentError, WorkflowTimeout
+from ..engine.errors import ChildAgentError, ChildAgentSkipped, WorkflowTimeout
 from ..plugin.structured_output import (
     MAX_STRUCTURED_OUTPUT_RETRIES,
     STRUCTURED_OUTPUT_CONTINUE_MESSAGE,
     STRUCTURED_OUTPUT_TOOL_NAME,
     STRUCTURED_OUTPUT_TOOLSET,
+    build_tool_schema_instruction,
     clear_expectation,
     peek_result,
     register_expectation,
@@ -31,25 +32,49 @@ from ..engine.types import ChildAgentRequest, ChildAgentResult, ChildAgentRunner
 
 logger = logging.getLogger(__name__)
 
+_CHILD_EXCLUDED_TOOL_NAMES = frozenset({"skill_manage"})
+
 
 class HermesChildAgentRunner(ChildAgentRunner):
     """Create standalone Hermes AIAgent children without native delegation."""
 
-    def __init__(self, config: PluginConfig, session_context: dict[str, str] | None = None):
+    def __init__(
+        self,
+        config: PluginConfig,
+        session_context: dict[str, str] | None = None,
+        parent_runtime: dict[str, Any] | None = None,
+    ):
         self.config = config
         # Captured gateway session vars (platform/session_key/chat_id/...) from
         # the launching session, re-applied on each child worker thread so a
         # child's dangerous command can route to the user for mid-run approval
         # (child_approval_policy="ask"). None outside gateway.
         self._session_context = session_context or None
-        self._active_children: list[Any] = []
+        # Captured from the launching main agent. It stays in memory so default
+        # children and model="inherit" use the active session runtime, including
+        # a non-persisted /model switch, without leaking credentials to run data.
+        self._parent_runtime = dict(parent_runtime) if parent_runtime else None
+        self._active_children: dict[str, Any] = {}
+        self._skipped_children: set[str] = set()
         self._active_lock = threading.RLock()
 
     def run(self, request: ChildAgentRequest) -> ChildAgentResult:
         task_id = f"workflow-{uuid.uuid4().hex[:12]}"
         base_cwd = request.cwd or os.environ.get("TERMINAL_CWD") or os.getcwd()
-        agent_type = resolve_agent_type(request.agent_type, cwd=base_cwd, task_id=task_id)
-        request = _apply_agent_type_defaults(request, agent_type)
+        resolved = request.resolved
+        agent_type = (
+            resolved.agent_type_spec
+            if resolved is not None
+            else resolve_agent_type(request.agent_type, cwd=base_cwd)
+        )
+        if request.agent_type and agent_type is None:
+            available = ", ".join(spec.name for spec in list_agent_types(cwd=base_cwd)) or "none"
+            raise ChildAgentError(
+                f"agent({{agentType}}): agent type '{request.agent_type}' not found. "
+                f"Available agents: {available}"
+            )
+        if resolved is None:
+            request = _apply_agent_type_defaults(request, agent_type)
         lease = create_workspace_lease(
             cwd=base_cwd,
             isolation=request.isolation,
@@ -58,18 +83,30 @@ class HermesChildAgentRunner(ChildAgentRunner):
             keep_worktree=self.config.keep_worktrees,
         )
         runtime = self._resolve_runtime(request)
+        _prepare_mcp_tool_registry(self.config)
         toolsets = _resolve_child_toolsets(
             self.config,
             request.toolsets,
             agent_type.toolsets if agent_type else (),
+            include_discoverable=(
+                resolved is None
+                and agent_type is None
+                and not request.toolsets
+            ),
         )
         structured_tool = bool(request.structured_tool and request.schema)
         if structured_tool and STRUCTURED_OUTPUT_TOOLSET not in toolsets:
             toolsets = toolsets + [STRUCTURED_OUTPUT_TOOLSET]
-        _prepare_mcp_tool_registry(self.config)
         tool_scope = structured_output_tool_scope() if structured_tool else nullcontext()
         with tool_scope:
             child = self._build_agent(request, runtime, toolsets, lease, agent_type)
+            _configure_child_tools(
+                child,
+                toolsets=toolsets,
+                blocked_toolsets=self.config.blocked_child_toolsets,
+                allowed_tools=agent_type.allowed_tools if agent_type else (),
+                disallowed_tools=agent_type.disallowed_tools if agent_type else (),
+            )
             if structured_tool:
                 child.tools = specialize_structured_output_tool(child.tools, request.schema)
                 child.valid_tool_names.add(STRUCTURED_OUTPUT_TOOL_NAME)
@@ -87,6 +124,8 @@ class HermesChildAgentRunner(ChildAgentRunner):
                 )
             try:
                 result = self._run_child_with_timeout(child, request, lease, agent_type, toolsets)
+                if self._consume_skipped(task_id):
+                    raise ChildAgentSkipped(f"child agent {task_id} was skipped")
                 if structured_tool and isinstance(result, ChildAgentResult):
                     captured, value, attempts = peek_result(lease.task_id)
                     if captured:
@@ -94,7 +133,12 @@ class HermesChildAgentRunner(ChildAgentRunner):
                         result.metadata["structured_result"] = value
                         result.metadata["structured_attempts"] = attempts
                 return result
+            except BaseException:
+                if self._consume_skipped(task_id):
+                    raise ChildAgentSkipped(f"child agent {task_id} was skipped") from None
+                raise
             finally:
+                self._clear_skipped(task_id)
                 if structured_tool:
                     clear_expectation(lease.task_id)
 
@@ -107,8 +151,12 @@ class HermesChildAgentRunner(ChildAgentRunner):
 
     def _resolve_runtime(self, request: ChildAgentRequest) -> dict[str, Any]:
         requested_model = (request.model or "").strip() or None
+        if requested_model and requested_model.lower() == "inherit":
+            requested_model = None
         if requested_model and not self.config.allow_model_override:
             raise ChildAgentError("model override is disabled for workflow child agents")
+        if requested_model is None and self._parent_runtime is not None:
+            return dict(self._parent_runtime)
 
         try:
             from hermes_cli.config import load_config
@@ -178,7 +226,10 @@ class HermesChildAgentRunner(ChildAgentRunner):
         except Exception as exc:
             raise ChildAgentError(f"could not import Hermes AIAgent: {exc}") from exc
 
-        child_prompt = build_child_system_prompt(agent_type)
+        child_prompt = build_child_system_prompt(
+            agent_type,
+            structured_output=request.structured_tool,
+        )
         try:
             session_db = _create_session_db()
         except Exception:
@@ -189,9 +240,12 @@ class HermesChildAgentRunner(ChildAgentRunner):
             "base_url": runtime.get("base_url"),
             "provider": runtime.get("provider"),
             "api_mode": runtime.get("api_mode"),
+            "acp_command": runtime.get("acp_command"),
+            "acp_args": runtime.get("acp_args"),
             "model": runtime.get("model"),
             "credential_pool": runtime.get("credential_pool"),
             "fallback_model": runtime.get("fallback_model"),
+            "max_tokens": runtime.get("max_tokens"),
             "enabled_toolsets": toolsets,
             "disabled_toolsets": list(self.config.blocked_child_toolsets),
             "quiet_mode": True,
@@ -203,8 +257,13 @@ class HermesChildAgentRunner(ChildAgentRunner):
             "session_db": session_db,
             "session_id": lease.task_id,
         }
-        if request.request_overrides and _callable_accepts_keyword(AIAgent, "request_overrides"):
-            kwargs["request_overrides"] = request.request_overrides
+        request_overrides = request.request_overrides or runtime.get("request_overrides")
+        if request_overrides and _callable_accepts_keyword(AIAgent, "request_overrides"):
+            kwargs["request_overrides"] = request_overrides
+        if runtime.get("reasoning_config") is not None:
+            kwargs["reasoning_config"] = runtime["reasoning_config"]
+        if runtime.get("service_tier") is not None:
+            kwargs["service_tier"] = runtime["service_tier"]
         return AIAgent(**kwargs)
 
     def _run_child_with_timeout(
@@ -283,7 +342,7 @@ class HermesChildAgentRunner(ChildAgentRunner):
             initializer=_init_worker,
         )
         with self._active_lock:
-            self._active_children.append(child)
+            self._active_children[lease.task_id] = child
         future = executor.submit(_run)
         result: dict[str, Any] | None = None
         try:
@@ -306,15 +365,14 @@ class HermesChildAgentRunner(ChildAgentRunner):
                 raise WorkflowTimeout(f"child agent timed out after {timeout:.0f}s") from exc
         finally:
             with self._active_lock:
-                if child in self._active_children:
-                    self._active_children.remove(child)
+                self._active_children.pop(lease.task_id, None)
             _cleanup_task_cwd(lease.task_id)
             lease.cleanup()
             executor.shutdown(wait=False, cancel_futures=True)
 
     def interrupt_all(self) -> None:
         with self._active_lock:
-            children = list(self._active_children)
+            children = list(self._active_children.values())
         for child in children:
             try:
                 if hasattr(child, "interrupt"):
@@ -322,8 +380,43 @@ class HermesChildAgentRunner(ChildAgentRunner):
             except Exception:
                 pass
 
+    def skip_child(self, task_id: str) -> bool:
+        """Interrupt one active child and make its agent() call resolve to None."""
+        wanted = str(task_id or "")
+        if not wanted:
+            return False
+        with self._active_lock:
+            child = self._active_children.get(wanted)
+            if child is None:
+                return False
+            self._skipped_children.add(wanted)
+        try:
+            interrupt = getattr(child, "interrupt", None)
+            if callable(interrupt):
+                interrupt()
+            return True
+        except Exception:
+            with self._active_lock:
+                self._skipped_children.discard(wanted)
+            return False
 
-def build_child_system_prompt(agent_type: AgentTypeSpec | None = None) -> str:
+    def _consume_skipped(self, task_id: str) -> bool:
+        with self._active_lock:
+            if task_id not in self._skipped_children:
+                return False
+            self._skipped_children.discard(task_id)
+            return True
+
+    def _clear_skipped(self, task_id: str) -> None:
+        with self._active_lock:
+            self._skipped_children.discard(task_id)
+
+
+def build_child_system_prompt(
+    agent_type: AgentTypeSpec | None = None,
+    *,
+    structured_output: bool = False,
+) -> str:
     """Stable, per-task-independent system prompt for a child agent.
 
     Kept byte-identical across children with the same agent_type so that, on
@@ -336,9 +429,9 @@ def build_child_system_prompt(agent_type: AgentTypeSpec | None = None) -> str:
     :func:`build_child_task_message`.
     """
     lines = [
-        "You are a focused Hermes child agent spawned by a dynamic workflow.",
-        "Work only on the delegated task. Do not ask the user questions.",
-        "Use available tools when needed, then return a concise final answer.",
+        "You are a subagent spawned by a workflow orchestration script.",
+        "Use the tools available to complete the task.",
+        "Your final text response is returned verbatim as a string to the calling script — it is your return value, not a message to a human.",
     ]
     if agent_type is not None:
         lines.extend(
@@ -351,6 +444,8 @@ def build_child_system_prompt(agent_type: AgentTypeSpec | None = None) -> str:
                 agent_type.instructions,
             ]
         )
+    if structured_output:
+        lines.extend(["", build_tool_schema_instruction().strip()])
     return "\n".join(lines)
 
 
@@ -358,14 +453,11 @@ def build_child_task_message(request: ChildAgentRequest, *, workspace: str) -> s
     """Per-task context (the variable part) prepended to the child's task.
 
     This is the child's first user message — the part that legitimately differs
-    per child (workspace, label, phase, worktree note) — kept out of the cached
-    system prefix so it doesn't break cross-child cache reuse.
+    per child (workspace and worktree note) — kept out of the cached system
+    prefix so it doesn't break cross-child cache reuse. Label and phase are
+    display-only metadata and deliberately do not alter the child's prompt.
     """
     context = [f"- Workspace: {workspace}"]
-    if request.label:
-        context.append(f"- Task label: {request.label}")
-    if request.phase:
-        context.append(f"- Workflow phase: {request.phase}")
     if request.isolation == "worktree":
         context.append(
             "- You are running in an isolated git worktree; keep all file "
@@ -380,9 +472,12 @@ def _apply_agent_type_defaults(
 ) -> ChildAgentRequest:
     if agent_type is None:
         return request
+    model = request.model or agent_type.model
+    if model and model.strip().lower() == "inherit":
+        model = None
     return replace(
         request,
-        model=request.model or agent_type.model,
+        model=model,
         isolation=request.isolation or agent_type.isolation,
     )
 
@@ -391,8 +486,12 @@ def _resolve_child_toolsets(
     config: PluginConfig,
     requested: list[str],
     agent_type_toolsets: tuple[str, ...] = (),
+    *,
+    include_discoverable: bool = False,
 ) -> list[str]:
     raw = requested or list(agent_type_toolsets) or list(config.default_child_toolsets)
+    if include_discoverable:
+        raw = list(raw) + _discoverable_child_toolsets(config)
     blocked = set(config.blocked_child_toolsets)
     cleaned: list[str] = []
     for item in raw:
@@ -400,7 +499,137 @@ def _resolve_child_toolsets(
         if not name or name in blocked or name in cleaned:
             continue
         cleaned.append(name)
-    return cleaned or list(config.default_child_toolsets)
+    return cleaned
+
+
+def _discoverable_child_toolsets(config: PluginConfig) -> list[str]:
+    """Return installed MCP/plugin toolsets safe for the default workflow child."""
+    blocked = set(config.blocked_child_toolsets)
+    blocked.add(STRUCTURED_OUTPUT_TOOLSET)
+    discovered: set[str] = set()
+    plugin_tool_names: set[str] = set()
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+
+        plugin_tool_names = set(get_plugin_manager()._plugin_tool_names)
+    except Exception:
+        pass
+    try:
+        from tools.registry import registry
+        from tools.tool_search import is_deferrable_tool_name
+
+        for tool_name in registry.get_all_tool_names():
+            if not is_deferrable_tool_name(tool_name):
+                continue
+            toolset = registry.get_toolset_for_tool(tool_name)
+            if (
+                toolset
+                and toolset not in blocked
+                and (toolset.startswith("mcp-") or tool_name in plugin_tool_names)
+            ):
+                discovered.add(toolset)
+    except Exception:
+        return []
+    return sorted(discovered)
+
+
+def _configure_child_tools(
+    child: Any,
+    *,
+    toolsets: list[str],
+    blocked_toolsets: tuple[str, ...],
+    allowed_tools: tuple[str, ...] = (),
+    disallowed_tools: tuple[str, ...] = (),
+) -> None:
+    """Apply the workflow-child tool surface and force native Tool Search."""
+    try:
+        import model_tools
+        from tools.tool_search import ToolSearchConfig, assemble_tool_defs
+
+        definitions = model_tools.get_tool_definitions(
+            enabled_toolsets=toolsets,
+            disabled_toolsets=list(blocked_toolsets),
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        ) or []
+        definitions = _filter_child_tool_definitions(
+            definitions,
+            allowed_tools=allowed_tools,
+            disallowed_tools=disallowed_tools,
+        )
+        direct: list[dict[str, Any]] = []
+        searchable: list[dict[str, Any]] = []
+        for definition in definitions:
+            function = definition.get("function") if isinstance(definition, dict) else None
+            name = function.get("name") if isinstance(function, dict) else None
+            if name in _CHILD_EXCLUDED_TOOL_NAMES:
+                continue
+            if name == STRUCTURED_OUTPUT_TOOL_NAME:
+                direct.append(definition)
+            else:
+                searchable.append(definition)
+
+        assembled = assemble_tool_defs(
+            searchable,
+            config=ToolSearchConfig.from_raw({"enabled": "on"}),
+        )
+        child.tools = list(assembled.tool_defs) + direct
+    except Exception:
+        child.tools = _filter_child_tool_definitions(
+            [
+                definition
+                for definition in list(getattr(child, "tools", None) or [])
+                if _tool_definition_name(definition) not in _CHILD_EXCLUDED_TOOL_NAMES
+            ],
+            allowed_tools=allowed_tools,
+            disallowed_tools=disallowed_tools,
+        )
+
+    child.valid_tool_names = {
+        name
+        for definition in child.tools
+        if (name := _tool_definition_name(definition))
+    }
+    # Keep structured_output directly callable but out of the deferred catalog.
+    child.enabled_toolsets = [
+        toolset for toolset in toolsets if toolset != STRUCTURED_OUTPUT_TOOLSET
+    ]
+    try:
+        child._tool_search_scope_cache = None
+    except Exception:
+        pass
+
+
+def _filter_child_tool_definitions(
+    definitions: list[dict[str, Any]],
+    *,
+    allowed_tools: tuple[str, ...] = (),
+    disallowed_tools: tuple[str, ...] = (),
+) -> list[dict[str, Any]]:
+    allowed = {name for item in allowed_tools if (name := str(item).strip())}
+    disallowed = {name for item in disallowed_tools if (name := str(item).strip())}
+    if allowed:
+        allowed.add(STRUCTURED_OUTPUT_TOOL_NAME)
+    filtered: list[dict[str, Any]] = []
+    for definition in definitions:
+        name = _tool_definition_name(definition)
+        if not name:
+            continue
+        if allowed and name not in allowed:
+            continue
+        if name in disallowed:
+            continue
+        filtered.append(definition)
+    return filtered
+
+
+def _tool_definition_name(definition: Any) -> str:
+    if not isinstance(definition, dict):
+        return ""
+    function = definition.get("function")
+    if not isinstance(function, dict):
+        return ""
+    return str(function.get("name") or "")
 
 
 def _prepare_mcp_tool_registry(config: PluginConfig) -> None:
@@ -574,7 +803,7 @@ def _child_metadata(
         "isolation": lease.isolation or "shared",
         "worktree_path": lease.path,
         "worktree_branch": lease.branch,
-        "agent_type": agent_type.name if agent_type else None,
+        "agent_type": agent_type.name if agent_type else "workflow-subagent",
         "agent_type_source": agent_type.source if agent_type else None,
         "model": getattr(child, "model", None),
         "toolsets": toolsets,

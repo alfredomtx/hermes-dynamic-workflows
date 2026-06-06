@@ -23,9 +23,7 @@ from .errors import SandboxViolation, WorkflowParseError
 # Hermes' approval engine, never the orchestration script itself).
 FORBIDDEN_NODES = (
     ast.AsyncFor,
-    ast.AsyncFunctionDef,
     ast.AsyncWith,
-    ast.Await,
     ast.ClassDef,
     ast.Delete,
     ast.Global,
@@ -64,22 +62,38 @@ FORBIDDEN_NAMES = {
     "importlib",
 }
 
+META_FIRST_ERROR = "Invalid workflow script: `meta = {...}` must be the FIRST statement in the script"
+DETERMINISM_ERROR = (
+    "Workflow scripts must be deterministic: current time and randomness are "
+    "unavailable (breaks resume). Stamp results after the workflow returns, "
+    "or pass timestamps via args."
+)
 MAX_AST_NODES = 2500
 MAX_STRING_LITERAL_CHARS = 20000
 MAX_ABS_INT_LITERAL = 10**9
+ENTRYPOINT_NAME = "__workflow_main__"
 
 
 def parse_script(script: str, config: PluginConfig) -> ast.Module:
     if not isinstance(script, str) or not script.strip():
-        raise WorkflowParseError("workflow script must be a non-empty Python string")
+        raise WorkflowParseError(META_FIRST_ERROR)
     if len(script) > config.script_max_chars:
         raise WorkflowParseError(
-            f"workflow script is too large ({len(script)} chars; max {config.script_max_chars})"
+            f"Invalid workflow script: workflow script is too large "
+            f"({len(script)} chars; max {config.script_max_chars})"
         )
     try:
         tree = ast.parse(script, filename="<workflow>", mode="exec")
     except SyntaxError as exc:
-        raise WorkflowParseError(f"invalid Python workflow script: {exc.msg} at line {exc.lineno}") from exc
+        line = exc.lineno or 0
+        column = exc.offset or 0
+        raise WorkflowParseError(
+            "Invalid workflow script: Script parse error: "
+            f"{exc.msg} at line {line}, column {column}. "
+            "Workflow scripts must be plain Python."
+        ) from exc
+    extract_meta(tree)
+    _validate_top_level_contract(tree)
     validate_ast(tree)
     return instrument_loops(tree)
 
@@ -112,39 +126,45 @@ def validate_ast(tree: ast.AST) -> None:
 
 
 def extract_meta(tree: ast.Module) -> dict[str, Any]:
-    """Extract a literal top-level ``meta = {...}`` assignment when present."""
-    for stmt in tree.body:
-        if not isinstance(stmt, ast.Assign):
-            continue
-        if len(stmt.targets) != 1:
-            continue
-        target = stmt.targets[0]
-        if not isinstance(target, ast.Name) or target.id != "meta":
-            continue
-        try:
-            value = ast.literal_eval(stmt.value)
-        except (ValueError, TypeError, SyntaxError, MemoryError):
-            raise WorkflowParseError("meta must be a literal dict")
-        if not isinstance(value, dict):
-            raise WorkflowParseError("meta must be a dict")
-        return _normalize_meta(value)
-    return {"name": "dynamic-workflow", "description": ""}
+    """Extract the required literal ``meta = {...}`` first statement."""
+    if not tree.body:
+        raise WorkflowParseError(META_FIRST_ERROR)
+    stmt = tree.body[0]
+    if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
+        raise WorkflowParseError(META_FIRST_ERROR)
+    target = stmt.targets[0]
+    if not isinstance(target, ast.Name) or target.id != "meta":
+        raise WorkflowParseError(META_FIRST_ERROR)
+    if not isinstance(stmt.value, ast.Dict):
+        raise WorkflowParseError(META_FIRST_ERROR)
+    _validate_meta_literal(stmt.value)
+    try:
+        value = ast.literal_eval(stmt.value)
+    except (ValueError, TypeError, SyntaxError, MemoryError):
+        raise WorkflowParseError("Invalid workflow script: meta must be a pure literal")
+    if not isinstance(value, dict):
+        raise WorkflowParseError(META_FIRST_ERROR)
+    return _normalize_meta(value)
 
 
 def _normalize_meta(value: dict[str, Any]) -> dict[str, Any]:
+    if "name" not in value:
+        raise WorkflowParseError("Invalid workflow script: meta.name must be a non-empty string")
+    if "description" not in value:
+        raise WorkflowParseError("Invalid workflow script: meta.description must be a non-empty string")
     meta: dict[str, Any] = {}
     for key, item in value.items():
         if not isinstance(key, str):
-            raise WorkflowParseError("meta keys must be strings")
+            raise WorkflowParseError("Invalid workflow script: meta keys must be strings")
         if key.startswith("_") or key in {"__proto__", "constructor", "prototype"}:
-            raise WorkflowParseError(f"forbidden meta key: {key}")
+            raise WorkflowParseError(f"Invalid workflow script: forbidden meta key: {key}")
         if key in {"name", "description", "whenToUse"}:
             if item is not None and not isinstance(item, str):
-                raise WorkflowParseError(f"meta.{key} must be a string")
+                raise WorkflowParseError(f"Invalid workflow script: meta.{key} must be a string")
             meta[key] = item or ""
         elif key == "phases":
             if not isinstance(item, list):
-                raise WorkflowParseError("meta.phases must be a list")
+                raise WorkflowParseError("Invalid workflow script: meta.phases must be a list")
             normalized = []
             for part in item:
                 if isinstance(part, str):
@@ -153,26 +173,89 @@ def _normalize_meta(value: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(part, dict):
                     title = part.get("title")
                     if not isinstance(title, str) or not title.strip():
-                        raise WorkflowParseError("meta.phases object entries require a title string")
+                        raise WorkflowParseError(
+                            "Invalid workflow script: meta.phases object entries require a title string"
+                        )
                     entry = {"title": title.strip()}
                     for phase_key in ("detail", "model"):
                         value = part.get(phase_key)
                         if value is not None:
                             if not isinstance(value, str):
-                                raise WorkflowParseError(f"meta.phases.{phase_key} must be a string")
+                                raise WorkflowParseError(
+                                    f"Invalid workflow script: meta.phases.{phase_key} must be a string"
+                                )
                             entry[phase_key] = value
                     normalized.append(entry)
                     continue
-                raise WorkflowParseError("meta.phases entries must be strings or objects")
+                raise WorkflowParseError(
+                    "Invalid workflow script: meta.phases entries must be strings or objects"
+                )
             meta[key] = normalized
         else:
             meta[key] = item
     name = str(meta.get("name") or "").strip()
     if not name:
-        raise WorkflowParseError("meta.name must be a non-empty string")
+        raise WorkflowParseError("Invalid workflow script: meta.name must be a non-empty string")
+    description = str(meta.get("description") or "").strip()
+    if not description:
+        raise WorkflowParseError(
+            "Invalid workflow script: meta.description must be a non-empty string"
+        )
     meta["name"] = name
-    meta.setdefault("description", "")
+    meta["description"] = description
     return meta
+
+
+def _validate_meta_literal(node: ast.Dict) -> None:
+    for key in node.keys:
+        if key is None:
+            raise WorkflowParseError(
+                "Invalid workflow script: meta must be a pure literal: "
+                "only plain properties allowed in meta"
+            )
+    for child in ast.walk(node):
+        if isinstance(child, ast.JoinedStr):
+            raise WorkflowParseError(
+                "Invalid workflow script: meta must be a pure literal: "
+                "template interpolation not allowed in meta"
+            )
+        if isinstance(child, _META_LITERAL_NODE_TYPES):
+            continue
+        if child is node:
+            continue
+        raise WorkflowParseError(
+            "Invalid workflow script: meta must be a pure literal: "
+            f"non-literal node type in meta: {type(child).__name__}"
+        )
+
+
+def _validate_top_level_contract(tree: ast.Module) -> None:
+    for stmt in tree.body[1:]:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name == "workflow":
+            raise WorkflowParseError(
+                "do not define workflow(); the workflow script body is already async"
+            )
+
+
+def build_execution_tree(tree: ast.Module) -> ast.Module:
+    """Wrap the post-meta script body in the runtime's private async entrypoint."""
+    body = tree.body[1:] or [ast.Return(value=ast.Constant(value=None))]
+    entrypoint = ast.AsyncFunctionDef(
+        name=ENTRYPOINT_NAME,
+        args=ast.arguments(
+            posonlyargs=[],
+            args=[],
+            kwonlyargs=[],
+            kw_defaults=[],
+            defaults=[],
+        ),
+        body=body,
+        decorator_list=[],
+        returns=None,
+        type_comment=None,
+    )
+    execution_tree = ast.Module(body=[tree.body[0], entrypoint], type_ignores=[])
+    return ast.fix_missing_locations(execution_tree)
 
 
 def _validate_name(name: str) -> None:
@@ -188,6 +271,8 @@ def _validate_constant(value: Any) -> None:
 
 
 def _validate_call(node: ast.Call) -> None:
+    if _is_nondeterministic_call(node):
+        raise SandboxViolation(DETERMINISM_ERROR)
     func = node.func
     if isinstance(func, ast.Name):
         _validate_name(func.id)
@@ -196,6 +281,33 @@ def _validate_call(node: ast.Call) -> None:
             raise SandboxViolation(f"forbidden method call: {func.attr}")
     else:
         raise SandboxViolation("dynamic call targets are not allowed")
+
+
+_META_LITERAL_NODE_TYPES = (
+    ast.Constant,
+    ast.Dict,
+    ast.List,
+    ast.Load,
+    ast.Set,
+    ast.Tuple,
+)
+
+
+def _is_nondeterministic_call(node: ast.Call) -> bool:
+    func = node.func
+    if not isinstance(func, ast.Attribute):
+        return False
+    if not isinstance(func.value, ast.Name):
+        return False
+    base = func.value.id
+    attr = func.attr
+    return (
+        (base == "time" and attr in {"time", "monotonic", "perf_counter", "process_time"})
+        or (base == "random" and attr in {"random", "randint", "randrange", "choice", "shuffle"})
+        or (base == "uuid" and attr in {"uuid1", "uuid4"})
+        or (base == "datetime" and attr in {"now", "utcnow", "today"})
+        or (base == "date" and attr == "today")
+    )
 
 
 def _validate_except_handler(node: ast.ExceptHandler) -> None:
@@ -227,12 +339,11 @@ LOOP_GUARD_NAME = "__wf_tick__"
 
 
 class _LoopGuard(ast.NodeTransformer):
-    """Rewrite ``while TEST:`` into ``while __wf_tick__() and (TEST):``.
+    """Inject ``__wf_tick__()`` into every while/for iteration.
 
     ``__wf_tick__()`` checks stop/deadline and the loop-iteration cap (raising a
-    WorkflowHalt if exceeded) and otherwise returns True, so the original TEST
-    still controls the loop. This makes the cooperative deadline fire inside a
-    pure-compute loop that never calls agent().
+    WorkflowHalt if exceeded). This makes the cooperative deadline fire inside
+    a pure-compute loop that never calls agent().
     """
 
     def visit_While(self, node: ast.While) -> ast.While:
@@ -243,12 +354,24 @@ class _LoopGuard(ast.NodeTransformer):
         node.test = ast.BoolOp(op=ast.And(), values=[guard, node.test])
         return node
 
+    def visit_For(self, node: ast.For) -> ast.For:
+        self.generic_visit(node)
+        guard = ast.Expr(
+            value=ast.Call(
+                func=ast.Name(id=LOOP_GUARD_NAME, ctx=ast.Load()),
+                args=[],
+                keywords=[],
+            )
+        )
+        node.body.insert(0, guard)
+        return node
+
 
 def instrument_loops(tree: ast.Module) -> ast.Module:
-    """Inject the per-iteration loop guard into every ``while`` loop.
+    """Inject the per-iteration loop guard into every ``while`` and ``for`` loop.
 
     Runs after ``validate_ast`` (the injected nodes are trusted and not
-    re-validated). ``for`` loops are bounded by their iterable and left alone.
+    re-validated).
     """
     _LoopGuard().visit(tree)
     ast.fix_missing_locations(tree)

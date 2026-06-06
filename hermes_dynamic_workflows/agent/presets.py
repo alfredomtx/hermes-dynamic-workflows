@@ -15,55 +15,55 @@ class AgentTypeSpec:
     name: str
     instructions: str
     source: str
+    description: str = ""
     toolsets: tuple[str, ...] = ()
+    allowed_tools: tuple[str, ...] = ()
+    disallowed_tools: tuple[str, ...] = ()
     model: str | None = None
     isolation: str | None = None
 
 
-def resolve_agent_type(name: str | None, *, cwd: str | None = None, task_id: str | None = None) -> AgentTypeSpec | None:
+def resolve_agent_type(name: str | None, *, cwd: str | None = None) -> AgentTypeSpec | None:
     clean = str(name or "").strip()
     if not clean:
         return None
 
-    skill_spec = _resolve_hermes_skill(clean, task_id=task_id)
-    if skill_spec is not None:
-        return skill_spec
-
     path = _find_agent_type_file(clean, cwd=cwd)
-    if path is None:
-        return None
-    return _load_agent_type_file(clean, path)
+    if path is not None:
+        return _load_agent_type_file(clean, path)
+
+    for spec in list_agent_types(cwd=cwd):
+        if spec.name == clean:
+            return spec
+    return None
 
 
-def _resolve_hermes_skill(name: str, *, task_id: str | None) -> AgentTypeSpec | None:
-    """Load agentType through Hermes' own skill resolver when possible."""
-    try:
-        from agent.skill_commands import build_preloaded_skills_prompt
-
-        prompt, loaded_names, missing = build_preloaded_skills_prompt([name], task_id=task_id)
-    except Exception:
-        return None
-    if not prompt.strip() or not loaded_names or missing:
-        return None
-    return AgentTypeSpec(
-        name=loaded_names[0],
-        instructions=prompt.strip(),
-        source=f"hermes-skill:{name}",
-    )
+def list_agent_types(*, cwd: str | None = None) -> list[AgentTypeSpec]:
+    """Return active workflow agent types in resolution precedence order."""
+    active: dict[str, AgentTypeSpec] = {}
+    for base in _agent_type_bases(cwd):
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in {".md", ".yaml", ".yml", ".json"}:
+                continue
+            try:
+                rel = path.resolve().relative_to(base.resolve())
+            except ValueError:
+                continue
+            try:
+                spec = _load_agent_type_file(str(rel.with_suffix("")), path)
+            except Exception:
+                continue
+            active.setdefault(spec.name, spec)
+    return list(active.values())
 
 
 def _find_agent_type_file(name: str, *, cwd: str | None) -> Path | None:
     rel = _safe_agent_type_relative_path(name)
-    bases: list[Path] = []
-    if cwd:
-        bases.append(Path(cwd).expanduser() / ".hermes" / "workflow-agent-types")
-    bases.append(default_store_root() / "agent-types")
-    plugin_root = Path(__file__).resolve().parent.parent
-    bases.append(plugin_root / "agent-types")
-
     suffix = rel.suffix.lower()
     rels = [rel] if suffix else [rel.with_suffix(ext) for ext in (".md", ".yaml", ".yml", ".json")]
-    for base in bases:
+    for base in _agent_type_bases(cwd):
         for candidate_rel in rels:
             candidate = (base / candidate_rel).resolve()
             try:
@@ -73,6 +73,16 @@ def _find_agent_type_file(name: str, *, cwd: str | None) -> Path | None:
             if candidate.is_file():
                 return candidate
     return None
+
+
+def _agent_type_bases(cwd: str | None) -> list[Path]:
+    bases: list[Path] = []
+    if cwd:
+        bases.append(Path(cwd).expanduser() / ".hermes" / "dynamic-workflows" / "agents")
+    bases.append(default_store_root() / "agents")
+    plugin_root = Path(__file__).resolve().parent.parent
+    bases.append(plugin_root / "agents")
+    return bases
 
 
 def _safe_agent_type_relative_path(name: str) -> Path:
@@ -104,7 +114,10 @@ def _load_markdown_agent_type(name: str, path: Path) -> AgentTypeSpec:
         name=str(frontmatter.get("name") or Path(name).stem),
         instructions=body,
         source=str(path),
+        description=_description_from(frontmatter),
         toolsets=_as_tuple(frontmatter.get("toolsets") or frontmatter.get("tools")),
+        allowed_tools=_as_tuple(frontmatter.get("allowed_tools")),
+        disallowed_tools=_as_tuple(frontmatter.get("disallowed_tools")),
         model=_as_optional_str(frontmatter.get("model")),
         isolation=_as_optional_str(frontmatter.get("isolation")),
     )
@@ -127,7 +140,10 @@ def _load_structured_agent_type(name: str, path: Path, data: Any) -> AgentTypeSp
         name=str(data.get("name") or Path(name).stem),
         instructions=instructions,
         source=str(path),
+        description=_description_from(data),
         toolsets=_as_tuple(data.get("toolsets") or data.get("tools")),
+        allowed_tools=_as_tuple(data.get("allowed_tools")),
+        disallowed_tools=_as_tuple(data.get("disallowed_tools")),
         model=_as_optional_str(data.get("model")),
         isolation=_as_optional_str(data.get("isolation")),
     )
@@ -198,6 +214,11 @@ def _as_tuple(value: Any) -> tuple[str, ...]:
     else:
         return ()
     return tuple(str(item).strip() for item in raw if str(item).strip())
+
+
+def _description_from(data: dict[str, Any]) -> str:
+    description = str(data.get("description") or data.get("whenToUse") or "").strip()
+    return description.replace("\\n", "\n").replace('\\"', '"')
 
 
 def _as_optional_str(value: Any) -> str | None:

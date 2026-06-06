@@ -4,7 +4,7 @@ Two families, split on purpose:
 
 * ``DynamicWorkflowError`` (→ ``Exception``): recoverable. A workflow script may
   ``try/except Exception`` around these (e.g. a child agent that failed, a
-  subworkflow error, bad indexing of results) and handle them gracefully.
+  nested workflow error, bad indexing of results) and handle them gracefully.
 * ``WorkflowHalt`` (→ ``BaseException``): run-level halts — user stop, the
   workflow deadline, and hard limits (token budget / agent cap / loop cap).
   These derive from ``BaseException`` so a script's ``except Exception`` cannot
@@ -36,6 +36,10 @@ class ChildAgentError(WorkflowRuntimeError):
     """Raised when a child agent fails."""
 
 
+class ChildAgentSkipped(DynamicWorkflowError):
+    """Raised internally when one child agent is intentionally skipped."""
+
+
 class WorkflowLaunchDenied(DynamicWorkflowError):
     """Raised when a top-level launch is not approved by the user (or no
     approval channel is available). The caller should tell the user, not retry."""
@@ -48,9 +52,9 @@ class WorkflowToolUseError(DynamicWorkflowError):
 class WorkflowTimeout(ChildAgentError):
     """A single child agent exceeded its own timeout.
 
-    Recoverable and per-agent: ``agent()`` records it and returns None (it is
-    not retried, to avoid multiplying long waits). This is NOT the whole-run
-    deadline — that is ``WorkflowDeadlineExceeded`` below.
+    Recoverable and per-agent: ``agent()`` records it and raises it to the
+    workflow script. This is NOT the whole-run deadline — that is
+    ``WorkflowDeadlineExceeded`` below.
     """
 
 

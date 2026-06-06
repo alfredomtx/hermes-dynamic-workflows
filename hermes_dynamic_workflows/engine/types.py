@@ -192,6 +192,36 @@ class ChildAgentResult:
 
 
 @dataclass(frozen=True)
+class ResolvedAgentSpec:
+    requested_agent_type: str | None
+    agent_type_spec: Any = None
+    model: str | None = None
+    isolation: str | None = None
+    toolsets: tuple[str, ...] = ()
+    allowed_tools: tuple[str, ...] = ()
+    disallowed_tools: tuple[str, ...] = ()
+    system_prompt_hash: str = ""
+    workspace: str = ""
+
+    @property
+    def agent_type_name(self) -> str | None:
+        value = getattr(self.agent_type_spec, "name", None)
+        return str(value) if value else self.requested_agent_type
+
+    def cache_inputs(self) -> dict[str, Any]:
+        return {
+            "model": self.model,
+            "isolation": self.isolation,
+            "toolsets": list(self.toolsets),
+            "allowedTools": list(self.allowed_tools),
+            "disallowedTools": list(self.disallowed_tools),
+            "agentType": self.agent_type_name,
+            "systemPromptHash": self.system_prompt_hash,
+            "workspace": self.workspace,
+        }
+
+
+@dataclass(frozen=True)
 class ChildAgentRequest:
     id: int
     prompt: str
@@ -206,6 +236,7 @@ class ChildAgentRequest:
     request_overrides: dict[str, Any] | None = None
     structured_tool: bool = False
     on_start: Callable[[dict[str, Any]], None] | None = None
+    resolved: ResolvedAgentSpec | None = None
 
 
 class ChildAgentRunner:

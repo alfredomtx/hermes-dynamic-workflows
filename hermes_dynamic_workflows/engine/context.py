@@ -78,6 +78,7 @@ class WorkflowExecutionContext:
     on_journal: Callable[[dict[str, Any]], None] | None = None
     plugin_context: Any = None
     token_budget_total: int | None = None
+    store: Any = None
     state: WorkflowState = field(init=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False)
     _agent_slots: threading.BoundedSemaphore = field(init=False)
@@ -89,7 +90,8 @@ class WorkflowExecutionContext:
 
     def __post_init__(self) -> None:
         self.state = WorkflowState(self.root)
-        self._agent_slots = threading.BoundedSemaphore(max(1, self.config.concurrency))
+        concurrency = min(self.config.concurrency, self.config.max_concurrency)
+        self._agent_slots = threading.BoundedSemaphore(max(1, concurrency))
 
     @property
     def spent_tokens(self) -> int:

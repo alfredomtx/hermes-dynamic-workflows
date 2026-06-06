@@ -216,10 +216,9 @@ class DynamicToolSchemaTests(unittest.TestCase):
 class ToolChannelTests(unittest.TestCase):
     def test_schema_agent_requires_structured_output_and_returns_captured_result(self):
         script = """
-meta = {"name": "tool-channel"}
+meta = {"name": "tool-channel", "description": "Test workflow"}
 
-def workflow():
-    return agent("return status", {"label": "json", "schema": {"type": "object", "required": ["ok"]}})
+return await agent("return status", {"label": "json", "schema": {"type": "object", "required": ["ok"]}})
 """
         runner = CaptureRunner({"ok": True, "n": 5})
         result = run_workflow(
@@ -230,7 +229,8 @@ def workflow():
         self.assertEqual(result.value, {"ok": True, "n": 5})
         request = runner.requests[0]
         self.assertTrue(request.structured_tool)
-        self.assertIn("structured_output", request.prompt)
+        self.assertEqual(request.prompt, "return status")
+        self.assertIsNotNone(request.resolved)
         agent = result.state.snapshot()["agents"][0]
         self.assertEqual(agent["structured"]["mode"], "tool")
         self.assertEqual(agent["structured"]["status"], "valid")

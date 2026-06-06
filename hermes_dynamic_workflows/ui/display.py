@@ -226,7 +226,7 @@ def _render_frame_tree(parts: list[str], frame: dict[str, Any], *, indent: str, 
         parts.append(f"{indent}log: {preview(line, 120)}")
     for child in frame.get("children") or []:
         child_meta = child.get("meta") or {}
-        child_name = child_meta.get("name") or child.get("source_ref") or "subworkflow"
+        child_name = child_meta.get("name") or child.get("source_ref") or "workflow"
         child_totals = _totals(child)
         parts.append(
             f"{indent}> {child_name} "
@@ -239,7 +239,7 @@ def _render_frame_detail(lines: list[str], frame: dict[str, Any], *, level: int)
     prefix = "  " * level
     if level > 0:
         meta = frame.get("meta") or {}
-        name = meta.get("name") or frame.get("source_ref") or "subworkflow"
+        name = meta.get("name") or frame.get("source_ref") or "workflow"
         totals = _totals(frame)
         lines.append(f"{prefix}> {name} . {totals['done']}/{totals['agents']} agents")
     phases = _phase_names(frame, recursive=False)

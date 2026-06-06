@@ -2,17 +2,33 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import inspect
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from time import monotonic
 from typing import Any, Callable
 
 from .cache import agent_fingerprint, is_cache_miss
-from ..plugin.structured_output import build_tool_schema_instruction
 from ..ui.display import preview
-from .errors import WorkflowHalt, WorkflowRuntimeError
+from .errors import (
+    ChildAgentError,
+    ChildAgentSkipped,
+    WorkflowHalt,
+    WorkflowParseError,
+    WorkflowRuntimeError,
+)
 from .structured import StructuredOutputError, validate_json_schema
-from .types import AgentRecord, ChildAgentRequest, ChildAgentResult, WorkflowFrame
+from .types import (
+    AgentRecord,
+    ChildAgentRequest,
+    ChildAgentResult,
+    ResolvedAgentSpec,
+    WorkflowFrame,
+)
+
+MAX_VM_ARRAY_ITEMS = 4096
 
 
 class BudgetView:
@@ -55,13 +71,14 @@ class WorkflowAPI:
             "phase": self.phase,
             "log": self.log,
             "args": self.frame.args,
-            "cwd": self.frame.cwd,
             "budget": self.budget,
-            "print": self.log,
-            "subworkflow": self.subworkflow,
+            "workflow": self.workflow,
         }
 
-    def agent(self, prompt: str, opts: dict[str, Any] | None = None) -> Any:
+    async def agent(self, prompt: str, opts: dict[str, Any] | None = None) -> Any:
+        return await asyncio.to_thread(self._agent_sync, prompt, opts)
+
+    def _agent_sync(self, prompt: str, opts: dict[str, Any] | None = None) -> Any:
         self._check_deadline()
         opts = opts or {}
         if not isinstance(prompt, str) or not prompt.strip():
@@ -78,35 +95,34 @@ class WorkflowAPI:
                 validate_json_schema(schema)
             except StructuredOutputError as exc:
                 raise WorkflowRuntimeError(str(exc)) from exc
+        resolved = _resolve_agent_spec(
+            opts,
+            cwd=self.frame.cwd,
+            config=self.config,
+            structured_output=schema is not None,
+        )
 
         with self._lock:
             agent_id = self.context.reserve_agent()
             phase_name = str(opts.get("phase") or self.frame.current_phase or "") or None
             label = str(opts.get("label") or f"agent-{agent_id}")
-            isolation = _normalize_isolation(opts.get("isolation"))
-            agent_type = _normalize_agent_type(opts.get("agentType", opts.get("agent_type")))
             record = AgentRecord(
                 id=agent_id,
                 label=label,
                 phase=phase_name,
                 prompt=prompt,
                 prompt_preview=preview(prompt, 160),
-                agent_type=agent_type,
-                isolation=isolation or "shared",
+                agent_type=resolved.agent_type_name,
+                isolation=resolved.isolation or "shared",
             )
             self.frame.agents.append(record)
             self._notify()
 
-        task_prompt = prompt + build_tool_schema_instruction() if schema else prompt
         fingerprint = agent_fingerprint(
             prompt,
             {
-                "label": label,
-                "phase": phase_name,
                 "schema": schema,
-                "model": opts.get("model"),
-                "agentType": agent_type,
-                "isolation": isolation,
+                **resolved.cache_inputs(),
             },
         )
         journal_key = f"v2:{fingerprint}"
@@ -137,17 +153,18 @@ class WorkflowAPI:
 
         request = ChildAgentRequest(
             id=agent_id,
-            prompt=task_prompt,
+            prompt=prompt,
             label=label,
             phase=phase_name,
-            toolsets=[],
-            model=str(opts.get("model")).strip() if opts.get("model") else None,
+            toolsets=list(resolved.toolsets),
+            model=resolved.model,
             schema=schema,
-            agent_type=agent_type,
-            isolation=isolation,
+            agent_type=resolved.agent_type_name,
+            isolation=resolved.isolation,
             cwd=self.frame.cwd,
             structured_tool=bool(schema),
             on_start=on_child_start,
+            resolved=resolved,
         )
         if schema:
             record.structured = {
@@ -212,6 +229,21 @@ class WorkflowAPI:
                 # A run-level halt (stop / deadline / token/agent/loop limit) is
                 # not a child failure — never retry or swallow it.
                 raise
+            except ChildAgentSkipped:
+                record.attempts = attempt + 1
+                record.status = "skipped"
+                record.tokens = accumulated_tokens
+                record.result_preview = ""
+                self._journal(
+                    {
+                        "type": "result",
+                        "key": journal_key,
+                        "agentId": str(agent_id),
+                        "skipped": True,
+                        "result": None,
+                    }
+                )
+                return None
             except Exception as exc:
                 record.attempts = attempt + 1
                 record.status = "error"
@@ -227,56 +259,71 @@ class WorkflowAPI:
                         "error": record.error,
                     }
                 )
-                return None
+                if isinstance(exc, ChildAgentError):
+                    raise
+                raise ChildAgentError(str(exc)) from exc
             finally:
                 record.ended_at = monotonic()
                 self._notify()
-        return None
+        raise ChildAgentError("child agent failed without a result")
 
     def _run_child(self, request: ChildAgentRequest, record: AgentRecord) -> Any:
         return self.runner.run(request)
 
-    def parallel(self, thunks: list[Callable[[], Any]]) -> list[Any]:
+    async def parallel(self, thunks: list[Callable[[], Any]]) -> list[Any]:
         self._check_deadline()
         if not isinstance(thunks, list):
             raise WorkflowRuntimeError("parallel() expects a list of callables")
+        _check_vm_array_length(thunks)
         if not all(callable(item) for item in thunks):
             raise WorkflowRuntimeError("parallel() entries must be callables, e.g. lambda: agent(...)")
         if not thunks:
             return []
 
-        results: list[Any] = [None] * len(thunks)
-        max_workers = min(len(thunks), self.config.concurrency, self.config.max_concurrency)
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="dw-parallel") as pool:
-            future_to_index = {pool.submit(thunk): index for index, thunk in enumerate(thunks)}
-            for future in as_completed(future_to_index):
-                self._check_deadline()
-                index = future_to_index[future]
-                try:
-                    results[index] = future.result()
-                except Exception as exc:
-                    message = f"parallel[{index}] failed: {type(exc).__name__}: {exc}"
-                    self.log(message)
-                    with self._lock:
-                        self.frame.errors.append(message)
-                    results[index] = None
+        results = await asyncio.gather(
+            *(self._run_parallel_thunk(index, thunk) for index, thunk in enumerate(thunks))
+        )
+        self._check_deadline()
         return results
 
-    def pipeline(self, items: list[Any], *stages: Callable[[Any, Any, int], Any]) -> list[Any]:
+    async def _run_parallel_thunk(self, index: int, thunk: Callable[[], Any]) -> Any:
+        try:
+            self._check_deadline()
+            return await _maybe_await(thunk())
+        except WorkflowHalt:
+            raise
+        except Exception as exc:
+            message = f"parallel[{index}] failed: {type(exc).__name__}: {exc}"
+            self.log(message)
+            with self._lock:
+                self.frame.errors.append(message)
+            return None
+
+    async def pipeline(self, items: list[Any], *stages: Callable[[Any, Any, int], Any]) -> list[Any]:
         self._check_deadline()
         if not isinstance(items, list):
             raise WorkflowRuntimeError("pipeline() expects a list as the first argument")
+        _check_vm_array_length(items)
         if not stages or not all(callable(stage) for stage in stages):
             raise WorkflowRuntimeError("pipeline() expects one or more callable stages")
 
-        def run_one(index: int, original: Any) -> Any:
+        async def run_one(index: int, original: Any) -> Any:
             current = original
-            for stage in stages:
-                self._check_deadline()
-                current = stage(current, original, index)
+            try:
+                for stage in stages:
+                    self._check_deadline()
+                    current = await _maybe_await(stage(current, original, index))
+            except WorkflowHalt:
+                raise
+            except Exception as exc:
+                message = f"pipeline[{index}] failed: {type(exc).__name__}: {exc}"
+                self.log(message)
+                with self._lock:
+                    self.frame.errors.append(message)
+                return None
             return current
 
-        return self.parallel([lambda i=i, item=item: run_one(i, item) for i, item in enumerate(items)])
+        return await asyncio.gather(*(run_one(i, item) for i, item in enumerate(items)))
 
     def phase(self, name: str) -> None:
         if not isinstance(name, str) or not name.strip():
@@ -288,27 +335,35 @@ class WorkflowAPI:
             self._notify()
 
     def log(self, message: Any) -> None:
+        if not isinstance(message, str):
+            raise WorkflowRuntimeError("log() expects a string")
         with self._lock:
             self.frame.logs.append(preview(message, 500))
             self._notify()
 
-    def subworkflow(self, name_or_ref: Any, args: Any = None) -> Any:
-        """Run a child workflow synchronously.
+    async def workflow(self, name_or_ref: Any, args: Any = None) -> Any:
+        return await asyncio.to_thread(self._workflow_sync, name_or_ref, args)
 
-        Python workflows use def workflow() as their entrypoint, so the nested
-        workflow API is named subworkflow() to avoid shadowing that function.
-        """
+    def _workflow_sync(self, name_or_ref: Any, args: Any = None) -> Any:
+        """Run a child workflow from async Python scripts."""
         self._check_deadline()
         if self.depth >= 1:
             raise WorkflowRuntimeError("nested workflows are limited to one level")
         from .runtime import WorkflowOptions, run_workflow
         from ..storage.store import WorkflowStore, resolve_workflow_source
 
-        if isinstance(name_or_ref, dict):
-            params = dict(name_or_ref)
-        else:
-            params = {"name": str(name_or_ref)}
-        source = resolve_workflow_source(params, store=WorkflowStore(), cwd=self.frame.cwd)
+        params = _normalize_workflow_ref(name_or_ref)
+        store = self.context.store or WorkflowStore()
+        try:
+            source = resolve_workflow_source(params, store=store, cwd=self.frame.cwd)
+        except WorkflowParseError as exc:
+            if "name" in params:
+                name = str(params.get("name") or "")
+                available = ", ".join(_available_workflow_names(store, self.frame.cwd)) or "none"
+                raise WorkflowRuntimeError(
+                    f"workflow({name!r}): no workflow with that name. Available: {available}"
+                ) from exc
+            raise WorkflowRuntimeError(str(exc)) from exc
         result = run_workflow(
             source.script,
             WorkflowOptions(
@@ -320,6 +375,7 @@ class WorkflowAPI:
                 parent_frame=self.frame,
                 depth=self.depth + 1,
                 source_ref=source.source_ref,
+                store=store,
             ),
         )
         return result.value
@@ -342,9 +398,6 @@ _PUBLIC_AGENT_OPT_KEYS = frozenset(
         "model",
         "isolation",
         "agentType",
-        # Compatibility with Python-style scripts. The model-facing API should
-        # still prefer Claude-style ``agentType``.
-        "agent_type",
     }
 )
 
@@ -363,6 +416,14 @@ def _validate_agent_opts(opts: dict[str, Any]) -> None:
     )
 
 
+def _check_vm_array_length(items: list[Any]) -> None:
+    if len(items) > MAX_VM_ARRAY_ITEMS:
+        raise WorkflowRuntimeError(
+            f"array length {len(items)} exceeds the maximum of {MAX_VM_ARRAY_ITEMS} "
+            "supported across the workflow VM boundary"
+        )
+
+
 def _normalize_agent_type(value: Any) -> str | None:
     if value in (None, ""):
         return None
@@ -370,15 +431,129 @@ def _normalize_agent_type(value: Any) -> str | None:
     return clean or None
 
 
+def _normalize_agent_model(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    clean = str(value).strip()
+    if not clean or clean.lower() == "inherit":
+        return None
+    return clean
+
+
 def _normalize_isolation(value: Any) -> str | None:
     if value in (None, ""):
         return None
     clean = str(value).strip()
-    if clean in {"shared", "none"}:
-        return "shared"
     if clean == "worktree":
         return clean
-    raise WorkflowRuntimeError("isolation must be 'worktree' or 'shared'")
+    raise WorkflowRuntimeError("isolation must be 'worktree'")
+
+
+def _resolve_agent_spec(
+    opts: dict[str, Any],
+    *,
+    cwd: str,
+    config: Any,
+    structured_output: bool,
+) -> ResolvedAgentSpec:
+    from ..agent.presets import list_agent_types, resolve_agent_type
+    from ..agent.runner import (
+        _prepare_mcp_tool_registry,
+        _resolve_child_toolsets,
+        build_child_system_prompt,
+    )
+
+    requested_type = _normalize_agent_type(opts.get("agentType"))
+    agent_type_spec = resolve_agent_type(requested_type, cwd=cwd)
+    if requested_type and agent_type_spec is None:
+        available = ", ".join(spec.name for spec in list_agent_types(cwd=cwd)) or "none"
+        raise WorkflowRuntimeError(
+            f"agent({{agentType}}): agent type '{requested_type}' not found. "
+            f"Available agents: {available}"
+        )
+
+    explicit_isolation = _normalize_isolation(opts.get("isolation"))
+    agent_type_isolation = _normalize_agent_type_isolation(
+        getattr(agent_type_spec, "isolation", None)
+    )
+    model = _normalize_agent_model(
+        opts.get("model")
+        if opts.get("model")
+        else getattr(agent_type_spec, "model", None)
+    )
+    _prepare_mcp_tool_registry(config)
+    toolsets = tuple(
+        _resolve_child_toolsets(
+            config,
+            [],
+            getattr(agent_type_spec, "toolsets", ()),
+            include_discoverable=agent_type_spec is None,
+        )
+    )
+    prompt = build_child_system_prompt(
+        agent_type_spec,
+        structured_output=structured_output,
+    )
+    return ResolvedAgentSpec(
+        requested_agent_type=requested_type,
+        agent_type_spec=agent_type_spec,
+        model=model or None,
+        isolation=explicit_isolation or agent_type_isolation,
+        toolsets=toolsets,
+        allowed_tools=tuple(getattr(agent_type_spec, "allowed_tools", ()) or ()),
+        disallowed_tools=tuple(getattr(agent_type_spec, "disallowed_tools", ()) or ()),
+        system_prompt_hash=hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        workspace=str(Path(cwd).expanduser().resolve()),
+    )
+
+
+def _normalize_workflow_ref(name_or_ref: Any) -> dict[str, str]:
+    if isinstance(name_or_ref, str) and name_or_ref.strip():
+        return {"name": name_or_ref.strip()}
+    if isinstance(name_or_ref, dict) and set(name_or_ref) == {"scriptPath"}:
+        script_path = name_or_ref.get("scriptPath")
+        if isinstance(script_path, str) and script_path.strip():
+            return {"scriptPath": script_path.strip()}
+    raise WorkflowRuntimeError(
+        "workflow() expects a non-empty workflow name or {'scriptPath': '<path>'}"
+    )
+
+
+def _available_workflow_names(store: Any, cwd: str) -> list[str]:
+    from ..storage.store import _RESERVED_WORKFLOW_NAMES
+
+    directories = [
+        Path(cwd) / ".hermes" / "workflows",
+        store.workflows_dir,
+        Path(__file__).resolve().parent.parent / "workflows",
+    ]
+    names: list[str] = []
+    seen: set[str] = set()
+    for directory in directories:
+        try:
+            if not directory.is_dir():
+                continue
+            for path in sorted(directory.glob("*.py")):
+                stem = path.stem
+                if not stem or stem.startswith("_") or stem in _RESERVED_WORKFLOW_NAMES:
+                    continue
+                if stem not in seen:
+                    seen.add(stem)
+                    names.append(stem)
+        except OSError:
+            continue
+    return names
+
+
+def _normalize_agent_type_isolation(value: Any) -> str | None:
+    if value in (None, "", "shared", "none"):
+        return None
+    clean = str(value).strip()
+    if clean == "worktree":
+        return clean
+    raise WorkflowRuntimeError(
+        f"agentType isolation must be 'worktree' when set, got {clean!r}"
+    )
 
 
 def _apply_child_metadata(record: AgentRecord, metadata: dict[str, Any]) -> None:
@@ -412,3 +587,9 @@ def _as_int_metadata(value: Any) -> int:
         return max(0, int(value))
     except (TypeError, ValueError):
         return 0
+
+
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value

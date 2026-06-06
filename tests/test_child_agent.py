@@ -1,24 +1,28 @@
 from __future__ import annotations
 
 import sys
+import os
 import tempfile
 import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from hermes_dynamic_workflows.agents.presets import AgentTypeSpec, resolve_agent_type
-from hermes_dynamic_workflows.agents.runner import (
+from hermes_dynamic_workflows.agent.presets import AgentTypeSpec, list_agent_types, resolve_agent_type
+from hermes_dynamic_workflows.agent.runner import (
     HermesChildAgentRunner,
     build_child_system_prompt,
     build_child_task_message,
     _child_failure_message,
+    _child_metadata,
     _apply_agent_type_defaults,
+    _configure_child_tools,
+    _discoverable_child_toolsets,
     _make_child_approval_callback,
     _resolve_child_toolsets,
     _tool_call_count,
 )
-from hermes_dynamic_workflows.agents.worktree import WorkspaceLease
+from hermes_dynamic_workflows.agent.worktree import WorkspaceLease
 from hermes_dynamic_workflows.engine.config import PluginConfig
 from hermes_dynamic_workflows.engine.errors import ChildAgentError
 from hermes_dynamic_workflows.engine.types import ChildAgentRequest
@@ -29,6 +33,21 @@ from hermes_dynamic_workflows.plugin.structured_output import (
     register_expectation,
     structured_output_handler,
 )
+
+
+def _tool_definition(name: str) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": name,
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+
+def _tool_name(definition: dict) -> str:
+    return str((definition.get("function") or {}).get("name") or "")
 
 
 class ChildAgentTests(unittest.TestCase):
@@ -47,6 +66,214 @@ class ChildAgentTests(unittest.TestCase):
             ["web"],
         )
 
+    def test_default_child_toolsets_include_read_only_skills_surface(self):
+        self.assertEqual(
+            _resolve_child_toolsets(PluginConfig(), []),
+            ["web", "file", "terminal", "skills"],
+        )
+
+    def test_explicit_agent_type_does_not_gain_discoverable_toolsets(self):
+        with patch(
+            "hermes_dynamic_workflows.agent.runner._discoverable_child_toolsets",
+            return_value=["mcp-github", "plugin-extra"],
+        ):
+            self.assertEqual(
+                _resolve_child_toolsets(
+                    PluginConfig(),
+                    [],
+                    ("file",),
+                    include_discoverable=False,
+                ),
+                ["file"],
+            )
+
+    def test_discoverable_toolsets_exclude_workflow_controls(self):
+        class Registry:
+            toolsets = {
+                "mcp_search": "mcp-search",
+                "plugin_extra": "plugin-extra",
+                "workflow": "workflow",
+                "task_stop": "workflow",
+                "structured_output": "workflow_structured",
+                "delegate_task": "delegation",
+                "built_in_extra": "discord_admin",
+                "read_file": "file",
+            }
+
+            def get_all_tool_names(self):
+                return list(self.toolsets)
+
+            def get_toolset_for_tool(self, name):
+                return self.toolsets.get(name)
+
+        registry_mod = types.ModuleType("tools.registry")
+        registry_mod.registry = Registry()
+        search_mod = types.ModuleType("tools.tool_search")
+        search_mod.is_deferrable_tool_name = lambda name: name != "read_file"
+        tools_pkg = types.ModuleType("tools")
+        tools_pkg.__path__ = []
+        tools_pkg.registry = registry_mod
+        tools_pkg.tool_search = search_mod
+        plugins_mod = types.ModuleType("hermes_cli.plugins")
+        plugins_mod.get_plugin_manager = lambda: types.SimpleNamespace(
+            _plugin_tool_names={"plugin_extra", "workflow", "task_stop"}
+        )
+        hermes_cli_pkg = types.ModuleType("hermes_cli")
+        hermes_cli_pkg.__path__ = []
+        hermes_cli_pkg.plugins = plugins_mod
+
+        with patch.dict(
+            sys.modules,
+            {
+                "hermes_cli": hermes_cli_pkg,
+                "hermes_cli.plugins": plugins_mod,
+                "tools": tools_pkg,
+                "tools.registry": registry_mod,
+                "tools.tool_search": search_mod,
+            },
+        ):
+            discovered = _discoverable_child_toolsets(PluginConfig())
+
+        self.assertEqual(discovered, ["mcp-search", "plugin-extra"])
+
+    def test_child_tool_surface_forces_tool_search_and_keeps_skills_read_only(self):
+        definitions = [
+            _tool_definition("read_file"),
+            _tool_definition("skills_list"),
+            _tool_definition("skill_view"),
+            _tool_definition("skill_manage"),
+            _tool_definition("mcp_search"),
+            _tool_definition("structured_output"),
+        ]
+        captured = {}
+
+        model_tools = types.ModuleType("model_tools")
+
+        def get_tool_definitions(**kwargs):
+            captured["get"] = kwargs
+            return definitions
+
+        model_tools.get_tool_definitions = get_tool_definitions
+        search_mod = types.ModuleType("tools.tool_search")
+
+        class ToolSearchConfig:
+            @staticmethod
+            def from_raw(raw):
+                captured["config"] = raw
+                return raw
+
+        def assemble_tool_defs(tool_defs, *, config):
+            captured["assembled"] = [_tool_name(item) for item in tool_defs]
+            return types.SimpleNamespace(
+                tool_defs=[
+                    _tool_definition("read_file"),
+                    _tool_definition("skills_list"),
+                    _tool_definition("skill_view"),
+                    _tool_definition("tool_search"),
+                    _tool_definition("tool_describe"),
+                    _tool_definition("tool_call"),
+                ]
+            )
+
+        search_mod.ToolSearchConfig = ToolSearchConfig
+        search_mod.assemble_tool_defs = assemble_tool_defs
+        tools_pkg = types.ModuleType("tools")
+        tools_pkg.__path__ = []
+        tools_pkg.tool_search = search_mod
+
+        class Child:
+            tools = []
+            valid_tool_names = set()
+            enabled_toolsets = []
+
+        child = Child()
+        with patch.dict(
+            sys.modules,
+            {
+                "model_tools": model_tools,
+                "tools": tools_pkg,
+                "tools.tool_search": search_mod,
+            },
+        ):
+            _configure_child_tools(
+                child,
+                toolsets=["file", "skills", "mcp-search", "workflow_structured"],
+                blocked_toolsets=PluginConfig().blocked_child_toolsets,
+            )
+
+        self.assertNotIn("skill_manage", captured["assembled"])
+        self.assertNotIn("structured_output", captured["assembled"])
+        self.assertEqual(captured["config"], {"enabled": "on"})
+        self.assertEqual(captured["get"]["enabled_toolsets"], [
+            "file",
+            "skills",
+            "mcp-search",
+            "workflow_structured",
+        ])
+        self.assertEqual(
+            child.enabled_toolsets,
+            ["file", "skills", "mcp-search"],
+        )
+        self.assertIn("structured_output", child.valid_tool_names)
+        self.assertIn("tool_search", child.valid_tool_names)
+        self.assertNotIn("skill_manage", child.valid_tool_names)
+
+    def test_child_tool_surface_applies_agent_type_allowed_tools(self):
+        definitions = [
+            _tool_definition("read_file"),
+            _tool_definition("write_file"),
+            _tool_definition("patch"),
+            _tool_definition("search_files"),
+            _tool_definition("terminal"),
+            _tool_definition("process"),
+        ]
+
+        model_tools = types.ModuleType("model_tools")
+        model_tools.get_tool_definitions = lambda **kwargs: definitions
+        search_mod = types.ModuleType("tools.tool_search")
+
+        class ToolSearchConfig:
+            @staticmethod
+            def from_raw(raw):
+                return raw
+
+        def assemble_tool_defs(tool_defs, *, config):
+            return types.SimpleNamespace(tool_defs=tool_defs)
+
+        search_mod.ToolSearchConfig = ToolSearchConfig
+        search_mod.assemble_tool_defs = assemble_tool_defs
+        tools_pkg = types.ModuleType("tools")
+        tools_pkg.__path__ = []
+        tools_pkg.tool_search = search_mod
+
+        class Child:
+            tools = []
+            valid_tool_names = set()
+            enabled_toolsets = []
+
+        child = Child()
+        with patch.dict(
+            sys.modules,
+            {
+                "model_tools": model_tools,
+                "tools": tools_pkg,
+                "tools.tool_search": search_mod,
+            },
+        ):
+            _configure_child_tools(
+                child,
+                toolsets=["file", "terminal"],
+                blocked_toolsets=PluginConfig().blocked_child_toolsets,
+                allowed_tools=("read_file", "search_files", "terminal", "process"),
+            )
+
+        self.assertEqual(
+            child.valid_tool_names,
+            {"read_file", "search_files", "terminal", "process"},
+        )
+        self.assertNotIn("write_file", child.valid_tool_names)
+        self.assertNotIn("patch", child.valid_tool_names)
+
     def test_system_prompt_includes_agent_type_instructions(self):
         prompt = build_child_system_prompt(
             AgentTypeSpec(
@@ -57,6 +284,41 @@ class ChildAgentTests(unittest.TestCase):
         )
         self.assertIn("Agent type: researcher", prompt)
         self.assertIn("Search broadly", prompt)
+
+    def test_system_prompt_defines_final_text_as_raw_return_value(self):
+        prompt = build_child_system_prompt(None)
+        self.assertIn("subagent spawned by a workflow orchestration script", prompt)
+        self.assertIn("Use the tools available to complete the task", prompt)
+        self.assertIn("returned verbatim as a string to the calling script", prompt)
+        self.assertIn("not a message to a human", prompt)
+
+    def test_structured_output_instruction_is_appended_to_system_prompt(self):
+        plain = build_child_system_prompt(None)
+        structured = build_child_system_prompt(None, structured_output=True)
+
+        self.assertNotIn("structured_output tool", plain)
+        self.assertIn("structured_output tool", structured)
+        self.assertTrue(structured.startswith(plain))
+
+    def test_internal_skip_interrupts_only_requested_child(self):
+        class Child:
+            def __init__(self):
+                self.interrupted = False
+
+            def interrupt(self):
+                self.interrupted = True
+
+        runner = HermesChildAgentRunner(PluginConfig())
+        first = Child()
+        second = Child()
+        runner._active_children = {"first": first, "second": second}
+
+        self.assertTrue(runner.skip_child("first"))
+        self.assertTrue(first.interrupted)
+        self.assertFalse(second.interrupted)
+        self.assertTrue(runner._consume_skipped("first"))
+        self.assertFalse(runner._consume_skipped("first"))
+        self.assertFalse(runner.skip_child("missing"))
 
     def test_agent_type_applies_model_and_isolation_defaults(self):
         request = ChildAgentRequest(
@@ -79,6 +341,25 @@ class ChildAgentTests(unittest.TestCase):
         self.assertEqual(applied.model, "test-model")
         self.assertEqual(applied.isolation, "worktree")
 
+    def test_agent_type_inherit_model_means_no_override(self):
+        request = ChildAgentRequest(
+            id=1,
+            prompt="work",
+            label="worker",
+            phase=None,
+            toolsets=[],
+        )
+        spec = AgentTypeSpec(
+            name="planner",
+            instructions="Plan.",
+            source="test",
+            model="inherit",
+        )
+
+        applied = _apply_agent_type_defaults(request, spec)
+
+        self.assertIsNone(applied.model)
+
     def test_system_prompt_excludes_per_task_data_for_cache_sharing(self):
         # The system prompt must depend only on agent_type (not label/phase/
         # workspace), so the [tools + system] prefix is byte-identical across a
@@ -90,7 +371,7 @@ class ChildAgentTests(unittest.TestCase):
         # No agent type -> identical across all children.
         self.assertEqual(build_child_system_prompt(None), build_child_system_prompt(None))
 
-    def test_task_message_carries_per_task_context(self):
+    def test_task_message_excludes_display_only_label_and_phase(self):
         request = ChildAgentRequest(
             id=1,
             prompt="do the thing",
@@ -101,20 +382,64 @@ class ChildAgentTests(unittest.TestCase):
         )
         msg = build_child_task_message(request, workspace="/tmp/project/.worktrees/wf")
         self.assertIn("Workspace: /tmp/project/.worktrees/wf", msg)
-        self.assertIn("Task label: worker", msg)
-        self.assertIn("Workflow phase: Review", msg)
+        self.assertNotIn("Task label: worker", msg)
+        self.assertNotIn("Workflow phase: Review", msg)
         self.assertIn("isolated git worktree", msg)
         self.assertIn("do the thing", msg)
+
+    def test_default_child_metadata_uses_workflow_subagent_type(self):
+        class Child:
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_reasoning_tokens = 0
+            session_cache_read_tokens = 0
+            session_cache_write_tokens = 0
+            model = "test"
+            messages = []
+
+        metadata = _child_metadata(
+            Child(),
+            {},
+            WorkspaceLease(task_id="child", cwd="/tmp"),
+            None,
+            ["file"],
+        )
+
+        self.assertEqual(metadata["agent_type"], "workflow-subagent")
+        self.assertIsNone(metadata["agent_type_source"])
+
+    def test_bundled_agent_types_inherit_launching_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(
+                os.environ,
+                {"HERMES_DYNAMIC_WORKFLOWS_HOME": str(Path(tmp) / "store")},
+            ):
+                for name in ("Explore", "Plan", "general-purpose", "verification"):
+                    spec = resolve_agent_type(name, cwd=tmp)
+                    self.assertIsNotNone(spec)
+                    assert spec is not None
+                    self.assertEqual(spec.model, "inherit")
+                    if name in {"Explore", "Plan"}:
+                        self.assertEqual(
+                            spec.allowed_tools,
+                            ("read_file", "search_files", "terminal", "process"),
+                        )
+                    if name == "verification":
+                        self.assertNotIn("write_file", spec.allowed_tools)
+                        self.assertNotIn("patch", spec.allowed_tools)
 
     def test_resolves_project_agent_type_markdown(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            agent_dir = root / ".hermes" / "workflow-agent-types"
+            agent_dir = root / ".hermes" / "dynamic-workflows" / "agents"
             agent_dir.mkdir(parents=True)
             (agent_dir / "wf-unique-test-agent.md").write_text(
                 """---
 name: unique-researcher
+description: Search code and summarize findings.
 toolsets: [web, file]
+allowed_tools: [read_file, search_files]
+disallowed_tools: [write_file, patch]
 isolation: worktree
 ---
 
@@ -123,14 +448,47 @@ Search carefully and return concise notes.
                 encoding="utf-8",
             )
 
-            spec = resolve_agent_type("wf-unique-test-agent", cwd=str(root), task_id="t")
+            spec = resolve_agent_type("wf-unique-test-agent", cwd=str(root))
+            named_spec = resolve_agent_type("unique-researcher", cwd=str(root))
+            listed = list_agent_types(cwd=str(root))
 
         self.assertIsNotNone(spec)
         assert spec is not None
         self.assertEqual(spec.name, "unique-researcher")
+        self.assertEqual(spec.description, "Search code and summarize findings.")
         self.assertEqual(spec.toolsets, ("web", "file"))
+        self.assertEqual(spec.allowed_tools, ("read_file", "search_files"))
+        self.assertEqual(spec.disallowed_tools, ("write_file", "patch"))
         self.assertEqual(spec.isolation, "worktree")
         self.assertIn("Search carefully", spec.instructions)
+        self.assertIsNotNone(named_spec)
+        assert named_spec is not None
+        self.assertEqual(named_spec.name, "unique-researcher")
+        self.assertIn("unique-researcher", [item.name for item in listed])
+
+    def test_resolves_user_agent_type_markdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "store"
+            agent_dir = store / "agents"
+            agent_dir.mkdir(parents=True)
+            (agent_dir / "global-reviewer.md").write_text(
+                """---
+name: global-reviewer
+model: test-model
+---
+
+Review from the user-wide workflow agent store.
+""",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"HERMES_DYNAMIC_WORKFLOWS_HOME": str(store)}):
+                spec = resolve_agent_type("global-reviewer", cwd=str(Path(tmp) / "project"))
+
+        self.assertIsNotNone(spec)
+        assert spec is not None
+        self.assertEqual(spec.name, "global-reviewer")
+        self.assertEqual(spec.model, "test-model")
+        self.assertIn("user-wide workflow agent store", spec.instructions)
 
 
 class ChildFailureDetectionTests(unittest.TestCase):
@@ -186,7 +544,7 @@ class ToolCallCountTests(unittest.TestCase):
 
 class RunnerSessionContextTests(unittest.TestCase):
     def test_runner_stores_session_context(self):
-        from hermes_dynamic_workflows.agents.runner import HermesChildAgentRunner
+        from hermes_dynamic_workflows.agent.runner import HermesChildAgentRunner
 
         ctx = {"platform": "telegram", "session_key": "k1", "chat_id": "c1"}
         runner = HermesChildAgentRunner(PluginConfig(), session_context=ctx)
@@ -194,9 +552,34 @@ class RunnerSessionContextTests(unittest.TestCase):
         self.assertEqual(runner._session_context["session_key"], "k1")
 
     def test_runner_session_context_defaults_none(self):
-        from hermes_dynamic_workflows.agents.runner import HermesChildAgentRunner
+        from hermes_dynamic_workflows.agent.runner import HermesChildAgentRunner
 
         self.assertIsNone(HermesChildAgentRunner(PluginConfig())._session_context)
+
+    def test_default_and_inherit_models_use_captured_parent_runtime(self):
+        runtime = {
+            "model": "session-switched-model",
+            "provider": "custom:session",
+            "base_url": "https://session.example/v1",
+            "api_key": "session-secret",
+            "api_mode": "chat_completions",
+            "request_overrides": {"extra_body": {"routing": "session"}},
+        }
+        runner = HermesChildAgentRunner(
+            PluginConfig(allow_model_override=False),
+            parent_runtime=runtime,
+        )
+
+        for model in (None, "inherit"):
+            request = ChildAgentRequest(
+                id=1,
+                prompt="work",
+                label="worker",
+                phase=None,
+                toolsets=[],
+                model=model,
+            )
+            self.assertEqual(runner._resolve_runtime(request), runtime)
 
 
 class StructuredOutputContinuationTests(unittest.TestCase):

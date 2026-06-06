@@ -22,11 +22,10 @@ from hermes_dynamic_workflows.storage.store import WorkflowStore
 SEQUENTIAL_SCRIPT = """
 meta = {"name": "controlled", "description": "Exercise workflow controls", "phases": ["Work"]}
 
-def workflow():
-    phase("Work")
-    first = agent("first", {"label": "first"})
-    second = agent("second", {"label": "second"})
-    return [first, second]
+phase("Work")
+first = await agent("first", {"label": "first"})
+second = await agent("second", {"label": "second"})
+result = [first, second]
 """
 
 
@@ -69,7 +68,7 @@ class ControlTests(unittest.TestCase):
             client = ControlClient(store)
             try:
                 with patch(
-                    "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                    "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
                     return_value=runner,
                 ):
                     record = manager.start_from_params(
@@ -104,7 +103,7 @@ class ControlTests(unittest.TestCase):
                 manager.stop_control_listener()
 
         self.assertEqual(final["status"], "completed")
-        self.assertEqual(final["result"], ["done:first", "done:second"])
+        self.assertIsNone(final["result"])
 
     def test_stop_and_restart_through_control_queue(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -118,7 +117,7 @@ class ControlTests(unittest.TestCase):
             try:
                 blocking = SequentialRunner()
                 with patch(
-                    "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                    "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
                     return_value=blocking,
                 ):
                     active = manager.start_from_params(
@@ -139,7 +138,7 @@ class ControlTests(unittest.TestCase):
                 self.assertEqual(final["status"], "stopped")
 
                 with patch(
-                    "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                    "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
                     return_value=ImmediateRunner(),
                 ):
                     restarted = client.request(
@@ -170,7 +169,7 @@ class ControlTests(unittest.TestCase):
             try:
                 with (
                     patch(
-                        "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                        "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
                         return_value=runner,
                     ),
                     patch(
@@ -262,7 +261,7 @@ listener.stop()
             )
             try:
                 with patch(
-                    "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                    "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
                     return_value=ImmediateRunner(),
                 ):
                     record = manager.start_from_params(
@@ -294,7 +293,7 @@ listener.stop()
             )
             try:
                 with patch(
-                    "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                    "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
                     return_value=ImmediateRunner(),
                 ):
                     record = manager.start_from_params(
@@ -326,8 +325,7 @@ listener.stop()
                 run_workflow(
                     """
 meta = {"name": "pause-deadline", "description": "Exercise paused deadline accounting"}
-def workflow():
-    return agent("work", {"label": "worker"})
+result = await agent("work", {"label": "worker"})
 """,
                     WorkflowOptions(
                         config=PluginConfig(workflow_timeout_seconds=0.1),
@@ -345,7 +343,7 @@ def workflow():
         thread.join(timeout=2)
 
         self.assertFalse(thread.is_alive())
-        self.assertEqual(result[0].value, "done:worker")
+        self.assertIsNone(result[0].value)
 
     def test_control_listener_failure_does_not_block_workflow_launch(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -359,7 +357,7 @@ def workflow():
                     enable_control=True,
                 )
             with patch(
-                "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
+                "hermes_dynamic_workflows.agent.runner.HermesChildAgentRunner",
                 return_value=ImmediateRunner(),
             ):
                 record = manager.start_from_params(

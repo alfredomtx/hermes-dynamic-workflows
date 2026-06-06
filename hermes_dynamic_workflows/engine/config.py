@@ -24,7 +24,7 @@ class PluginConfig:
     child_timeout_seconds: float = 300.0
     script_max_chars: int = 524288
     mcp_discovery_wait_seconds: float = 0.75
-    default_child_toolsets: tuple[str, ...] = ("web", "file", "terminal")
+    default_child_toolsets: tuple[str, ...] = ("web", "file", "terminal", "skills")
     blocked_child_toolsets: tuple[str, ...] = (
         "workflow",
         "workflows",
@@ -45,7 +45,7 @@ class PluginConfig:
     # default: CLI prompts synchronously, gateway sends approve/deny buttons,
     # and a headless/unattended context (no channel) is denied — set this False
     # (or HERMES_DYNAMIC_WORKFLOWS_REQUIRE_LAUNCH_APPROVAL=0) for automation.
-    # Only top-level launches are gated; subworkflow() inherits the parent run.
+    # Only top-level launches are gated; nested workflow() calls inherit the parent run.
     require_launch_approval: bool = True
     # What a child agent does when Hermes' approval engine flags a command and
     # no human is present to approve it. The engine itself (hardline blocks,

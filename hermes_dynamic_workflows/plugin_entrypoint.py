@@ -7,7 +7,7 @@ import os
 from hermes_dynamic_workflows.engine.approval_hook import pre_tool_call_handler
 from hermes_dynamic_workflows.plugin import registrar
 from hermes_dynamic_workflows.plugin.task_stop import TASK_STOP_SCHEMA, task_stop
-from hermes_dynamic_workflows.plugin.workflow import DYNAMIC_WORKFLOW_SCHEMA, workflow
+from hermes_dynamic_workflows.plugin.workflow import get_dynamic_workflow_schema, workflow
 from hermes_dynamic_workflows.ui.commands import (
     discover_named_workflows,
     make_named_workflow_handler,
@@ -19,6 +19,7 @@ from hermes_dynamic_workflows.ui.commands import (
 def register(ctx) -> None:
     """Register the workflow tool and commands with Hermes."""
     registrar.set_plugin_context(ctx)
+    cwd = os.environ.get("TERMINAL_CWD") or os.getcwd()
 
     def _workflow_handler(params, **kwargs):
         return workflow(params, plugin_context=ctx, **kwargs)
@@ -26,7 +27,7 @@ def register(ctx) -> None:
     ctx.register_tool(
         name="workflow",
         toolset="workflow",
-        schema=DYNAMIC_WORKFLOW_SCHEMA,
+        schema=get_dynamic_workflow_schema(cwd=cwd),
         handler=_workflow_handler,
         description=(
             "Run deterministic Python workflow scripts that orchestrate "
