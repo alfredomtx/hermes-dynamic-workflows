@@ -34,14 +34,14 @@ def render_workflow_text(snapshot: dict[str, Any], *, completed: bool = True, ma
 def render_runs_list(runs: list[dict[str, Any]]) -> str:
     if not runs:
         return "No workflow runs found."
-    running = sum(1 for run in runs if run.get("status") in {"queued", "running", "stopping"})
+    running = sum(1 for run in runs if run.get("status") in {"queued", "running", "paused", "stopping"})
     completed = sum(1 for run in runs if run.get("status") == "completed")
     lines = ["Dynamic workflows", f"{running} running . {completed} completed", ""]
     for index, run in enumerate(runs, start=1):
         snapshot = run.get("workflow") or {}
         meta = snapshot.get("meta") or {}
         name = meta.get("name") or run.get("source", {}).get("ref") or "workflow"
-        marker = ">" if index == 1 and run.get("status") in {"queued", "running", "stopping"} else " "
+        marker = ">" if index == 1 and run.get("status") in {"queued", "running", "paused", "stopping"} else " "
         totals = _totals(snapshot)
         errors = totals.get("errors") or 0
         error_note = f" . {errors} err" if errors else ""
@@ -193,6 +193,7 @@ def status_icon(status: Any) -> str:
         "queued": ".",
         "running": "*",
         "stopping": "~",
+        "paused": "=",
         "completed": "+",
         "done": "+",
         "error": "!",

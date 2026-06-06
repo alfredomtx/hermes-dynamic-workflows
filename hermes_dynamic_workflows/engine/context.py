@@ -19,11 +19,58 @@ from .errors import (
 from .types import ChildAgentRunner, WorkflowFrame, WorkflowState, normalize_phase_specs
 
 
+class PauseGate:
+    """Cooperative run gate that excludes paused time from the run deadline."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._paused = False
+        self._paused_at: float | None = None
+        self._paused_seconds = 0.0
+
+    @property
+    def is_paused(self) -> bool:
+        with self._condition:
+            return self._paused
+
+    @property
+    def paused_seconds(self) -> float:
+        with self._condition:
+            current = monotonic() - self._paused_at if self._paused and self._paused_at is not None else 0.0
+            return self._paused_seconds + current
+
+    def pause(self) -> bool:
+        with self._condition:
+            if self._paused:
+                return False
+            self._paused = True
+            self._paused_at = monotonic()
+            self._condition.notify_all()
+            return True
+
+    def resume(self) -> bool:
+        with self._condition:
+            if not self._paused:
+                return False
+            if self._paused_at is not None:
+                self._paused_seconds += max(0.0, monotonic() - self._paused_at)
+            self._paused = False
+            self._paused_at = None
+            self._condition.notify_all()
+            return True
+
+    def wait(self, stop_event: threading.Event) -> None:
+        with self._condition:
+            while self._paused and not stop_event.is_set():
+                self._condition.wait(timeout=0.1)
+
+
 @dataclass
 class WorkflowExecutionContext:
     config: PluginConfig
     runner: ChildAgentRunner
     stop_event: threading.Event
+    pause_gate: PauseGate
     resume_cache: ResumeCache
     deadline: float
     root: WorkflowFrame
@@ -119,7 +166,10 @@ class WorkflowExecutionContext:
     def check_runtime(self) -> None:
         if self.stop_event.is_set():
             raise WorkflowStopped("workflow was stopped")
-        if monotonic() > self.deadline:
+        self.pause_gate.wait(self.stop_event)
+        if self.stop_event.is_set():
+            raise WorkflowStopped("workflow was stopped")
+        if monotonic() - self.pause_gate.paused_seconds > self.deadline:
             raise WorkflowDeadlineExceeded(
                 f"workflow timed out after {self.config.workflow_timeout_seconds:.0f}s"
             )

@@ -11,6 +11,7 @@ from typing import Any
 
 from .cache import ResumeCache
 from .config import PluginConfig, load_config
+from .context import PauseGate
 from .errors import WorkflowLaunchDenied, WorkflowRuntimeError, WorkflowToolUseError
 from .sandbox import extract_meta, parse_script
 from .token_budget import parse_token_budget
@@ -22,6 +23,7 @@ from ..storage.store import (
     sanitize_filename,
     utc_now_iso,
 )
+from ..storage.control import ControlListener, new_control_owner
 from ..ui.display import (
     render_agent_detail,
     render_phase_detail,
@@ -37,9 +39,12 @@ from .runtime import WorkflowOptions, run_workflow
 class ManagedRun:
     run_id: str
     stop_event: threading.Event
+    pause_gate: PauseGate
     record: dict[str, Any]
     thread: threading.Thread | None = None
     child_runner: Any = None
+    plugin_context: Any = None
+    session_context: dict[str, str] | None = None
     transcript_exporters: dict[str, "LiveTranscriptExporter"] = field(default_factory=dict)
     lock: threading.RLock = field(default_factory=threading.RLock)
 
@@ -108,11 +113,47 @@ class LiveTranscriptExporter:
 
 
 class WorkflowRunManager:
-    def __init__(self, store: WorkflowStore | None = None, config: PluginConfig | None = None):
+    def __init__(
+        self,
+        store: WorkflowStore | None = None,
+        config: PluginConfig | None = None,
+        *,
+        enable_control: bool = False,
+    ):
         self.store = store or WorkflowStore()
         self.config = config or load_config()
+        self.control_owner = new_control_owner()
         self._runs: dict[str, ManagedRun] = {}
         self._lock = threading.RLock()
+        self._control_listener: ControlListener | None = None
+        if enable_control:
+            self.start_control_listener()
+
+    def start_control_listener(self) -> bool:
+        with self._lock:
+            if self._control_listener is not None:
+                return True
+            listener = ControlListener(
+                store=self.store,
+                owner=self.control_owner,
+                handler=self._handle_control_request,
+            )
+            self._control_listener = listener
+        try:
+            listener.start()
+        except Exception:
+            with self._lock:
+                if self._control_listener is listener:
+                    self._control_listener = None
+            return False
+        return True
+
+    def stop_control_listener(self) -> None:
+        with self._lock:
+            listener = self._control_listener
+            self._control_listener = None
+        if listener is not None:
+            listener.stop()
 
     def start_from_params(
         self,
@@ -123,6 +164,10 @@ class WorkflowRunManager:
         tool_use_id: str | None = None,
         host_session_id: str | None = None,
         user_task: str | None = None,
+        launch_approved: bool = False,
+        restart_from_run_id: str | None = None,
+        token_budget_total_override: int | None = None,
+        session_context_override: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         config = self.config
         cwd_value = cwd or os.environ.get("TERMINAL_CWD") or os.getcwd()
@@ -137,7 +182,7 @@ class WorkflowRunManager:
                 f'Stop it first with task_stop({{"task_id":"{active_task_id}"}}) '
                 "before resuming."
             )
-        approved, reason = _approve_launch(meta, config, plugin_context)
+        approved, reason = (True, "") if launch_approved else _approve_launch(meta, config, plugin_context)
         if not approved:
             raise WorkflowLaunchDenied(
                 f'Workflow "{meta.get("name") or "workflow"}" was not launched: {reason}. '
@@ -163,12 +208,21 @@ class WorkflowRunManager:
         previous = self.store.load_run(resume_from) if resume_from else None
         resume_cache = ResumeCache.from_run(previous)
         args = params["args"] if "args" in params else None
-        token_budget = parse_token_budget(user_task)
+        token_budget = (
+            token_budget_total_override
+            if token_budget_total_override is not None
+            else parse_token_budget(user_task)
+        )
         # Captured in the launching (parent) context, which carries the gateway
         # session vars when the run is started from a gateway session.
-        session_context = _capture_gateway_session_context()
+        session_context = (
+            session_context_override
+            if session_context_override is not None
+            else _capture_gateway_session_context()
+        )
 
         stop_event = threading.Event()
+        pause_gate = PauseGate()
         record = {
             "runId": run_id,
             "taskId": task_id,
@@ -179,6 +233,7 @@ class WorkflowRunManager:
             "finishedAt": None,
             "cwd": cwd_value,
             "workflowSessionId": workflow_session_id,
+            "controlOwner": self.control_owner if self._control_listener is not None else None,
             "scriptPath": str(saved_path),
             "transcriptDir": str(transcript_dir),
             "journalFile": str(journal_path),
@@ -188,6 +243,7 @@ class WorkflowRunManager:
                 "ref": source.source_ref,
             },
             "resumeFromRunId": resume_from,
+            "restartedFromRunId": restart_from_run_id,
             "args": args,
             "tokenBudget": token_budget,
             "result": None,
@@ -199,7 +255,14 @@ class WorkflowRunManager:
             "transcriptFiles": [],
             "transcriptMetaFiles": [],
         }
-        managed = ManagedRun(run_id=run_id, stop_event=stop_event, record=record)
+        managed = ManagedRun(
+            run_id=run_id,
+            stop_event=stop_event,
+            pause_gate=pause_gate,
+            record=record,
+            plugin_context=plugin_context,
+            session_context=session_context,
+        )
 
         with self._lock:
             self._runs[run_id] = managed
@@ -240,7 +303,7 @@ class WorkflowRunManager:
         if not managed:
             return None
         with managed.lock:
-            if managed.record.get("status") in {"queued", "running", "stopping"}:
+            if managed.record.get("status") in {"queued", "running", "paused", "stopping"}:
                 return self._public_record(dict(managed.record))
         return None
 
@@ -262,9 +325,10 @@ class WorkflowRunManager:
                 record = managed.record
                 if str(record.get("taskId") or "") != wanted:
                     continue
-                if record.get("status") not in {"queued", "running"}:
+                if record.get("status") not in {"queued", "running", "paused"}:
                     return None
                 managed.stop_event.set()
+                managed.pause_gate.resume()
                 child_runner = managed.child_runner
                 record["status"] = "stopping"
                 self.store.save_run(record)
@@ -290,25 +354,128 @@ class WorkflowRunManager:
             managed = self._runs.get(run_id)
         if not managed:
             record = self.store.load_run(run_id)
-            if not record or record.get("status") not in {"queued", "running"}:
+            if not record or record.get("status") not in {"queued", "running", "paused"}:
                 return False
             record["status"] = "stopped"
             record["finishedAt"] = utc_now_iso()
             self.store.save_run(record)
             return True
 
-        managed.stop_event.set()
-        child_runner = managed.child_runner
+        with managed.lock:
+            if managed.record.get("status") not in {"queued", "running", "paused"}:
+                return False
+            managed.stop_event.set()
+            managed.pause_gate.resume()
+            child_runner = managed.child_runner
+            managed.record["status"] = "stopping"
+            self.store.save_run(managed.record)
         if child_runner is not None and hasattr(child_runner, "interrupt_all"):
             try:
                 child_runner.interrupt_all()
             except Exception:
                 pass
-        with managed.lock:
-            if managed.record.get("status") in {"queued", "running"}:
-                managed.record["status"] = "stopping"
-                self.store.save_run(managed.record)
         return True
+
+    def pause(self, run_id: str) -> bool:
+        with self._lock:
+            managed = self._runs.get(run_id)
+        if managed is None:
+            return False
+        with managed.lock:
+            if managed.record.get("status") not in {"queued", "running"}:
+                return False
+            managed.pause_gate.pause()
+            managed.record["status"] = "paused"
+            managed.record["pausedAt"] = utc_now_iso()
+            self.store.save_run(managed.record)
+        return True
+
+    def resume(self, run_id: str) -> bool:
+        with self._lock:
+            managed = self._runs.get(run_id)
+        if managed is None:
+            return False
+        with managed.lock:
+            if managed.record.get("status") != "paused":
+                return False
+            managed.pause_gate.resume()
+            managed.record["status"] = "running"
+            managed.record["resumedAt"] = utc_now_iso()
+            self.store.save_run(managed.record)
+        return True
+
+    def restart(self, run_id: str) -> dict[str, Any] | None:
+        record = self.get(run_id)
+        if record is None:
+            return None
+        with self._lock:
+            managed = self._runs.get(run_id)
+        if managed is not None and record.get("status") in {"queued", "running", "paused", "stopping"}:
+            self.stop(run_id)
+            final = self.wait(run_id, timeout=5)
+            if final and final.get("status") not in {"stopped", "completed", "failed", "error"}:
+                raise WorkflowRuntimeError(f"workflow {run_id} did not stop before restart")
+
+        script_path = str(record.get("scriptPath") or "")
+        if not script_path or not Path(script_path).is_file():
+            raise WorkflowRuntimeError(f"workflow script is unavailable for restart: {script_path}")
+        params: dict[str, Any] = {"scriptPath": script_path}
+        if "args" in record:
+            params["args"] = record.get("args")
+        return self.start_from_params(
+            params,
+            cwd=str(record.get("cwd") or os.getcwd()),
+            plugin_context=managed.plugin_context if managed is not None else None,
+            host_session_id=str(record.get("workflowSessionId") or "") or None,
+            launch_approved=True,
+            restart_from_run_id=run_id,
+            token_budget_total_override=record.get("tokenBudget"),
+            session_context_override=managed.session_context if managed is not None else None,
+        )
+
+    def _handle_control_request(self, request: dict[str, Any]) -> dict[str, Any]:
+        run_id = str(request.get("runId") or "")
+        action = str(request.get("action") or "")
+        record = self.get(run_id)
+        if record is None:
+            return {"ok": False, "action": action, "runId": run_id, "message": f"Workflow run not found: {run_id}"}
+        if str(record.get("controlOwner") or "") != self.control_owner:
+            return {"ok": False, "action": action, "runId": run_id, "message": "Workflow is owned by another Hermes process."}
+        expected = str(request.get("expectedStatus") or "")
+        if expected and str(record.get("status") or "") != expected:
+            return {
+                "ok": False,
+                "action": action,
+                "runId": run_id,
+                "status": record.get("status"),
+                "message": f"Workflow status changed from {expected} to {record.get('status')}; retry the action.",
+            }
+        if action == "stop":
+            ok = self.stop(run_id)
+            message = f"Stop requested for {run_id}." if ok else f"Workflow {run_id} is not stoppable."
+            return {"ok": ok, "action": action, "runId": run_id, "status": "stopping" if ok else record.get("status"), "message": message}
+        if action == "pause":
+            ok = self.pause(run_id)
+            message = f"Paused {run_id}; running agents may finish." if ok else f"Workflow {run_id} is not pausable."
+            return {"ok": ok, "action": action, "runId": run_id, "status": "paused" if ok else record.get("status"), "message": message}
+        if action == "resume":
+            ok = self.resume(run_id)
+            message = f"Resumed {run_id}." if ok else f"Workflow {run_id} is not paused."
+            return {"ok": ok, "action": action, "runId": run_id, "status": "running" if ok else record.get("status"), "message": message}
+        if action == "restart":
+            restarted = self.restart(run_id)
+            if restarted is None:
+                return {"ok": False, "action": action, "runId": run_id, "message": f"Workflow run not found: {run_id}"}
+            new_run_id = restarted.get("runId")
+            return {
+                "ok": True,
+                "action": action,
+                "runId": run_id,
+                "newRunId": new_run_id,
+                "status": restarted.get("status"),
+                "message": f"Restarted {run_id} as {new_run_id}.",
+            }
+        return {"ok": False, "action": action, "runId": run_id, "message": f"Unsupported control action: {action}"}
 
     def format_list(self, limit: int = 10) -> str:
         runs = self.list(limit=limit)
@@ -455,7 +622,9 @@ class WorkflowRunManager:
             from ..agents.runner import HermesChildAgentRunner
 
             managed.child_runner = HermesChildAgentRunner(config, session_context=session_context)
-            self._update(managed, status="running", startedAt=utc_now_iso())
+            with managed.lock:
+                start_status = "paused" if managed.pause_gate.is_paused else "running"
+            self._update(managed, status=start_status, startedAt=utc_now_iso())
             result = run_workflow(
                 script,
                 WorkflowOptions(
@@ -464,6 +633,7 @@ class WorkflowRunManager:
                     config=config,
                     child_runner=managed.child_runner,
                     stop_event=managed.stop_event,
+                    pause_gate=managed.pause_gate,
                     resume_cache=resume_cache,
                     on_update=lambda state: self._update_state(managed, state),
                     on_journal=lambda event: self._append_journal_event(managed, event),
@@ -1009,5 +1179,5 @@ def get_run_manager() -> WorkflowRunManager:
     global _MANAGER
     with _MANAGER_LOCK:
         if _MANAGER is None:
-            _MANAGER = WorkflowRunManager()
+            _MANAGER = WorkflowRunManager(enable_control=True)
         return _MANAGER

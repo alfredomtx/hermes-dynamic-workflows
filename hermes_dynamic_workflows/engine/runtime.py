@@ -13,7 +13,7 @@ from typing import Any, Callable
 from .api import WorkflowAPI
 from .cache import ResumeCache
 from .config import PluginConfig, load_config
-from .context import WorkflowExecutionContext
+from .context import PauseGate, WorkflowExecutionContext
 from .sandbox import LOOP_GUARD_NAME, extract_meta, parse_script
 from .types import ChildAgentRunner, WorkflowFrame, WorkflowState, normalize_phase_specs
 
@@ -25,6 +25,7 @@ class WorkflowOptions:
     config: PluginConfig | None = None
     child_runner: ChildAgentRunner | None = None
     stop_event: threading.Event | None = None
+    pause_gate: PauseGate | None = None
     resume_cache: ResumeCache | None = None
     on_update: Callable[[WorkflowState], None] | None = None
     on_journal: Callable[[dict[str, Any]], None] | None = None
@@ -106,6 +107,7 @@ def run_workflow(script: str, options: WorkflowOptions | None = None) -> Workflo
         else:
             child_runner = options.child_runner
         stop_event = options.stop_event or threading.Event()
+        pause_gate = options.pause_gate or PauseGate()
         root = WorkflowFrame(
             id="root",
             meta=meta,
@@ -118,6 +120,7 @@ def run_workflow(script: str, options: WorkflowOptions | None = None) -> Workflo
             config=config,
             runner=child_runner,
             stop_event=stop_event,
+            pause_gate=pause_gate,
             resume_cache=options.resume_cache or ResumeCache(),
             deadline=monotonic() + config.workflow_timeout_seconds,
             root=root,
@@ -158,6 +161,7 @@ def run_workflow(script: str, options: WorkflowOptions | None = None) -> Workflo
         value = _resolve_workflow_value(namespace)
         if _frame_agent_count(frame) == 0:
             raise WorkflowRuntimeError("workflow must call agent() at least once")
+        context.check_runtime()
         frame.status = "completed"
         return WorkflowResult(value=value, state=state)
     except BaseException as exc:
