@@ -490,9 +490,10 @@ def _resolve_agent_spec(
         build_child_system_prompt,
     )
 
-    requested_type = _normalize_agent_type(opts.get("agentType"))
+    explicit_type = _normalize_agent_type(opts.get("agentType"))
+    requested_type = explicit_type or "general-purpose"
     agent_type_spec = resolve_agent_type(requested_type, cwd=cwd)
-    if requested_type and agent_type_spec is None:
+    if explicit_type and agent_type_spec is None:
         available = ", ".join(spec.name for spec in list_agent_types(cwd=cwd)) or "none"
         raise WorkflowRuntimeError(
             f"agent({{agentType}}): agent type '{requested_type}' not found. "
@@ -516,7 +517,7 @@ def _resolve_agent_spec(
             config,
             [],
             getattr(agent_type_spec, "toolsets", ()),
-            include_discoverable=agent_type_spec is None,
+            include_discoverable=not explicit_type,
         )
     )
     prompt = build_child_system_prompt(

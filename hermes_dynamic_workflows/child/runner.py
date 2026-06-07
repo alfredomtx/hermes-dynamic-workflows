@@ -655,6 +655,10 @@ def _resolve_child_toolsets(
     include_discoverable: bool = False,
 ) -> list[str]:
     raw = requested or list(agent_type_toolsets) or list(config.default_child_toolsets)
+    # "*" expands to all default child toolsets (like general-purpose)
+    if "*" in raw:
+        wildcard = [ts for ts in config.default_child_toolsets if ts not in raw]
+        raw = [item for item in raw if item != "*"] + wildcard
     if include_discoverable:
         raw = list(raw) + _discoverable_child_toolsets(config)
     blocked = set(config.blocked_child_toolsets)
@@ -1185,7 +1189,7 @@ def _child_metadata(
         "isolation": lease.isolation or "shared",
         "worktree_path": lease.path,
         "worktree_branch": lease.branch,
-        "agent_type": agent_type.name if agent_type else "workflow-subagent",
+        "agent_type": agent_type.name if agent_type else "general-purpose",
         "agent_type_source": agent_type.source if agent_type else None,
         "model": getattr(child, "model", None),
         "toolsets": toolsets,

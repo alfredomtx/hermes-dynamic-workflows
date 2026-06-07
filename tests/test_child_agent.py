@@ -440,7 +440,7 @@ class ChildAgentTests(unittest.TestCase):
             ["file"],
         )
 
-        self.assertEqual(metadata["agent_type"], "workflow-subagent")
+        self.assertEqual(metadata["agent_type"], "general-purpose")
         self.assertIsNone(metadata["agent_type_source"])
 
     def test_bundled_agent_types_inherit_launching_model(self):
