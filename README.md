@@ -42,19 +42,22 @@ plugins:
   entries:
     dynamic-workflows:
       dynamic_workflows:
-        concurrency: 8                  # max agents running at once (default: min(16, cpu-2))
-        max_concurrency: 16             # hard ceiling for concurrency
-        max_agents: 1000                # runaway backstop: total agents per run
-        workflow_timeout_seconds: 900   # whole-run wall-clock deadline (paused time excluded)
-        child_timeout_seconds: 300      # per child-agent timeout
-        default_child_toolsets: [web, file, terminal, skills]  # toolsets each child gets by default
-        keep_worktrees: false           # keep per-agent git worktrees instead of deleting them
-        allow_model_override: true      # allow per-agent model routing via agent(model=...)
-        require_launch_approval: true   # confirm before a top-level launch (deny if no channel)
-        child_approval_policy: inherit  # flagged cmd: inherit|smart|deny|approve|ask
-        ask_fallback: smart             # what 'ask' degrades to with no human: smart|deny|approve
-        notify_on_complete: true        # notify the launching CLI or gateway chat on completion
-        notify_result_preview_chars: 2000   # truncate the result shown in the notification
+        concurrency: 8                # 最大并发 agent 数（默认 min(16, cpu-2)）
+        max_concurrency: 16           # 并发上限硬限制
+        max_agents: 1000              # 单个 run 的 agent 总数上限（防逃逸）
+        workflow_timeout_seconds: 900 # 整个 run 的 wall-clock 超时（不含暂停时间）
+        child_timeout_seconds: 300    # 单个子 agent 超时
+        blocked_child_toolsets: [workflow, delegation, code_execution, memory, messaging, clarify]
+                                      # 子 agent 禁止使用的 toolsets
+        default_child_toolsets: [web, file, terminal, skills]
+                                      # 子 agent 默认 toolset（不指定 agentType 时生效）
+        keep_worktrees: false         # 是否保留 agent 的 git worktree（默认自动清理）
+        allow_model_override: true    # 是否允许 agent(model=...) 指定模型
+        require_launch_approval: true # 顶层 workflow 启动前需确认（无人在线则拒绝）
+        child_approval_policy: inherit # 子 agent 审批策略: inherit|smart|deny|approve|ask
+        ask_fallback: smart           # ask 无人可达时的降级: smart|deny|approve
+        notify_on_complete: true      # 完成时通知发起 CLI 或 gateway 会话
+        notify_result_preview_chars: 2000  # 通知中结果预览的截断字符数
 ```
 
 ## 能力一瞥
@@ -81,6 +84,21 @@ return await agent("Synthesize the verified findings:\n" + json.dumps(findings))
   `agentType`、`isolation="worktree"`。
 - `pipeline`（默认，无栅栏）/ `parallel`（栅栏）做并发；`phase`/`log` 报告进度；
   `workflow()` 内联跑命名工作流；`args` / `budget` 取入参与 token 预算。
+
+### Agent Type
+
+脚本里通过 `agentType` 指定子代理类型，不填则默认 `general-purpose`（全工具集）:
+
+| 类型 | 工具集 | 说明 |
+|------|--------|------|
+| `general-purpose` | `*`（全部安全工具） | 默认，适合搜索代码、研究复杂问题、多步任务 |
+| `explore` | 只读（read_file, search_files, terminal） | 快速代码库探索，适合找文件、搜关键词 |
+| `plan` | 只读（read_file, search_files, terminal） | 软件架构设计，输出分步实现方案 |
+| `verification` | web + file + terminal + browser | 验证实现正确性，跑构建/测试/lint 出 PASS/FAIL |
+
+Agent type 定义在 `<插件目录>/hermes_dynamic_workflows/agents/*.md` 里。
+要加自定义类型，在 `~/.hermes/dynamic-workflows/agents/` 下放同名 `.md` 即可覆盖内置定义，
+格式参考内置的 `general-purpose.md`。
 
 运行时持久化脚本与每个子代理的完整执行链路（transcript），并在完成时把
 `<task-notification>` 注入对话——无需轮询。用 `/workflows` 看历史与详情。
