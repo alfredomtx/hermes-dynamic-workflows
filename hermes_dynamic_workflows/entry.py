@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import os
 
-from hermes_dynamic_workflows.adapters.hooks import pre_tool_call_handler
-from hermes_dynamic_workflows.adapters.task_stop import TASK_STOP_SCHEMA, task_stop
-from hermes_dynamic_workflows.adapters.workflow import get_dynamic_workflow_schema, workflow
-from hermes_dynamic_workflows.adapters.commands import workflows_command
+from .adapters.hooks import pre_tool_call_handler
+from .adapters.task_stop import TASK_STOP_SCHEMA, task_stop
+from .adapters.workflow import get_dynamic_workflow_schema, workflow
+from .adapters.commands import workflows_command
 
 
 def register(ctx) -> None:

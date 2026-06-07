@@ -227,6 +227,8 @@ def _read_journal(raw_path: Any, reader: "_JsonlTailReader") -> dict[str, list[s
             text = "Result recorded"
         elif event_type == "error":
             text = f"Error: {_preview(value.get('error'), 90)}"
+        elif event_type == "activity" and value.get("activity"):
+            text = str(value.get("activity"))
         else:
             continue
         events.setdefault(agent_id, []).append(text)

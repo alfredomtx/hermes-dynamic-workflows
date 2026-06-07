@@ -14,6 +14,7 @@ from typing import Any, Callable
 from .api import WorkflowAPI
 from .cache import ResumeCache
 from ..core.config import PluginConfig, load_config
+from ..core.errors import ChildAgentError
 from .context import PauseGate, WorkflowExecutionContext
 from .sandbox import (
     ENTRYPOINT_NAME,
@@ -177,7 +178,8 @@ async def _run_workflow_async(script: str, options: WorkflowOptions | None = Non
         # BaseException so a WorkflowHalt (stop/deadline/limit) still records
         # frame status before propagating to the run thread.
         frame.status = "stopped" if context.stop_event.is_set() else "error"
-        frame.errors.append(f"{type(exc).__name__}: {exc}")
+        if not isinstance(exc, ChildAgentError):
+            frame.errors.append(f"{type(exc).__name__}: {exc}")
         raise
     finally:
         frame.ended_at = monotonic()

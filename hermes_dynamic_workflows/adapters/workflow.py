@@ -59,7 +59,7 @@ def _launch_message(record: dict[str, Any]) -> str:
     script_path = record.get("scriptPath") or ""
     return "\n".join(
         [
-            f"Workflow launched in background. Task ID: {task_id}",
+            f"Workflow launched in background. Workflow Task ID: {task_id}",
             f"Summary: {summary}",
             f"Transcript dir: {transcript_dir}",
             f"Script file: {script_path}",

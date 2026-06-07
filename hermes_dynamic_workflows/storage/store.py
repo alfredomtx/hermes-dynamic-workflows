@@ -204,6 +204,9 @@ def default_store_root() -> Path:
     override = os.getenv("HERMES_DYNAMIC_WORKFLOWS_HOME")
     if override:
         return Path(override).expanduser()
+    hermes_home = os.getenv("HERMES_HOME")
+    if hermes_home:
+        return Path(hermes_home).expanduser() / "dynamic-workflows"
     try:
         from ..host import session as host_session
 
@@ -216,6 +219,9 @@ def default_layout_root() -> Path:
     override = os.getenv("HERMES_DYNAMIC_WORKFLOWS_HOME")
     if override:
         return Path(override).expanduser()
+    hermes_home = os.getenv("HERMES_HOME")
+    if hermes_home:
+        return Path(hermes_home).expanduser()
     try:
         from ..host import session as host_session
 

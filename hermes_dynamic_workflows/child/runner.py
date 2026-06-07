@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import inspect
 import os
+import re
+import shutil
+import sys
 import threading
 import uuid
 import logging
@@ -35,6 +38,73 @@ logger = logging.getLogger(__name__)
 _CHILD_EXCLUDED_TOOL_NAMES = frozenset({"skill_manage"})
 
 
+class _WorkflowApprovalCoordinator:
+    """Serialize workflow-child CLI approvals and reuse explicit session grants."""
+
+    def __init__(self, callback: Any):
+        self._callback = callback if callable(callback) else None
+        self._lock = threading.RLock()
+        self._session_approved_descriptions: set[str] = set()
+
+    def callback_for(self, task_id: str, on_event: Any = None):
+        if self._callback is None:
+            return None
+
+        def _callback(command: str, description: str, **kwargs: Any) -> str:
+            emit = on_event if callable(on_event) else None
+            if emit is not None:
+                emit(
+                    {
+                        "type": "approval",
+                        "status": "queued",
+                        "task_id": task_id,
+                        "command": command,
+                        "description": description,
+                    }
+                )
+            with self._lock:
+                if description in self._session_approved_descriptions:
+                    if emit is not None:
+                        emit(
+                            {
+                                "type": "approval",
+                                "status": "reused",
+                                "task_id": task_id,
+                                "command": command,
+                                "description": description,
+                                "choice": "session",
+                            }
+                        )
+                    return "once"
+                if emit is not None:
+                    emit(
+                        {
+                            "type": "approval",
+                            "status": "requested",
+                            "task_id": task_id,
+                            "command": command,
+                            "description": description,
+                        }
+                    )
+                choice = self._callback(command, description, **kwargs)
+                if choice in ("session", "always"):
+                    self._session_approved_descriptions.add(description)
+                if emit is not None:
+                    emit(
+                        {
+                            "type": "approval",
+                            "status": "resolved",
+                            "task_id": task_id,
+                            "command": command,
+                            "description": description,
+                            "choice": choice,
+                        }
+                    )
+                return choice
+
+        return _callback
+
+
 class HermesChildAgentRunner(ChildAgentRunner):
     """Create standalone Hermes AIAgent children without native delegation."""
 
@@ -42,6 +112,8 @@ class HermesChildAgentRunner(ChildAgentRunner):
         self,
         config: PluginConfig,
         session_context: dict[str, str] | None = None,
+        approval_callback: Any = None,
+        approval_session_key: str | None = None,
         parent_runtime: dict[str, Any] | None = None,
     ):
         self.config = config
@@ -50,6 +122,11 @@ class HermesChildAgentRunner(ChildAgentRunner):
         # child's dangerous command can route to the user for mid-run approval
         # (child_approval_policy="ask"). None outside gateway.
         self._session_context = session_context or None
+        # Captured from the launching CLI thread. Hermes' CLI approval callback
+        # is designed to serialize concurrent background requests.
+        self._approval_callback = approval_callback if callable(approval_callback) else None
+        self._approval_coordinator = _WorkflowApprovalCoordinator(self._approval_callback)
+        self._approval_session_key = str(approval_session_key or "").strip()
         # Captured from the launching main agent. It stays in memory so default
         # children and model="inherit" use the active session runtime, including
         # a non-persisted /model switch, without leaking credentials to run data.
@@ -57,6 +134,7 @@ class HermesChildAgentRunner(ChildAgentRunner):
         self._active_children: dict[str, Any] = {}
         self._skipped_children: set[str] = set()
         self._active_lock = threading.RLock()
+        self._progress_print_lock = threading.RLock()
 
     def run(self, request: ChildAgentRequest) -> ChildAgentResult:
         task_id = f"workflow-{uuid.uuid4().hex[:12]}"
@@ -250,6 +328,7 @@ class HermesChildAgentRunner(ChildAgentRunner):
             "disabled_toolsets": list(self.config.blocked_child_toolsets),
             "quiet_mode": True,
             "platform": "cli",
+            "tool_progress_callback": self._make_tool_progress_callback(request, lease),
             "skip_context_files": True,
             "skip_memory": True,
             "clarify_callback": _child_clarify_callback,
@@ -266,6 +345,29 @@ class HermesChildAgentRunner(ChildAgentRunner):
             kwargs["service_tier"] = runtime["service_tier"]
         return AIAgent(**kwargs)
 
+    def _make_tool_progress_callback(self, request: ChildAgentRequest, lease: WorkspaceLease):
+        label = (request.label or "").strip() or lease.task_id
+        print_lock = self._progress_print_lock
+
+        def _callback(event: str, tool_name: str, _preview: Any = None, args: Any = None, **_: Any) -> None:
+            if event != "tool.started":
+                return
+            if not _stdout_is_tty():
+                return
+            line = _compact_tool_progress_line(
+                label,
+                tool_name,
+                args,
+                max_width=_tool_progress_line_width(),
+            )
+            with print_lock:
+                try:
+                    _write_tool_progress_line(line)
+                except (OSError, ValueError):
+                    pass
+
+        return _callback
+
     def _run_child_with_timeout(
         self,
         child: Any,
@@ -275,9 +377,33 @@ class HermesChildAgentRunner(ChildAgentRunner):
         toolsets: list[str],
     ) -> ChildAgentResult:
         timeout = self.config.child_timeout_seconds
+        live_lock = threading.RLock()
+        live_tool_calls = 0
+
+        def _emit_progress(event: dict[str, Any]) -> None:
+            nonlocal live_tool_calls
+            with live_lock:
+                if event.get("type") == "tool_call":
+                    live_tool_calls += 1
+                metadata = _child_metadata(child, {}, lease, agent_type, toolsets)
+                metadata["tool_calls"] = max(
+                    int(metadata.get("tool_calls") or 0),
+                    live_tool_calls,
+                )
+                if event.get("activity"):
+                    metadata["activity"] = str(event["activity"])
+                if event.get("type") == "approval":
+                    metadata["approval"] = dict(event)
+            _emit_request_update(request, metadata)
+
+        interactive_callback = self._approval_coordinator.callback_for(
+            lease.task_id,
+            _emit_progress,
+        )
         approval_callback = _make_child_approval_callback(
             self.config.child_approval_policy,
             getattr(self.config, "ask_fallback", "smart"),
+            interactive_callback=interactive_callback,
         )
 
         def _init_worker() -> None:
@@ -304,43 +430,69 @@ class HermesChildAgentRunner(ChildAgentRunner):
                     pass
 
         def _run() -> dict[str, Any]:
-            _register_task_cwd(lease.task_id, lease.cwd)
-            message = build_child_task_message(request, workspace=lease.cwd)
-            history = None
-            stop_attempts = 0
-            while True:
-                result = child.run_conversation(
-                    user_message=message,
-                    conversation_history=history,
-                    task_id=lease.task_id,
-                )
-                if not request.structured_tool:
-                    return result
-
-                captured, _value, tool_attempts = peek_result(lease.task_id)
-                if captured:
-                    return result
-
-                stop_attempts += 1
-                if (
-                    tool_attempts >= MAX_STRUCTURED_OUTPUT_RETRIES
-                    or stop_attempts >= MAX_STRUCTURED_OUTPUT_RETRIES
-                ):
-                    raise ChildAgentError(
-                        "Failed to provide valid structured output after "
-                        f"{MAX_STRUCTURED_OUTPUT_RETRIES} attempts"
+            approval_token = None
+            reset_current_session_key = None
+            if self._approval_session_key:
+                try:
+                    from tools.approval import (
+                        reset_current_session_key as _reset_current_session_key,
+                        set_current_session_key,
                     )
 
-                previous_messages = result.get("messages") if isinstance(result, dict) else None
-                if isinstance(previous_messages, list):
-                    history = previous_messages
-                message = STRUCTURED_OUTPUT_CONTINUE_MESSAGE
+                    approval_token = set_current_session_key(self._approval_session_key)
+                    reset_current_session_key = _reset_current_session_key
+                except Exception:
+                    pass
+            try:
+                _register_task_cwd(lease.task_id, lease.cwd)
+                message = build_child_task_message(request, workspace=lease.cwd)
+                history = None
+                stop_attempts = 0
+                while True:
+                    result = child.run_conversation(
+                        user_message=message,
+                        conversation_history=history,
+                        task_id=lease.task_id,
+                    )
+                    if not request.structured_tool:
+                        return result
+
+                    captured, _value, tool_attempts = peek_result(lease.task_id)
+                    if captured:
+                        return result
+
+                    stop_attempts += 1
+                    if (
+                        tool_attempts >= MAX_STRUCTURED_OUTPUT_RETRIES
+                        or stop_attempts >= MAX_STRUCTURED_OUTPUT_RETRIES
+                    ):
+                        raise ChildAgentError(
+                            "Failed to provide valid structured output after "
+                            f"{MAX_STRUCTURED_OUTPUT_RETRIES} attempts"
+                        )
+
+                    previous_messages = result.get("messages") if isinstance(result, dict) else None
+                    if isinstance(previous_messages, list):
+                        history = previous_messages
+                    message = STRUCTURED_OUTPUT_CONTINUE_MESSAGE
+            finally:
+                if approval_token is not None and reset_current_session_key is not None:
+                    try:
+                        reset_current_session_key(approval_token)
+                    except Exception:
+                        pass
 
         executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="dw-child-agent",
             initializer=_init_worker,
         )
+        try:
+            from ..adapters.hooks import register_child_observer
+
+            register_child_observer(lease.task_id, _emit_progress)
+        except Exception:
+            pass
         with self._active_lock:
             self._active_children[lease.task_id] = child
         future = executor.submit(_run)
@@ -364,6 +516,12 @@ class HermesChildAgentRunner(ChildAgentRunner):
             finally:
                 raise WorkflowTimeout(f"child agent timed out after {timeout:.0f}s") from exc
         finally:
+            try:
+                from ..adapters.hooks import unregister_child_observer
+
+                unregister_child_observer(lease.task_id)
+            except Exception:
+                pass
             with self._active_lock:
                 self._active_children.pop(lease.task_id, None)
             _cleanup_task_cwd(lease.task_id)
@@ -666,6 +824,120 @@ def _child_clarify_callback(question: str, choices=None) -> str:
     )
 
 
+_TOOL_ARG_PRIORITY = (
+    "query",
+    "path",
+    "url",
+    "command",
+    "action",
+    "key",
+    "name",
+)
+_TOOL_ARG_VALUE_LIMIT = 80
+_TOOL_PROGRESS_FALLBACK_WIDTH = 120
+_TOOL_PROGRESS_MAX_WIDTH = 140
+
+
+def _stdout_is_tty() -> bool:
+    stream = getattr(sys, "stdout", None)
+    if stream is None:
+        return False
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def _compact_tool_progress_line(
+    label: str,
+    tool_name: str,
+    args: Any,
+    *,
+    max_width: int | None = None,
+) -> str:
+    clean_label = _single_line(label or "workflow-child")
+    clean_tool = _single_line(tool_name or "tool")
+    compact_args = _compact_tool_args(args)
+    suffix = f"({compact_args})" if compact_args else ""
+    line = f"↳ {clean_label} · {clean_tool}{suffix}"
+    if max_width is not None:
+        line = _ellipsize_middle(line, max_width)
+    return line
+
+
+def _tool_progress_line_width() -> int:
+    try:
+        columns = shutil.get_terminal_size((_TOOL_PROGRESS_FALLBACK_WIDTH, 24)).columns
+    except (OSError, ValueError):
+        columns = _TOOL_PROGRESS_FALLBACK_WIDTH
+    return max(40, min(int(columns) - 1, _TOOL_PROGRESS_MAX_WIDTH))
+
+
+def _write_tool_progress_line(line: str) -> None:
+    stream = getattr(sys, "stdout", None)
+    if stream is None:
+        return
+    stream.write(f"{line}\n")
+    stream.flush()
+
+
+def _compact_tool_args(args: Any) -> str:
+    if not isinstance(args, dict):
+        return ""
+    parts: list[str] = []
+    seen: set[str] = set()
+    for key in _TOOL_ARG_PRIORITY:
+        if key in args:
+            parts.append(f"{key}:{_compact_tool_arg_value(args[key])}")
+            seen.add(key)
+        if len(parts) >= 3:
+            break
+    if not parts:
+        for key in sorted(str(k) for k in args.keys()):
+            if key in seen:
+                continue
+            parts.append(f"{key}:{_compact_tool_arg_value(args.get(key))}")
+            if len(parts) >= 3:
+                break
+    return ", ".join(parts)
+
+
+def _compact_tool_arg_value(value: Any) -> str:
+    if isinstance(value, str):
+        return _quote_display_string(_ellipsize_middle(_single_line(value), _TOOL_ARG_VALUE_LIMIT))
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, dict):
+        return "{...}"
+    if isinstance(value, (list, tuple, set)):
+        return "[...]"
+    return _quote_display_string(_ellipsize_middle(_single_line(str(value)), _TOOL_ARG_VALUE_LIMIT))
+
+
+def _quote_display_string(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _single_line(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def _ellipsize_middle(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    if limit <= 3:
+        return "." * max(0, limit)
+    keep = max(1, limit - 3)
+    head = (keep + 1) // 2
+    tail = keep // 2
+    return f"{value[:head]}...{value[-tail:]}"
+
+
 def _child_failure_message(result: Any, content: str) -> str | None:
     """Return an error message when a child result signals a hard failure with
     no usable content, else None.
@@ -683,6 +955,15 @@ def _child_failure_message(result: Any, content: str) -> str | None:
     return None
 
 
+def _emit_request_update(request: ChildAgentRequest, metadata: dict[str, Any]) -> None:
+    if request.on_update is None:
+        return
+    try:
+        request.on_update(metadata)
+    except Exception:
+        logger.debug("dynamic workflow child update callback failed", exc_info=True)
+
+
 def _resolve_inherit_policy(policy: str) -> str:
     """Resolve ``inherit`` to Hermes' own approvals.mode (manual->ask,
     smart->smart, off->approve). Mirrors approval_hook._resolve_policy so the
@@ -698,7 +979,12 @@ def _resolve_inherit_policy(policy: str) -> str:
     return {"manual": "ask", "smart": "smart", "off": "approve"}.get(mode, "deny")
 
 
-def _make_child_approval_callback(policy: str, ask_fallback: str = "smart"):
+def _make_child_approval_callback(
+    policy: str,
+    ask_fallback: str = "smart",
+    *,
+    interactive_callback: Any = None,
+):
     """Build the non-interactive approval callback for child worker threads.
 
     Child agents run every command through Hermes' approval engine
@@ -715,11 +1001,15 @@ def _make_child_approval_callback(policy: str, ask_fallback: str = "smart"):
       approve -> allow flagged commands (hardline is still blocked upstream)
       smart   -> defer to Hermes' _smart_approve auxiliary-LLM guardian;
                  'escalate' (uncertain) resolves to deny since no human is present
-      ask     -> a detached background child can't grab the CLI's synchronous
-                 prompt, so degrade to ask_fallback (smart|deny|approve)
+      ask     -> use the captured launching CLI approval callback when present;
+                 otherwise degrade to ask_fallback (smart|deny|approve)
     """
     clean = _resolve_inherit_policy((policy or "deny").strip().lower())
+    if callable(interactive_callback):
+        interactive_callback = _with_read_only_fast_path(interactive_callback)
     if clean == "ask":
+        if callable(interactive_callback):
+            return interactive_callback
         clean = ask_fallback if ask_fallback in ("smart", "deny", "approve") else "smart"
 
     if clean == "approve":
@@ -758,6 +1048,25 @@ def _make_child_approval_callback(policy: str, ask_fallback: str = "smart"):
         )
         return "deny"
     return _deny
+
+
+def _with_read_only_fast_path(callback: Any):
+    def _callback(command: str, description: str, **kwargs: Any) -> str:
+        try:
+            from ..adapters.hooks import is_obviously_read_only_terminal_command
+
+            if is_obviously_read_only_terminal_command(command):
+                logger.info(
+                    "workflow child auto-approved read-only terminal command: %s (%s)",
+                    command,
+                    description,
+                )
+                return "once"
+        except Exception:
+            pass
+        return callback(command, description, **kwargs)
+
+    return _callback
 
 
 def _register_task_cwd(task_id: str, cwd: str) -> None:

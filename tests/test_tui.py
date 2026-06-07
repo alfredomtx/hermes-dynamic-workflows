@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from hermes_dynamic_workflows.storage.store import WorkflowStore
 from hermes_dynamic_workflows.tui.app import TuiController
-from hermes_dynamic_workflows.tui.model import WorkflowRepository, _JsonlTailReader
+from hermes_dynamic_workflows.tui.model import PhaseView, WorkflowRepository, _JsonlTailReader
 from hermes_dynamic_workflows.tui.render import RenderState, _display_width, render_screen
 
 
@@ -44,6 +44,31 @@ class TuiTests(unittest.TestCase):
         self.assertEqual(hydrated.agents[0].activity[-2:], ('WebSearch({"query":"dynamic workflows"})', 'Read({"path":"paper.pdf"})'))
         self.assertEqual(running.agents[1].activity, ("Agent started",))
 
+    def test_repository_reads_live_tool_activity_from_journal_without_transcript(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _fake_store(Path(tmp))
+            record = store.load_run("wf_fake-running")
+            assert record is not None
+            with Path(record["journalFile"]).open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "activity",
+                            "agentId": "2",
+                            "activity": 'terminal({"command":"pwd"})',
+                        }
+                    )
+                    + "\n"
+                )
+            store.save_run(record)
+            running = next(
+                workflow
+                for workflow in WorkflowRepository(store).load()
+                if workflow.status == "running"
+            )
+
+        self.assertIn('terminal({"command":"pwd"})', running.agents[1].activity)
+
     def test_renders_claude_style_list_workflow_and_agent_views(self):
         with tempfile.TemporaryDirectory() as tmp:
             repository = WorkflowRepository(_fake_store(Path(tmp)))
@@ -73,13 +98,13 @@ class TuiTests(unittest.TestCase):
             )
 
         self.assertIn("Dynamic workflows", list_text)
-        self.assertIn("1 running . 1 completed", list_text)
+        self.assertIn("1 running · 1 completed", list_text)
         self.assertIn("dynamic-workflow-research", list_text)
         self.assertIn("Phases", workflow_text)
-        self.assertIn("Search . 2 agents", workflow_text)
+        self.assertIn("Search · 2 agents", workflow_text)
         self.assertIn("search:claude-articles", workflow_text)
-        self.assertIn("Prompt .", agent_text)
-        self.assertIn("Activity . last 2 of 2", agent_text)
+        self.assertIn("Prompt ·", agent_text)
+        self.assertIn("Activity · last 2 of 2", agent_text)
         self.assertIn("WebSearch", agent_text)
         self.assertIn("Still running...", agent_text)
 
@@ -134,6 +159,57 @@ class TuiTests(unittest.TestCase):
 
         self.assertTrue(all(_display_width(line) <= 88 for line in lines))
 
+    def test_rendered_views_keep_selected_items_and_footer_visible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workflows = WorkflowRepository(_fake_store(Path(tmp))).load()
+        base = workflows[0]
+        many_workflows = [
+            replace(base, run_id=f"wf-{index}", name=f"run-{index}", description=f"run-{index}")
+            for index in range(30)
+        ]
+        list_lines = render_screen(
+            many_workflows,
+            RenderState(run_index=29),
+            width=100,
+            height=12,
+        )
+
+        phases = tuple(
+            PhaseView(title=f"phase-{index}", agents=base.agents)
+            for index in range(20)
+        )
+        workflow_with_phases = replace(base, phases=phases)
+        workflow_lines = render_screen(
+            [workflow_with_phases],
+            RenderState(view="workflow", phase_index=19),
+            width=100,
+            height=14,
+        )
+
+        agents = tuple(
+            replace(base.agents[0], id=str(index), label=f"agent-{index}")
+            for index in range(20)
+        )
+        workflow_with_agents = replace(
+            base,
+            agents=agents,
+            phases=(PhaseView(title="agents", agents=agents),),
+        )
+        agent_lines = render_screen(
+            [workflow_with_agents],
+            RenderState(view="agent", agent_index=19),
+            width=100,
+            height=14,
+        )
+
+        self.assertIn("run-29", "\n".join(list_lines))
+        self.assertNotIn("run-0", "\n".join(list_lines))
+        self.assertIn("q close", list_lines[-1])
+        self.assertIn("phase-19", "\n".join(workflow_lines))
+        self.assertNotIn("phase-0 ", "\n".join(workflow_lines))
+        self.assertIn("agent-19", "\n".join(agent_lines))
+        self.assertNotIn("agent-0 ", "\n".join(agent_lines))
+
     def test_non_tty_command_prints_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
             _fake_store(Path(tmp))
@@ -149,6 +225,23 @@ class TuiTests(unittest.TestCase):
             )
 
         self.assertIn("Dynamic workflows", result.stdout)
+        self.assertIn("dynamic-workflow-research", result.stdout)
+
+    def test_non_tty_command_respects_hermes_home(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _fake_store(Path(tmp) / "dynamic-workflows")
+            env = dict(os.environ)
+            env.pop("HERMES_DYNAMIC_WORKFLOWS_HOME", None)
+            env["HERMES_HOME"] = tmp
+            result = subprocess.run(
+                [sys.executable, "-m", "hermes_dynamic_workflows.tui.app"],
+                cwd=Path(__file__).resolve().parent.parent,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
         self.assertIn("dynamic-workflow-research", result.stdout)
 
     def test_jsonl_reader_caches_stable_files_and_reads_bounded_tail(self):

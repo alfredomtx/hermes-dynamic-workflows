@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sys
 import os
+import io
+import subprocess
 import tempfile
 import types
 import unittest
@@ -11,10 +13,12 @@ from unittest.mock import patch
 from hermes_dynamic_workflows.child.presets import AgentTypeSpec, list_agent_types, resolve_agent_type
 from hermes_dynamic_workflows.child.runner import (
     HermesChildAgentRunner,
+    _WorkflowApprovalCoordinator,
     build_child_system_prompt,
     build_child_task_message,
     _child_failure_message,
     _child_metadata,
+    _compact_tool_progress_line,
     _apply_agent_type_defaults,
     _configure_child_tools,
     _discoverable_child_toolsets,
@@ -22,7 +26,7 @@ from hermes_dynamic_workflows.child.runner import (
     _resolve_child_toolsets,
     _tool_call_count,
 )
-from hermes_dynamic_workflows.child.worktree import WorkspaceLease
+from hermes_dynamic_workflows.child.worktree import WorkspaceLease, create_workspace_lease
 from hermes_dynamic_workflows.core.config import PluginConfig
 from hermes_dynamic_workflows.core.errors import ChildAgentError
 from hermes_dynamic_workflows.core.types import ChildAgentRequest
@@ -51,6 +55,35 @@ def _tool_name(definition: dict) -> str:
 
 
 class ChildAgentTests(unittest.TestCase):
+    def test_clean_worktree_is_removed_without_modifying_tracked_gitignore(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            gitignore = repo / ".gitignore"
+            gitignore.write_text("existing/\n", encoding="utf-8")
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+            subprocess.run(["git", "add", ".gitignore"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "initial"], cwd=repo, check=True)
+
+            lease = create_workspace_lease(cwd=str(repo), isolation="worktree", label="clean")
+            worktree = Path(lease.path or "")
+            branch = str(lease.branch or "")
+            self.assertTrue(worktree.is_dir())
+            self.assertEqual(gitignore.read_text(encoding="utf-8"), "existing/\n")
+
+            lease.cleanup()
+
+            self.assertFalse(worktree.exists())
+            branches = subprocess.run(
+                ["git", "branch", "--list", branch],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(branches.stdout.strip(), "")
+
     def test_child_toolsets_filter_recursive_tools(self):
         self.assertEqual(
             _resolve_child_toolsets(
@@ -541,6 +574,95 @@ class ToolCallCountTests(unittest.TestCase):
     def test_missing_messages_is_zero(self):
         self.assertEqual(_tool_call_count({}), 0)
 
+    def test_compact_tool_progress_line_prioritizes_and_truncates_args(self):
+        long_command = (
+            "curl -sL https://example.test/search?q=anthropic+workflow+approval "
+            "| python3 -c \"import sys; print(sys.stdin.read()[:100])\""
+        )
+
+        line = _compact_tool_progress_line(
+            "search:models",
+            "terminal",
+            {"unused": "ignored", "command": long_command, "path": "/Users/Apple/code/MyProjects/hermes-dynamic-workflows/hermes_dynamic_workflows/child/runner.py"},
+        )
+
+        self.assertTrue(line.startswith("↳ search:models · terminal("))
+        self.assertIn('path:"/Users/Apple/code/MyProjects/hermes-dyn...rmes_dynamic_workflows/child/runner.py"', line)
+        self.assertIn('command:"curl -sL https://example.test/search?q=...rt sys; print(sys.stdin.read()[:100])\\""', line)
+        self.assertNotIn("unused", line)
+        self.assertNotIn("\n", line)
+
+    def test_compact_tool_progress_line_can_fit_terminal_width(self):
+        line = _compact_tool_progress_line(
+            "综合搜索",
+            "structured_output",
+            {
+                "benchmarks": "关键基准测试成绩：" + "很长" * 80,
+                "capabilities": "能力：" + "很长" * 80,
+                "pricing": "价格：" + "很长" * 80,
+            },
+            max_width=72,
+        )
+
+        self.assertLessEqual(len(line), 72)
+        self.assertIn("...", line)
+        self.assertNotIn("\n", line)
+
+    def test_child_agent_installs_compact_tool_progress_callback(self):
+        seen_kwargs = {}
+
+        class FakeAIAgent:
+            def __init__(self, **kwargs):
+                seen_kwargs.update(kwargs)
+                self.model = kwargs.get("model")
+
+        run_agent_mod = types.ModuleType("run_agent")
+        run_agent_mod.AIAgent = FakeAIAgent
+        runner = HermesChildAgentRunner(PluginConfig())
+        request = ChildAgentRequest(
+            id=1,
+            prompt="work",
+            label="search:models",
+            phase=None,
+            toolsets=[],
+        )
+        lease = WorkspaceLease(task_id="workflow-abc123", cwd="/tmp")
+        runtime = {"model": "test-model"}
+
+        with patch.dict(sys.modules, {"run_agent": run_agent_mod}):
+            child = runner._build_agent(request, runtime, [], lease, None)
+
+        self.assertIsInstance(child, FakeAIAgent)
+        self.assertEqual(seen_kwargs["quiet_mode"], True)
+        self.assertEqual(seen_kwargs["platform"], "cli")
+        self.assertTrue(callable(seen_kwargs["tool_progress_callback"]))
+
+    def test_tool_progress_callback_prints_one_started_line_on_tty(self):
+        class TtyStringIO(io.StringIO):
+            def isatty(self):
+                return True
+
+        runner = HermesChildAgentRunner(PluginConfig())
+        request = ChildAgentRequest(
+            id=1,
+            prompt="work",
+            label="read:source",
+            phase=None,
+            toolsets=[],
+        )
+        lease = WorkspaceLease(task_id="workflow-abc123", cwd="/tmp")
+        callback = runner._make_tool_progress_callback(request, lease)
+        stream = TtyStringIO()
+
+        with patch("sys.stdout", stream):
+            callback("tool.started", "read_file", None, {"path": "/tmp/project/src/really_long_file_name.py"})
+            callback("tool.completed", "read_file", None, {"path": "/tmp/project/src/really_long_file_name.py"})
+
+        self.assertEqual(
+            stream.getvalue(),
+            '↳ read:source · read_file(path:"/tmp/project/src/really_long_file_name.py")\n',
+        )
+
 
 class RunnerSessionContextTests(unittest.TestCase):
     def test_runner_stores_session_context(self):
@@ -555,6 +677,17 @@ class RunnerSessionContextTests(unittest.TestCase):
         from hermes_dynamic_workflows.child.runner import HermesChildAgentRunner
 
         self.assertIsNone(HermesChildAgentRunner(PluginConfig())._session_context)
+
+    def test_runner_stores_live_cli_approval_callback(self):
+        from hermes_dynamic_workflows.child.runner import HermesChildAgentRunner
+
+        callback = lambda command, description: "once"
+        runner = HermesChildAgentRunner(PluginConfig(), approval_callback=callback)
+        self.assertIs(runner._approval_callback, callback)
+
+    def test_runner_stores_approval_session_key(self):
+        runner = HermesChildAgentRunner(PluginConfig(), approval_session_key="parent-session")
+        self.assertEqual(runner._approval_session_key, "parent-session")
 
     def test_default_and_inherit_models_use_captured_parent_runtime(self):
         runtime = {
@@ -583,6 +716,72 @@ class RunnerSessionContextTests(unittest.TestCase):
 
 
 class StructuredOutputContinuationTests(unittest.TestCase):
+    def test_runner_binds_parent_approval_session_key_inside_child_thread(self):
+        seen = []
+        current = {"value": ""}
+        resets = []
+
+        approval_mod = types.ModuleType("tools.approval")
+
+        def set_current_session_key(value):
+            previous = current["value"]
+            current["value"] = value
+            return previous
+
+        def reset_current_session_key(token):
+            resets.append(token)
+            current["value"] = token
+
+        approval_mod.set_current_session_key = set_current_session_key
+        approval_mod.reset_current_session_key = reset_current_session_key
+        terminal_mod = types.ModuleType("tools.terminal_tool")
+        terminal_mod.set_approval_callback = lambda callback: None
+        terminal_mod.register_task_env_overrides = lambda task_id, overrides: None
+        terminal_mod.clear_task_env_overrides = lambda task_id: None
+        terminal_mod.cleanup_vm = lambda task_id: None
+        tools_pkg = types.ModuleType("tools")
+        tools_pkg.__path__ = []
+        tools_pkg.approval = approval_mod
+        tools_pkg.terminal_tool = terminal_mod
+
+        class Child:
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_reasoning_tokens = 0
+            session_cache_read_tokens = 0
+            session_cache_write_tokens = 0
+            model = "test"
+
+            def run_conversation(self, **_):
+                seen.append(current["value"])
+                return {"final_response": "done", "messages": [], "completed": True}
+
+        request = ChildAgentRequest(
+            id=1,
+            prompt="work",
+            label="worker",
+            phase=None,
+            toolsets=[],
+        )
+        lease = WorkspaceLease(task_id="approval-session-child", cwd="/tmp")
+        runner = HermesChildAgentRunner(
+            PluginConfig(),
+            approval_session_key="parent-session",
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                "tools": tools_pkg,
+                "tools.approval": approval_mod,
+                "tools.terminal_tool": terminal_mod,
+            },
+        ):
+            result = runner._run_child_with_timeout(child=Child(), request=request, lease=lease, agent_type=None, toolsets=[])
+
+        self.assertEqual(result.content, "done")
+        self.assertEqual(seen, ["parent-session"])
+        self.assertEqual(resets, [""])
+
     def test_runner_continues_same_child_session_until_tool_submission(self):
         schema = {
             "type": "object",
@@ -698,6 +897,38 @@ class ConfigDefaultsTests(unittest.TestCase):
 
 
 class ChildApprovalPolicyTests(unittest.TestCase):
+    def test_workflow_approval_coordinator_reuses_explicit_session_grant(self):
+        calls = []
+        events = []
+
+        def interactive(command, description, **kwargs):
+            calls.append((command, description, kwargs))
+            return "session"
+
+        coordinator = _WorkflowApprovalCoordinator(interactive)
+        first = coordinator.callback_for("workflow-1", events.append)
+        second = coordinator.callback_for("workflow-2", events.append)
+
+        self.assertEqual(first("curl a | python3", "pipe to interpreter"), "session")
+        self.assertEqual(second("curl b | python3", "pipe to interpreter"), "once")
+        self.assertEqual(len(calls), 1)
+        self.assertIn("reused", [event["status"] for event in events])
+
+    def test_workflow_approval_coordinator_does_not_reuse_allow_once(self):
+        calls = []
+
+        def interactive(command, description, **kwargs):
+            calls.append(command)
+            return "once"
+
+        coordinator = _WorkflowApprovalCoordinator(interactive)
+        first = coordinator.callback_for("workflow-1")
+        second = coordinator.callback_for("workflow-2")
+
+        self.assertEqual(first("curl a | python3", "pipe to interpreter"), "once")
+        self.assertEqual(second("curl b | python3", "pipe to interpreter"), "once")
+        self.assertEqual(calls, ["curl a | python3", "curl b | python3"])
+
     def test_deny_policy_refuses(self):
         cb = _make_child_approval_callback("deny")
         self.assertEqual(cb("rm -rf build", "recursive delete", allow_permanent=True), "deny")
@@ -742,10 +973,78 @@ class ChildApprovalPolicyTests(unittest.TestCase):
 
 
     def test_ask_degrades_to_fallback(self):
-        # A detached child can't grab the CLI prompt, so 'ask' degrades to
-        # ask_fallback. With fallback='deny' a flagged command is refused.
+        # Without a captured live channel, ask degrades to ask_fallback.
         cb = _make_child_approval_callback("ask", ask_fallback="deny")
         self.assertEqual(cb("rm -rf build", "recursive delete"), "deny")
+
+    def test_ask_uses_captured_cli_approval_callback(self):
+        calls = []
+
+        def interactive(command, description, **kwargs):
+            calls.append((command, description, kwargs))
+            return "session"
+
+        cb = _make_child_approval_callback(
+            "ask",
+            ask_fallback="deny",
+            interactive_callback=interactive,
+        )
+        self.assertEqual(cb("python3 -c \"print('ok')\"", "script execution"), "session")
+        self.assertEqual(calls[0][0], "python3 -c \"print('ok')\"")
+
+    def test_ask_auto_allows_obvious_read_only_terminal_command(self):
+        calls = []
+
+        def interactive(command, description, **kwargs):
+            calls.append(command)
+            return "session"
+
+        cb = _make_child_approval_callback(
+            "ask",
+            ask_fallback="deny",
+            interactive_callback=interactive,
+        )
+        command = (
+            "curl -sL https://example.test/feed.xml 2>/dev/null | "
+            "python3 -c \"import sys, re; data = sys.stdin.read(); print(re.findall('title', data))\""
+        )
+
+        self.assertEqual(cb(command, "pipe to interpreter"), "once")
+        self.assertEqual(calls, [])
+
+    def test_ask_does_not_auto_allow_terminal_write(self):
+        calls = []
+
+        def interactive(command, description, **kwargs):
+            calls.append(command)
+            return "deny"
+
+        cb = _make_child_approval_callback(
+            "ask",
+            ask_fallback="deny",
+            interactive_callback=interactive,
+        )
+        command = "curl -sL https://example.test | python3 -c \"open('x', 'w').write('bad')\""
+
+        self.assertEqual(cb(command, "script execution"), "deny")
+        self.assertEqual(calls, [command])
+
+    def test_inherit_manual_uses_captured_cli_approval_callback(self):
+        approval_mod = types.ModuleType("tools.approval")
+        approval_mod._get_approval_mode = lambda: "manual"
+        tools_pkg = types.ModuleType("tools")
+        tools_pkg.__path__ = []
+        tools_pkg.approval = approval_mod
+        calls = []
+
+        def interactive(command, description):
+            calls.append(command)
+            return "once"
+
+        with patch.dict(sys.modules, {"tools": tools_pkg, "tools.approval": approval_mod}):
+            cb = _make_child_approval_callback("inherit", interactive_callback=interactive)
+            self.assertEqual(cb("rm -rf build", "recursive delete"), "once")
+        self.assertEqual(calls, ["rm -rf build"])
 
     def test_ask_default_fallback_is_smart(self):
         # Default ask_fallback is smart -> routes through _smart_approve.

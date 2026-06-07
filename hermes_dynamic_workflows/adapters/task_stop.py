@@ -12,7 +12,7 @@ _DESCRIPTION = """
 - Stop a running workflow by its Task ID
 - Takes a task_id parameter identifying the workflow task to stop
 - Returns a success or failure status
-- Use this tool when you need to terminate a workflow task
+- Use this tool when you need to terminate a running workflow task
 """
 
 TASK_STOP_SCHEMA = {

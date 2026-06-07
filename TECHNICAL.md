@@ -87,7 +87,7 @@ notification（run 尚未开始）。
 成功启动：
 
 ```
-Workflow launched in background. Task ID: <taskId>
+Workflow launched in background. Workflow Task ID: <taskId>
 Summary: <meta.description or meta.name>
 Transcript dir: <…/subagents/workflows/<runId>>
 Script file: <…/scripts/<name>-<runId>.py>

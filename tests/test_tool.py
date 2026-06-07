@@ -159,7 +159,7 @@ return await agent("do it", {"label": "worker"})
                 run_id = match.group(1)
                 final = manager.wait(run_id, timeout=2)
 
-        self.assertRegex(result, r"Workflow launched in background\. Task ID: wg[a-z0-9]{7}")
+        self.assertRegex(result, r"Workflow launched in background\. Workflow Task ID: wg[a-z0-9]{7}")
         self.assertIn("Summary: Test workflow", result)
         self.assertIn("Transcript dir:", result)
         self.assertIn("tool-session", result)
@@ -192,8 +192,14 @@ return await agent("do it", {"label": "worker"})
         )
         captured = {}
 
-        def runner_factory(config, session_context=None, parent_runtime=None):
+        def runner_factory(
+            config,
+            session_context=None,
+            approval_session_key=None,
+            parent_runtime=None,
+        ):
             captured["parent_runtime"] = parent_runtime
+            captured["approval_session_key"] = approval_session_key
             return FakeRunner()
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -225,6 +231,7 @@ return await agent("do it", {"label": "worker"})
         self.assertEqual(final["status"], "completed")
         self.assertEqual(captured["parent_runtime"]["model"], "session-switched-model")
         self.assertEqual(captured["parent_runtime"]["api_key"], "session-secret")
+        self.assertEqual(captured["approval_session_key"], "tool-session")
         self.assertNotIn("parent_runtime", persisted)
         self.assertNotIn("session-secret", json.dumps(persisted))
 
@@ -251,7 +258,7 @@ return await agent("wait", {"label": "worker"})
                     launch,
                     re.MULTILINE,
                 ).group(1)
-                task_id = re.search(r"Task ID: (wg[a-z0-9]{7})", launch).group(1)
+                task_id = re.search(r"Workflow Task ID: (wg[a-z0-9]{7})", launch).group(1)
                 self.assertTrue(runner.started.wait(timeout=2))
 
                 out = json.loads(task_stop({"task_id": task_id}))
@@ -314,7 +321,7 @@ return await agent("wait", {"label": "worker"})
                     launch,
                     re.MULTILINE,
                 ).group(1)
-                task_id = re.search(r"Task ID: (wg[a-z0-9]{7})", launch).group(1)
+                task_id = re.search(r"Workflow Task ID: (wg[a-z0-9]{7})", launch).group(1)
                 self.assertTrue(runner.started.wait(timeout=2))
 
                 blocked = workflow(

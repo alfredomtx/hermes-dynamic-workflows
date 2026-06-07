@@ -1,15 +1,15 @@
 # Hermes Dynamic Workflows
 
-你现在可以在 Hermes 里用 **dynamic workflows** 了：让模型现写一段受限 Python 脚本，
+你现在可以在 Hermes 里用 **Dynamic Workflows** 了：让模型现写一段受限 Python 脚本，
 后台运行时执行它、用 `agent()/parallel()/pipeline()` 编排大量独立子代理——适合代码库
-审计、大规模迁移、交叉验证的研究。参考自 Claude Code 的 dynamic workflows。
+审计、大规模迁移、交叉验证的研究。参考自 [Dynamic Workflows in Claude Code](https://claude.com/blog/introducing-dynamic-workflows-in-claude-code)。
 
 ## 快速开始
 
 一行装好并启用：
 
 ```bash
-hermes plugins install <owner>/hermes-dynamic-workflows --enable && hermes tools enable workflow --platform cli
+hermes plugins install lingjiuu/hermes-dynamic-workflows --enable && hermes tools enable workflow --platform cli
 ```
 
 > gateway 平台把 `--platform cli` 换成 `telegram` 等，再 `hermes gateway restart`。
@@ -21,14 +21,16 @@ hermes plugins install <owner>/hermes-dynamic-workflows --enable && hermes tools
 `hermes plugins install` 只克隆插件、不安装它的 console 脚本，所以面板命令要单独装一次：
 
 ```bash
-python scripts/install-hermes-workflows.py   # 装到 ~/.local/bin
+python "${HERMES_HOME:-$HOME/.hermes}/plugins/dynamic-workflows/scripts/install-hermes-workflows.py"
+# 装到 ~/.local/bin
 ```
 
 之后在**另一个终端**运行 `hermes-workflows`，实时查看 run 列表、各 phase/agent 进度、
 每个子代理的 prompt 与产出，并用 `x` 停止、`p` 暂停/恢复、`r` 重启、`s` 导出 transcript。
 
 > 完整 JSON Schema 校验需要 `jsonschema`（装进运行 Hermes 的同一 Python 环境；缺失时
-> 用内置简易校验器）：`python -m pip install "jsonschema>=4,<5"`。
+> 用内置简易校验器）：
+> `uv pip install --python "$(head -n 1 "$(command -v hermes)" | sed 's/^#!//')" "jsonschema>=4,<5"`。
 
 ## 配置（可选）
 
@@ -49,9 +51,9 @@ plugins:
         keep_worktrees: false           # keep per-agent git worktrees instead of deleting them
         allow_model_override: true      # allow per-agent model routing via agent(model=...)
         require_launch_approval: true   # confirm before a top-level launch (deny if no channel)
-        child_approval_policy: inherit  # flagged cmd, no human present: inherit|smart|deny|approve|ask
+        child_approval_policy: inherit  # flagged cmd: inherit|smart|deny|approve|ask
         ask_fallback: smart             # what 'ask' degrades to with no human: smart|deny|approve
-        notify_on_complete: true        # inject <task-notification> on completion (CLI only)
+        notify_on_complete: true        # notify the launching CLI or gateway chat on completion
         notify_result_preview_chars: 2000   # truncate the result shown in the notification
 ```
 

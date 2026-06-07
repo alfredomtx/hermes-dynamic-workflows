@@ -20,11 +20,254 @@ calls return immediately, so the parent session and other agents are untouched.
 
 from __future__ import annotations
 
+import json
+import re
+import shlex
+import threading
 from typing import Any, Callable
 
 # Child task ids are minted as ``workflow-<uuid>`` by the runner.
 WORKFLOW_CHILD_PREFIX = "workflow-"
 TERMINAL_TOOLS = {"terminal"}
+_CHILD_OBSERVERS: dict[str, Callable[[dict[str, Any]], None]] = {}
+_CHILD_OBSERVERS_LOCK = threading.RLock()
+_READ_ONLY_REDIRECT_RE = re.compile(r'(?:^|\s)(?:[0-9]?>|[0-9]?>>|&>)\s*(["\']?)([^\s"\']+)\1')
+_MUTATING_SHELL_RE = re.compile(
+    r"\b("
+    r"rm|mv|cp|install|chmod|chown|mkdir|touch|tee|truncate|dd|mkfs|"
+    r"git\s+(?:reset|clean|checkout|switch|branch|commit|push|pull|merge|rebase)|"
+    r"npm\s+(?:install|add|remove|update)|"
+    r"pip(?:3)?\s+install|"
+    r"python(?:3)?\s+-m\s+pip\s+install"
+    r")\b",
+    re.IGNORECASE,
+)
+_PYTHON_WRITE_RE = re.compile(
+    r"\b("
+    r"open|exec|eval|compile|__import__|subprocess|os|pathlib|shutil|socket|requests|"
+    r"write|writelines|remove|unlink|rename|replace|rmdir|mkdir|chmod|chown|system|popen|spawn"
+    r")\b",
+    re.IGNORECASE,
+)
+_CURL_WRITE_FLAGS = {
+    "-o",
+    "--output",
+    "-O",
+    "--remote-name",
+    "--remote-header-name",
+    "-T",
+    "--upload-file",
+    "-d",
+    "--data",
+    "--data-raw",
+    "--data-binary",
+    "--data-urlencode",
+    "-F",
+    "--form",
+}
+_READ_ONLY_FILTER_COMMANDS = {
+    "cat",
+    "cut",
+    "grep",
+    "head",
+    "jq",
+    "rg",
+    "sed",
+    "sort",
+    "tail",
+    "tr",
+    "uniq",
+    "wc",
+}
+
+
+def register_child_observer(task_id: str, callback: Callable[[dict[str, Any]], None]) -> None:
+    if not task_id or not callable(callback):
+        return
+    with _CHILD_OBSERVERS_LOCK:
+        _CHILD_OBSERVERS[task_id] = callback
+
+
+def unregister_child_observer(task_id: str) -> None:
+    with _CHILD_OBSERVERS_LOCK:
+        _CHILD_OBSERVERS.pop(task_id, None)
+
+
+def _notify_child_observer(task_id: str, event: dict[str, Any]) -> None:
+    with _CHILD_OBSERVERS_LOCK:
+        callback = _CHILD_OBSERVERS.get(task_id)
+    if callback is None:
+        return
+    try:
+        callback(event)
+    except Exception:
+        pass
+
+
+def _tool_activity(tool_name: str, args: Any) -> str:
+    try:
+        rendered = json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False, default=str)
+    except Exception:
+        rendered = str(args or "")
+    if len(rendered) > 140:
+        rendered = rendered[:137] + "..."
+    return f"{tool_name}({rendered})"
+
+
+def is_obviously_read_only_terminal_command(command: str) -> bool:
+    """Return True for shell commands that only fetch/read/filter text.
+
+    This is intentionally conservative. It exists to avoid approval storms from
+    workflow research children that use shell pipelines for web/file reads,
+    while still keeping mutations, installs, writes, and arbitrary scripts on
+    the normal approval path.
+    """
+    raw = str(command or "").strip()
+    if not raw:
+        return False
+    lowered = raw.lower()
+    if any(token in lowered for token in ("<<", "$(", "`")):
+        return False
+    if _has_unquoted_command_separator(raw):
+        return False
+    if _MUTATING_SHELL_RE.search(raw):
+        return False
+    for match in _READ_ONLY_REDIRECT_RE.finditer(raw):
+        target = match.group(2)
+        if target not in {"/dev/null", "&1", "&2"}:
+            return False
+    parts = _split_pipeline(raw)
+    if not parts:
+        return False
+    return all(_is_read_only_pipeline_part(part, index) for index, part in enumerate(parts))
+
+
+def _split_pipeline(command: str) -> list[str]:
+    parts: list[str] = []
+    current: list[str] = []
+    quote = ""
+    escaped = False
+    for char in command:
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+        if char == "\\":
+            current.append(char)
+            escaped = True
+            continue
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = ""
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            current.append(char)
+            continue
+        if char == "|":
+            parts.append("".join(current).strip())
+            current = []
+            continue
+        current.append(char)
+    tail = "".join(current).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _has_unquoted_command_separator(command: str) -> bool:
+    quote = ""
+    escaped = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if char == "\\":
+            escaped = True
+            index += 1
+            continue
+        if quote:
+            if char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if char == ";":
+            return True
+        if command.startswith("&&", index) or command.startswith("||", index):
+            return True
+        index += 1
+    return False
+
+
+def _is_read_only_pipeline_part(part: str, index: int) -> bool:
+    try:
+        tokens = shlex.split(part)
+    except ValueError:
+        return False
+    tokens = _strip_env_prefix(tokens)
+    if not tokens:
+        return False
+    name = tokens[0].rsplit("/", 1)[-1]
+    if name in {"curl", "wget"}:
+        return _is_read_only_fetch(tokens)
+    if name in _READ_ONLY_FILTER_COMMANDS:
+        return _is_read_only_filter(name, tokens)
+    if name in {"python", "python3"}:
+        return index > 0 and _is_read_only_python(tokens)
+    return False
+
+
+def _strip_env_prefix(tokens: list[str]) -> list[str]:
+    while tokens and tokens[0] in {"env", "command"}:
+        tokens = tokens[1:]
+        while tokens and "=" in tokens[0] and not tokens[0].startswith("-"):
+            tokens = tokens[1:]
+    return tokens
+
+
+def _is_read_only_fetch(tokens: list[str]) -> bool:
+    for index, token in enumerate(tokens[1:], start=1):
+        if token in _CURL_WRITE_FLAGS:
+            return False
+        if token in {"-X", "--request"}:
+            method = tokens[index + 1].upper() if index + 1 < len(tokens) else ""
+            if method and method not in {"GET", "HEAD"}:
+                return False
+        if token.startswith("-X") and len(token) > 2 and token[2:].upper() not in {"GET", "HEAD"}:
+            return False
+        if token.startswith("--request=") and token.split("=", 1)[1].upper() not in {"GET", "HEAD"}:
+            return False
+    return True
+
+
+def _is_read_only_filter(name: str, tokens: list[str]) -> bool:
+    if name == "sed" and any(token.startswith("-i") or token == "--in-place" for token in tokens[1:]):
+        return False
+    if name == "rg" and any(token in {"--files-with-matches", "--files"} for token in tokens[1:]):
+        return True
+    return True
+
+
+def _is_read_only_python(tokens: list[str]) -> bool:
+    code = ""
+    for index, token in enumerate(tokens[1:], start=1):
+        if token == "-c" and index + 1 < len(tokens):
+            code = tokens[index + 1]
+            break
+        if token.startswith("-c") and len(token) > 2:
+            code = token[2:]
+            break
+    if not code:
+        return False
+    return not _PYTHON_WRITE_RE.search(code)
 
 
 def _block(description: str) -> dict[str, str]:
@@ -75,6 +318,14 @@ def evaluate_command_gate(
             return None  # user explicitly allowlisted this pattern
     except TypeError:
         pass
+
+    if is_obviously_read_only_terminal_command(command):
+        if on_allow is not None:
+            try:
+                on_allow(pattern_key)
+            except Exception:
+                pass
+        return None
 
     if policy == "ask":
         if has_gateway_channel:
@@ -182,9 +433,21 @@ def pre_tool_call_handler(
     task_id: str = "",
     **_: Any,
 ) -> dict[str, str] | None:
-    # Fast path: only workflow-child terminal commands are gated here.
+    # Observe every workflow-child tool call before applying the terminal-only
+    # command policy below. This provides live TUI progress even when Hermes'
+    # SessionDB has not flushed the child transcript yet.
     if not (isinstance(task_id, str) and task_id.startswith(WORKFLOW_CHILD_PREFIX)):
         return None
+    clean_tool_name = str(tool_name or "tool")
+    _notify_child_observer(
+        task_id,
+        {
+            "type": "tool_call",
+            "tool_name": clean_tool_name,
+            "args": args if isinstance(args, dict) else {},
+            "activity": _tool_activity(clean_tool_name, args),
+        },
+    )
     if tool_name not in TERMINAL_TOOLS:
         return None
     command = args.get("command") if isinstance(args, dict) else None

@@ -32,14 +32,14 @@ def render_screen(
     elif state.view == "agent" and workflows:
         lines = _render_agent(workflows[_clamp(state.run_index, len(workflows))], state, width, height)
     else:
-        lines = _render_list(workflows, state, width)
+        lines = _render_list(workflows, state, width, height)
     return _fit(lines, width, height)
 
 
-def _render_list(workflows: list[WorkflowView], state: RenderState, width: int) -> list[str]:
+def _render_list(workflows: list[WorkflowView], state: RenderState, width: int, height: int) -> list[str]:
     running = sum(workflow.running for workflow in workflows)
     completed = sum(workflow.status == "completed" for workflow in workflows)
-    lines = ["", "  Dynamic workflows", f"  {running} running . {completed} completed", ""]
+    lines = ["", "  Dynamic workflows", f"  {running} running · {completed} completed", ""]
     if not workflows:
         lines.extend(
             [
@@ -48,62 +48,73 @@ def _render_list(workflows: list[WorkflowView], state: RenderState, width: int) 
                 "  Start a workflow in Hermes, then this panel will refresh automatically.",
             ]
         )
+        lines.extend(
+            [""] * max(0, height - len(lines) - 2)
+        )
+        lines.extend(["", _footer("↑↓ select · Enter view · x stop · p pause/resume · r restart · s save · q close", state.message, width)])
+        return lines
+    selected_index = _clamp(state.run_index, len(workflows))
+    entries: list[list[str]] = []
     for index, workflow in enumerate(workflows):
-        selected = index == _clamp(state.run_index, len(workflows))
-        marker = ">" if selected else " "
-        lines.append(
+        selected = index == selected_index
+        marker = "›" if selected else " "
+        entry = [
             _crop(
                 f"  {marker} {_status_icon(workflow.status)} {workflow.name}  "
-                f"{len(workflow.agents)} agents . {_tokens(workflow.tokens)} tok . "
+                f"{len(workflow.agents)} agents · {_tokens(workflow.tokens)} tok · "
                 f"{_duration(workflow.duration_seconds)}",
                 width,
             )
-        )
+        ]
         if selected and workflow.description and workflow.description != workflow.name:
-            lines.append(_crop(f"      {workflow.description}", width))
-    lines.extend(["", _footer("Up/Down select . Enter view . x stop . p pause/resume . r restart . s save . q close", state.message, width)])
+            entry.append(_crop(f"      {workflow.description}", width))
+        entries.append(entry)
+    body_height = max(1, height - len(lines) - 2)
+    for entry in _window_entries(entries, selected_index, body_height):
+        lines.extend(entry)
+    lines.extend([""] * max(0, height - len(lines) - 2))
+    lines.extend(["", _footer("↑↓ select · Enter view · x stop · p pause/resume · r restart · s save · q close", state.message, width)])
     return lines
 
 
 def _render_workflow(workflow: WorkflowView, state: RenderState, width: int, height: int) -> list[str]:
     phase_index = _clamp(state.phase_index, len(workflow.phases))
     phase = workflow.phases[phase_index] if workflow.phases else PhaseView("Agents", ())
-    progress = f"{workflow.done}/{len(workflow.agents)} agents . {_duration(workflow.duration_seconds)}"
+    progress = f"{workflow.done}/{len(workflow.agents)} agents · {_duration(workflow.duration_seconds)}"
     header = [
         "",
-        _left_right(f"  {workflow.name}", progress + "  ", width),
-        _crop(f"  {workflow.description}", width),
+        _rule(width),
+        _crop(f"  {workflow.name}", width),
+        _left_right(f"  {workflow.description}", progress + "  ", width),
         "",
     ]
-    left_width = max(24, min(34, width // 4))
+    left_width = max(18, min(24, width // 5))
     right_width = max(20, width - left_width - 5)
     body_height = max(5, height - len(header) - 3)
 
     left = []
     for index, item in enumerate(workflow.phases):
-        marker = ">" if index == phase_index else " "
+        marker = "›" if index == phase_index else " "
         suffix = "not started" if not item.agents else f"{item.done}/{len(item.agents)}"
-        left.append(f"{marker} {index + 1} {item.title} {suffix}")
+        phase_icon = "✓" if item.agents and item.done == len(item.agents) else str(index + 1)
+        left.append(f"{marker} {phase_icon} {item.title} {suffix}")
+    left = _window_lines(left, phase_index, body_height)
     right = []
     if not phase.agents:
         right.append("Not started yet")
     for agent in phase.agents:
-        right.append(
-            f"{_status_icon(agent.status)} {agent.label}"
-            + (f"  {agent.model}" if agent.model else "")
-            + f"  {_tokens(agent.tokens)} tok . {agent.tool_calls} tools"
-        )
+        right.append(_agent_row(agent, right_width - 2, selected=False))
     panel = _two_panel(
         "Phases",
         left,
-        f"{phase.title} . {len(phase.agents)} agents",
+        f"{phase.title} · {len(phase.agents)} agents",
         right,
         left_width=left_width,
         right_width=right_width,
         height=body_height,
     )
     return header + panel + [
-        _footer("Up/Down phase . Enter agent . x stop . p pause/resume . r restart . s save . Esc back", state.message, width)
+        _footer("↑↓ phase · Enter agent · x stop · p pause/resume · r restart · s save · Esc back", state.message, width)
     ]
 
 
@@ -113,22 +124,24 @@ def _render_agent(workflow: WorkflowView, state: RenderState, width: int, height
     agents = list(phase.agents)
     agent_index = _clamp(state.agent_index, len(agents))
     agent = agents[agent_index] if agents else None
-    progress = f"{workflow.done}/{len(workflow.agents)} agents . {_duration(workflow.duration_seconds)}"
+    progress = f"{workflow.done}/{len(workflow.agents)} agents · {_duration(workflow.duration_seconds)}"
     header = [
         "",
-        _left_right(f"  {workflow.name}", progress + "  ", width),
-        _crop(f"  {workflow.description}", width),
+        _rule(width),
+        _crop(f"  {workflow.name}", width),
+        _left_right(f"  {workflow.description}", progress + "  ", width),
         "",
     ]
-    left_width = max(30, min(42, width // 3))
+    left_width = max(22, min(28, width // 4))
     right_width = max(20, width - left_width - 5)
     body_height = max(5, height - len(header) - 3)
     left = [
-        f"{'>' if index == agent_index else ' '} {_status_icon(item.status)} {item.label}"
+        f"{'›' if index == agent_index else ' '} {_status_icon(item.status)} {item.label}"
         for index, item in enumerate(agents)
     ]
+    left = _window_lines(left, agent_index, body_height)
     panel = _two_panel(
-        f"{phase.title} . {len(agents)} agents",
+        f"{phase.title} · {len(agents)} agents",
         left,
         agent.label if agent else "Agent",
         _agent_detail(agent, right_width - 2),
@@ -137,7 +150,7 @@ def _render_agent(workflow: WorkflowView, state: RenderState, width: int, height
         height=body_height,
     )
     return header + panel + [
-        _footer("Up/Down agent . x stop . p pause/resume . r restart . s save . Esc back", state.message, width)
+        _footer("↑↓ agent · x stop · p pause/resume · r restart · s save · Esc back", state.message, width)
     ]
 
 
@@ -145,20 +158,36 @@ def _agent_detail(agent: AgentView | None, width: int) -> list[str]:
     if agent is None:
         return ["No agents in this phase."]
     lines = [
-        f"{_status_label(agent.status)}" + (f" . {agent.model}" if agent.model else ""),
-        f"{_tokens(agent.tokens)} tok . {agent.tool_calls} tool calls",
+        f"{_status_label(agent.status)}" + (f" · {agent.model}" if agent.model else ""),
+        f"{_tokens(agent.tokens)} tok · {agent.tool_calls} tool calls",
         "",
-        f"Prompt . {len(agent.prompt.splitlines()) or 1} lines",
+        f"Prompt · {len(agent.prompt.splitlines()) or 1} lines",
     ]
-    lines.extend(_wrapped_preview(agent.prompt, width, 4))
-    lines.extend(["", f"Activity . last {min(3, len(agent.activity))} of {len(agent.activity)}"])
+    lines.extend("  " + item for item in _wrapped_preview(agent.prompt, max(8, width - 2), 4))
+    lines.extend(["", f"Activity · last {min(3, len(agent.activity))} of {len(agent.activity)}"])
     if agent.activity:
-        lines.extend(_crop(item, width) for item in agent.activity[-3:])
+        lines.extend("  " + _crop(item, max(8, width - 2)) for item in agent.activity[-3:])
     else:
-        lines.append("No tool activity yet")
+        lines.append("  No tool activity yet")
     lines.extend(["", "Outcome"])
-    lines.extend(_wrapped_preview(agent.outcome, width, 5))
+    lines.extend("  " + item for item in _wrapped_preview(agent.outcome, max(8, width - 2), 7))
     return lines
+
+
+def _agent_row(agent: AgentView, width: int, *, selected: bool) -> str:
+    marker = "›" if selected else " "
+    metrics = f"{_tokens(agent.tokens)} tok · {agent.tool_calls} tools"
+    metrics_width = _display_width(metrics)
+    available = max(8, width - metrics_width - 1)
+    label = f"{marker}{_status_icon(agent.status)} {agent.label}"
+    model = agent.model
+    if model:
+        model_width = min(18, max(8, available // 4))
+        label_width = max(8, available - model_width - 2)
+        left = f"{_pad(_crop(label, label_width), label_width)}  {_crop(model, model_width)}"
+    else:
+        left = _crop(label, available)
+    return f"{_pad(left, available)} {metrics}"
 
 
 def _two_panel(
@@ -204,6 +233,50 @@ def _fit(lines: list[str], width: int, height: int) -> list[str]:
 
 def _footer(default: str, message: str, width: int) -> str:
     return _crop(f"  {message or default}", width)
+
+
+def _rule(width: int) -> str:
+    return "  " + "─" * max(0, width - 4)
+
+
+def _window_entries(entries: list[list[str]], selected_index: int, height: int) -> list[list[str]]:
+    if not entries or height <= 0:
+        return []
+    selected_index = _clamp(selected_index, len(entries))
+    if len(entries[selected_index]) > height:
+        return [[entries[selected_index][0]]]
+    start = selected_index
+    end = selected_index + 1
+    used = len(entries[selected_index])
+    prefer_before = True
+    while True:
+        directions = ("before", "after") if prefer_before else ("after", "before")
+        added = False
+        for direction in directions:
+            candidate = entries[start - 1] if direction == "before" and start > 0 else None
+            if direction == "after" and end < len(entries):
+                candidate = entries[end]
+            if candidate is None or used + len(candidate) > height:
+                continue
+            if direction == "before":
+                start -= 1
+            else:
+                end += 1
+            used += len(candidate)
+            prefer_before = not prefer_before
+            added = True
+            break
+        if not added:
+            break
+    return entries[start:end]
+
+
+def _window_lines(lines: list[str], selected_index: int, height: int) -> list[str]:
+    if len(lines) <= height:
+        return lines
+    selected_index = _clamp(selected_index, len(lines))
+    start = max(0, min(selected_index - height // 2, len(lines) - height))
+    return lines[start:start + height]
 
 
 def _left_right(left: str, right: str, width: int) -> str:

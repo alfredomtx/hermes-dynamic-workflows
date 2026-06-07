@@ -194,16 +194,30 @@ def main() -> int:
 def _run_curses(screen: Any, controller: TuiController, curses: Any) -> None:
     _configure_curses(screen, curses)
     last_refresh = 0.0
+    last_frame: list[str] | None = None
+    last_size: tuple[int, int] | None = None
+    dirty = True
     while not controller.should_exit:
         now = time.monotonic()
         if now - last_refresh >= REFRESH_SECONDS:
             controller.refresh()
             last_refresh = now
+            dirty = True
         height, width = screen.getmaxyx()
-        _draw(screen, controller.frame(width, height), curses)
+        size = (height, width)
+        if size != last_size:
+            last_size = size
+            dirty = True
+        if dirty:
+            frame = controller.frame(width, height)
+            if frame != last_frame:
+                _draw(screen, frame, curses)
+                last_frame = frame
+            dirty = False
         key = screen.getch()
         if key != -1:
             controller.handle_key(_key_name(key, curses))
+            dirty = True
 
 
 def _configure_curses(screen: Any, curses: Any) -> None:
@@ -222,7 +236,7 @@ def _configure_curses(screen: Any, curses: Any) -> None:
 
 
 def _draw(screen: Any, lines: list[str], curses: Any) -> None:
-    screen.erase()
+    screen.clear()
     height, width = screen.getmaxyx()
     for row, line in enumerate(lines[:height]):
         attr = 0
@@ -231,7 +245,7 @@ def _draw(screen: Any, lines: list[str], curses: Any) -> None:
             attr = curses.color_pair(1) | curses.A_BOLD
         elif "✓" in line:
             attr = curses.color_pair(2)
-        elif stripped.startswith(">") or "│>" in line:
+        elif stripped.startswith((">", "›")) or "│>" in line or "│›" in line:
             attr = curses.A_BOLD
         elif "!" in line:
             attr = curses.color_pair(3)

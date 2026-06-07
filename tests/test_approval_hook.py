@@ -4,7 +4,10 @@ import unittest
 
 from hermes_dynamic_workflows.adapters.hooks import (
     evaluate_command_gate,
+    is_obviously_read_only_terminal_command,
     pre_tool_call_handler,
+    register_child_observer,
+    unregister_child_observer,
 )
 
 
@@ -129,8 +132,75 @@ class CommandGateTests(unittest.TestCase):
         )
         self.assertEqual(result["action"], "block")
 
+    def test_read_only_retrieval_command_bypasses_prompt_policy(self):
+        seen = []
+        command = (
+            "curl -sL https://example.test/feed.xml 2>/dev/null | "
+            "python3 -c \"import sys, re; data = sys.stdin.read(); print(re.findall('x', data))\""
+        )
+        result = evaluate_command_gate(
+            command,
+            classify=_dangerous,
+            allowlist=set(),
+            policy="deny",
+            smart_approve=_deny,
+            on_allow=seen.append,
+        )
+        self.assertIsNone(result)
+        self.assertEqual(seen, ["delete in root path"])
+
+
+class ReadOnlyTerminalDetectionTests(unittest.TestCase):
+    def test_allows_fetch_and_parse_pipeline(self):
+        command = (
+            "curl -sL https://example.test/feed.xml 2>/dev/null | "
+            "python3 -c \"import sys, json; data = sys.stdin.read(); print(data[:100])\""
+        )
+        self.assertTrue(is_obviously_read_only_terminal_command(command))
+
+    def test_rejects_fetch_writing_to_file(self):
+        self.assertFalse(is_obviously_read_only_terminal_command("curl -sL https://example.test -o out.html"))
+
+    def test_rejects_python_writing_file(self):
+        command = "curl -sL https://example.test | python3 -c \"open('x', 'w').write('bad')\""
+        self.assertFalse(is_obviously_read_only_terminal_command(command))
+
+    def test_rejects_mutating_command_chain(self):
+        self.assertFalse(is_obviously_read_only_terminal_command("curl -sL https://example.test && rm -rf build"))
+
 
 class HandlerFastPathTests(unittest.TestCase):
+    def test_observes_all_workflow_child_tool_calls(self):
+        events = []
+        register_child_observer("workflow-observed", events.append)
+        try:
+            self.assertIsNone(
+                pre_tool_call_handler(
+                    tool_name="web_search",
+                    args={"query": "dynamic workflows"},
+                    task_id="workflow-observed",
+                )
+            )
+        finally:
+            unregister_child_observer("workflow-observed")
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["tool_name"], "web_search")
+        self.assertIn("dynamic workflows", events[0]["activity"])
+
+    def test_unregister_stops_observation(self):
+        events = []
+        register_child_observer("workflow-observed", events.append)
+        unregister_child_observer("workflow-observed")
+
+        pre_tool_call_handler(
+            tool_name="web_search",
+            args={"query": "x"},
+            task_id="workflow-observed",
+        )
+
+        self.assertEqual(events, [])
+
     def test_ignores_non_workflow_task(self):
         # Non-workflow task_id short-circuits before any classification.
         self.assertIsNone(

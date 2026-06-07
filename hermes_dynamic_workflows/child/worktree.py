@@ -19,6 +19,7 @@ class WorkspaceLease:
     path: str | None = None
     branch: str | None = None
     repo_root: str | None = None
+    base_commit: str | None = None
     keep: bool = False
 
     def cleanup(self) -> None:
@@ -29,15 +30,17 @@ class WorkspaceLease:
         wt_path = Path(self.path)
         if not wt_path.exists():
             return
-        if _worktree_has_changes(wt_path):
+        if _worktree_has_changes(wt_path, self.base_commit):
             return
-        subprocess.run(
+        removed = subprocess.run(
             ["git", "worktree", "remove", "--force", str(wt_path)],
             cwd=self.repo_root,
             capture_output=True,
             text=True,
             timeout=30,
         )
+        if removed.returncode != 0:
+            return
         if self.branch:
             subprocess.run(
                 ["git", "branch", "-D", self.branch],
@@ -46,6 +49,10 @@ class WorkspaceLease:
                 text=True,
                 timeout=30,
             )
+        try:
+            wt_path.parent.rmdir()
+        except OSError:
+            pass
 
 
 def create_workspace_lease(
@@ -66,6 +73,9 @@ def create_workspace_lease(
     repo_root = _git_repo_root(base_cwd)
     if not repo_root:
         raise ValueError("isolation='worktree' requires running inside a git repository")
+    base_commit = _git_head(repo_root)
+    if not base_commit:
+        raise ValueError("isolation='worktree' requires a git repository with at least one commit")
 
     short_id = uuid.uuid4().hex[:8]
     safe_label = _safe_label(label)
@@ -73,11 +83,11 @@ def create_workspace_lease(
     branch = f"hermes/{wt_name}"
     worktrees_dir = Path(repo_root) / ".worktrees"
     worktrees_dir.mkdir(parents=True, exist_ok=True)
-    _ensure_gitignore(repo_root)
+    _ensure_worktree_excluded(repo_root)
     wt_path = worktrees_dir / wt_name
 
     result = subprocess.run(
-        ["git", "worktree", "add", str(wt_path), "-b", branch, "HEAD"],
+        ["git", "worktree", "add", str(wt_path), "-b", branch, base_commit],
         cwd=repo_root,
         capture_output=True,
         text=True,
@@ -94,6 +104,7 @@ def create_workspace_lease(
         path=str(wt_path),
         branch=branch,
         repo_root=repo_root,
+        base_commit=base_commit,
         keep=keep_worktree,
     )
 
@@ -114,14 +125,43 @@ def _git_repo_root(cwd: str) -> str | None:
     return str(Path(result.stdout.strip()).expanduser().resolve())
 
 
-def _ensure_gitignore(repo_root: str) -> None:
-    gitignore = Path(repo_root) / ".gitignore"
+def _git_head(repo_root: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _ensure_worktree_excluded(repo_root: str) -> None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--git-path", "info/exclude"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return
+    if result.returncode != 0 or not result.stdout.strip():
+        return
+    exclude = Path(result.stdout.strip())
+    if not exclude.is_absolute():
+        exclude = Path(repo_root) / exclude
     entry = ".worktrees/"
     try:
-        existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+        existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
         if entry in existing.splitlines():
             return
-        with gitignore.open("a", encoding="utf-8") as handle:
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        with exclude.open("a", encoding="utf-8") as handle:
             if existing and not existing.endswith("\n"):
                 handle.write("\n")
             handle.write(entry + "\n")
@@ -168,11 +208,10 @@ def _copy_worktree_includes(repo_root: Path, wt_path: Path) -> None:
                     raise
 
 
-def _worktree_has_changes(wt_path: Path) -> bool:
-    checks = [
-        ["git", "status", "--porcelain"],
-        ["git", "log", "--oneline", "HEAD", "--not", "--remotes"],
-    ]
+def _worktree_has_changes(wt_path: Path, base_commit: str | None) -> bool:
+    checks = [["git", "status", "--porcelain"]]
+    if base_commit:
+        checks.append(["git", "rev-list", "--count", f"{base_commit}..HEAD"])
     for command in checks:
         try:
             result = subprocess.run(
@@ -186,7 +225,11 @@ def _worktree_has_changes(wt_path: Path) -> bool:
             return True
         if result.returncode != 0:
             return True
-        if result.stdout.strip():
+        output = result.stdout.strip()
+        if command[1] == "rev-list":
+            if output != "0":
+                return True
+        elif output:
             return True
     return False
 

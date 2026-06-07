@@ -153,6 +153,29 @@ class WorkflowAPI:
             _apply_child_metadata(record, metadata)
             self._notify()
 
+        def on_child_update(metadata: dict[str, Any]) -> None:
+            with self._lock:
+                _apply_child_metadata(record, metadata)
+                activity = metadata.get("activity") if isinstance(metadata, dict) else None
+                if activity:
+                    self._journal(
+                        {
+                            "type": "activity",
+                            "agentId": str(agent_id),
+                            "activity": str(activity),
+                        }
+                    )
+                approval = metadata.get("approval") if isinstance(metadata, dict) else None
+                if isinstance(approval, dict):
+                    self._journal(
+                        {
+                            "type": "approval",
+                            "agentId": str(agent_id),
+                            **approval,
+                        }
+                    )
+                self._notify()
+
         request = ChildAgentRequest(
             id=agent_id,
             prompt=prompt,
@@ -166,6 +189,7 @@ class WorkflowAPI:
             cwd=self.frame.cwd,
             structured_tool=bool(schema),
             on_start=on_child_start,
+            on_update=on_child_update,
             resolved=resolved,
         )
         if schema:
@@ -249,10 +273,8 @@ class WorkflowAPI:
             except Exception as exc:
                 record.attempts = attempt + 1
                 record.status = "error"
-                record.tokens = accumulated_tokens
+                record.tokens = max(record.tokens, accumulated_tokens)
                 record.error = f"{type(exc).__name__}: {exc}"
-                with self._lock:
-                    self.frame.errors.append(f"{label}: {record.error}")
                 self._journal(
                     {
                         "type": "error",
@@ -297,8 +319,9 @@ class WorkflowAPI:
         except Exception as exc:
             message = f"parallel[{index}] failed: {type(exc).__name__}: {exc}"
             self.log(message)
-            with self._lock:
-                self.frame.errors.append(message)
+            if not isinstance(exc, ChildAgentError):
+                with self._lock:
+                    self.frame.errors.append(message)
             return None
 
     async def pipeline(self, items: list[Any], *stages: Callable[[Any, Any, int], Any]) -> list[Any]:
@@ -320,8 +343,9 @@ class WorkflowAPI:
             except Exception as exc:
                 message = f"pipeline[{index}] failed: {type(exc).__name__}: {exc}"
                 self.log(message)
-                with self._lock:
-                    self.frame.errors.append(message)
+                if not isinstance(exc, ChildAgentError):
+                    with self._lock:
+                        self.frame.errors.append(message)
                 return None
             return current
 

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+import asyncio
 import json
 import os
 import sqlite3
@@ -695,6 +696,83 @@ return await agent("do it", {"label": "worker"})
         self.assertNotIn("<errors>", msg)
         self.assertTrue(msg.strip().endswith("</task-notification>"))
         self.assertTrue(Path(final["outputFile"]).is_file())
+
+    def test_gateway_completion_sends_chat_notification_when_inject_unavailable(self):
+        script = """
+meta = {"name": "gateway-notify", "description": "Gateway notification test"}
+
+return await agent("do it", {"label": "worker"})
+"""
+
+        class FakeAdapter:
+            def __init__(self):
+                self.sent = []
+
+            async def send(self, chat_id, content, metadata=None):
+                self.sent.append((chat_id, content, metadata))
+                return SimpleNamespace(success=True)
+
+        adapter = FakeAdapter()
+        runner = SimpleNamespace(
+            adapters={"telegram": adapter},
+            _gateway_loop=object(),
+            _session_sources={
+                "agent:main:telegram:dm:chat-1": SimpleNamespace(
+                    platform="telegram",
+                    chat_id="chat-1",
+                    thread_id=None,
+                    message_id="message-1",
+                )
+            },
+            _thread_metadata_for_source=lambda source, reply_to_message_id=None: {"reply": reply_to_message_id},
+        )
+
+        def schedule(coro, loop, **kwargs):
+            result = asyncio.run(coro)
+            future = Future()
+            future.set_result(result)
+            return future
+
+        agent_pkg = ModuleType("agent")
+        async_utils = ModuleType("agent.async_utils")
+        async_utils.safe_schedule_threadsafe = schedule
+        agent_pkg.async_utils = async_utils
+        session_context = {
+            "platform": "telegram",
+            "chat_id": "chat-1",
+            "session_key": "agent:main:telegram:dm:chat-1",
+            "message_id": "message-1",
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig(require_launch_approval=False))
+            with (
+                patch(
+                    "hermes_dynamic_workflows.child.runner.HermesChildAgentRunner",
+                    return_value=CountingRunner(),
+                ),
+                patch(
+                    "hermes_dynamic_workflows.host.gateway.gateway_runner_ref",
+                    return_value=runner,
+                ),
+                patch.dict(sys.modules, {"agent": agent_pkg, "agent.async_utils": async_utils}),
+            ):
+                rec = manager.start_from_params(
+                    {"script": script},
+                    cwd=tmp,
+                    host_session_id="gateway-test-session",
+                    session_context_override=session_context,
+                )
+                final = manager.wait(rec["runId"], timeout=2)
+
+        self.assertEqual(final["status"], "completed")
+        self.assertEqual(len(adapter.sent), 1)
+        chat_id, content, metadata = adapter.sent[0]
+        self.assertEqual(chat_id, "chat-1")
+        self.assertIn("Workflow completed: Gateway notification test", content)
+        self.assertIn("Result:\n", content)
+        self.assertIn("worker", content)
+        self.assertEqual(metadata, {"reply": "message-1", "notify": True})
 
     def test_runtime_failure_injects_failed_task_notification_without_result(self):
         script = """

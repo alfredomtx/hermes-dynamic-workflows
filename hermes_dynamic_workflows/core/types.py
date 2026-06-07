@@ -236,6 +236,7 @@ class ChildAgentRequest:
     request_overrides: dict[str, Any] | None = None
     structured_tool: bool = False
     on_start: Callable[[dict[str, Any]], None] | None = None
+    on_update: Callable[[dict[str, Any]], None] | None = None
     resolved: ResolvedAgentSpec | None = None
 
 

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import threading
+import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,6 +56,7 @@ class ManagedRun:
     child_runner: Any = None
     plugin_context: Any = None
     session_context: dict[str, str] | None = None
+    approval_callback: Any = field(default=None, repr=False)
     parent_runtime: dict[str, Any] | None = field(default=None, repr=False)
     transcript_exporter: "LiveTranscriptExporter | None" = None
     lock: threading.RLock = field(default_factory=threading.RLock)
@@ -116,6 +118,7 @@ class WorkflowRunManager:
         restart_from_run_id: str | None = None,
         token_budget_total_override: int | None = None,
         session_context_override: dict[str, str] | None = None,
+        approval_callback_override: Any = None,
         parent_runtime_override: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         config = self.config
@@ -169,6 +172,11 @@ class WorkflowRunManager:
             if session_context_override is not None
             else _capture_gateway_session_context()
         )
+        approval_callback = (
+            approval_callback_override
+            if approval_callback_override is not None
+            else _capture_cli_approval_callback()
+        )
         parent_runtime = (
             dict(parent_runtime_override)
             if parent_runtime_override is not None
@@ -215,6 +223,7 @@ class WorkflowRunManager:
             record=record,
             plugin_context=plugin_context,
             session_context=session_context,
+            approval_callback=approval_callback,
             parent_runtime=parent_runtime,
         )
 
@@ -405,6 +414,7 @@ class WorkflowRunManager:
             restart_from_run_id=run_id,
             token_budget_total_override=record.get("tokenBudget"),
             session_context_override=managed.session_context if managed is not None else None,
+            approval_callback_override=managed.approval_callback if managed is not None else None,
             parent_runtime_override=managed.parent_runtime if managed is not None else None,
         )
 
@@ -522,11 +532,14 @@ class WorkflowRunManager:
         try:
             from ..child.runner import HermesChildAgentRunner
 
-            managed.child_runner = HermesChildAgentRunner(
-                config,
-                session_context=session_context,
-                parent_runtime=managed.parent_runtime,
-            )
+            runner_kwargs = {
+                "session_context": session_context,
+                "approval_session_key": _workflow_approval_session_key(managed, session_context),
+                "parent_runtime": managed.parent_runtime,
+            }
+            if managed.approval_callback is not None:
+                runner_kwargs["approval_callback"] = managed.approval_callback
+            managed.child_runner = HermesChildAgentRunner(config, **runner_kwargs)
             self._update(
                 managed,
                 status="paused" if managed.pause_gate.is_paused else "running",
@@ -580,7 +593,7 @@ class WorkflowRunManager:
         finally:
             self._stop_live_transcript_exporter(managed)
             self._finalize_completion_artifacts(managed)
-            _notify_completion(plugin_context, managed.record, config)
+            _notify_completion(plugin_context, managed.record, config, managed.session_context)
 
     def _finalize_completion_artifacts(self, managed: ManagedRun) -> None:
         with managed.lock:
@@ -859,6 +872,30 @@ def _get_hermes_session_env(name: str) -> str:
         return os.getenv(name, "").strip()
 
 
+def _capture_cli_approval_callback() -> Any:
+    """Capture the live CLI approval UI for background workflow children."""
+    if (os.environ.get("HERMES_INTERACTIVE") or "").strip().lower() not in ("1", "true", "yes", "on"):
+        return None
+    try:
+        from tools.terminal_tool import _get_approval_callback
+
+        callback = _get_approval_callback()
+        return callback if callable(callback) else None
+    except Exception:
+        return None
+
+
+def _workflow_approval_session_key(
+    managed: ManagedRun,
+    session_context: dict[str, str] | None,
+) -> str:
+    return str(
+        (session_context or {}).get("session_key")
+        or managed.record.get("workflowSessionId")
+        or managed.run_id
+    )
+
+
 def _approve_launch(meta: dict[str, Any], config: PluginConfig, plugin_context: Any) -> tuple[bool, str]:
     """Gate a top-level workflow launch when ``require_launch_approval`` is on.
 
@@ -887,7 +924,8 @@ def _approve_launch(meta: dict[str, Any], config: PluginConfig, plugin_context: 
             notify_cb = _approval._gateway_notify_cbs.get(session_key)
             if notify_cb is None:
                 return False, "launch approval required but no gateway approval channel is registered"
-            decision = _approval._await_gateway_decision(
+            decision = _await_gateway_launch_decision(
+                _approval,
                 session_key,
                 notify_cb,
                 {
@@ -896,7 +934,6 @@ def _approve_launch(meta: dict[str, Any], config: PluginConfig, plugin_context: 
                     "pattern_keys": ["workflow_launch"],
                     "description": human,
                 },
-                surface="gateway",
             )
             ok = bool(decision.get("resolved")) and decision.get("choice") not in (None, "deny")
             return (True, "") if ok else (False, "workflow launch was denied or timed out")
@@ -924,6 +961,97 @@ def _approve_launch(meta: dict[str, Any], config: PluginConfig, plugin_context: 
     )
 
 
+def _await_gateway_launch_decision(_approval: Any, session_key: str, notify_cb: Any, data: dict[str, Any]) -> dict[str, Any]:
+    legacy_wait = getattr(_approval, "_await_gateway_decision", None)
+    if callable(legacy_wait):
+        return legacy_wait(session_key, notify_cb, data, surface="gateway")
+
+    entry_cls = getattr(_approval, "_ApprovalEntry", None)
+    lock = getattr(_approval, "_lock", None)
+    queues = getattr(_approval, "_gateway_queues", None)
+    if entry_cls is None or lock is None or not isinstance(queues, dict):
+        raise RuntimeError("Hermes gateway approval queue API is unavailable")
+
+    entry = entry_cls(data)
+    with lock:
+        queues.setdefault(session_key, []).append(entry)
+
+    fire_hook = getattr(_approval, "_fire_approval_hook", None)
+    if callable(fire_hook):
+        fire_hook(
+            "pre_approval_request",
+            command=data.get("command", ""),
+            description=data.get("description", ""),
+            pattern_key=data.get("pattern_key", ""),
+            pattern_keys=list(data.get("pattern_keys") or []),
+            session_key=session_key,
+            surface="gateway",
+        )
+
+    try:
+        notify_cb(data)
+    except Exception:
+        with lock:
+            queue = queues.get(session_key, [])
+            if entry in queue:
+                queue.remove(entry)
+            if not queue:
+                queues.pop(session_key, None)
+        raise
+
+    timeout = 300
+    get_config = getattr(_approval, "_get_approval_config", None)
+    if callable(get_config):
+        try:
+            timeout = int((get_config() or {}).get("gateway_timeout", timeout))
+        except (TypeError, ValueError):
+            timeout = 300
+
+    touch_activity_if_due = None
+    now = time.monotonic()
+    activity_state: dict[str, Any] = {"start": now, "last_touch": now}
+    try:
+        from tools.environments.base import touch_activity_if_due as _touch_activity_if_due
+
+        touch_activity_if_due = _touch_activity_if_due
+    except Exception:
+        pass
+
+    resolved = False
+    deadline = time.monotonic() + max(0, timeout)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        if entry.event.wait(timeout=min(1.0, remaining)):
+            resolved = True
+            break
+        if touch_activity_if_due is not None:
+            touch_activity_if_due(activity_state, "waiting for workflow launch approval")
+
+    with lock:
+        queue = queues.get(session_key, [])
+        if entry in queue:
+            queue.remove(entry)
+        if not queue:
+            queues.pop(session_key, None)
+
+    choice = entry.result
+    if callable(fire_hook):
+        fire_hook(
+            "post_approval_response",
+            command=data.get("command", ""),
+            description=data.get("description", ""),
+            pattern_key=data.get("pattern_key", ""),
+            pattern_keys=list(data.get("pattern_keys") or []),
+            session_key=session_key,
+            surface="gateway",
+            choice=(choice if resolved and choice else "timeout"),
+        )
+
+    return {"resolved": resolved and choice is not None, "choice": choice}
+
+
 def _capture_gateway_session_context() -> dict[str, str] | None:
     """Capture the launching gateway session vars (parent context only).
 
@@ -947,25 +1075,167 @@ def _capture_gateway_session_context() -> dict[str, str] | None:
         "user_id": "HERMES_SESSION_USER_ID",
         "user_name": "HERMES_SESSION_USER_NAME",
         "session_key": "HERMES_SESSION_KEY",
+        "message_id": "HERMES_SESSION_MESSAGE_ID",
     }
     return {field: host_gateway.raw_session_env(env, "") for field, env in keys.items()}
 
 
-def _notify_completion(plugin_context: Any, record: dict[str, Any], config: PluginConfig) -> None:
+def _notify_completion(
+    plugin_context: Any,
+    record: dict[str, Any],
+    config: PluginConfig,
+    session_context: dict[str, str] | None = None,
+) -> None:
     """On terminal state, inject a Claude-Code-style <task-notification> into the
     conversation so the model can deliver the result without the user polling
-    /workflows. Best-effort and CLI-only: ctx.inject_message returns False in
-    gateway mode; any failure is swallowed so it never affects the run.
+    /workflows. In gateway mode, where CLI injection is unavailable after the
+    parent turn returns, send a concise completion message to the origin chat.
+    Best effort: any failure is swallowed so it never affects the run.
     """
-    if not config.notify_on_complete or plugin_context is None:
+    if not config.notify_on_complete:
         return
-    inject = getattr(plugin_context, "inject_message", None)
-    if not callable(inject):
-        return
+    notification = _render_task_notification(record, config.notify_result_preview_chars)
+    injected = False
+    inject = getattr(plugin_context, "inject_message", None) if plugin_context is not None else None
     try:
-        inject(_render_task_notification(record, config.notify_result_preview_chars))
+        if callable(inject):
+            injected = bool(inject(notification))
     except Exception:
         pass
+    if injected:
+        return
+    _send_gateway_completion_notification(record, config, session_context)
+
+
+def _send_gateway_completion_notification(
+    record: dict[str, Any],
+    config: PluginConfig,
+    session_context: dict[str, str] | None,
+) -> None:
+    context = dict(session_context or {})
+    platform = str(context.get("platform") or "").strip().lower()
+    chat_id = str(context.get("chat_id") or "").strip()
+    if not platform or not chat_id:
+        return
+
+    try:
+        from agent.async_utils import safe_schedule_threadsafe
+        from ..host import gateway as host_gateway
+
+        runner = host_gateway.gateway_runner_ref()
+        if runner is None:
+            return
+        adapter_key, adapter = _gateway_adapter_for_platform(runner, platform)
+        if adapter is None:
+            return
+
+        source = _gateway_source_for_context(runner, context)
+        if source is not None:
+            chat_id = str(getattr(source, "chat_id", chat_id) or chat_id)
+            metadata = _gateway_thread_metadata(runner, source=source, adapter=adapter)
+        else:
+            metadata = _gateway_thread_metadata(runner, context=context, adapter_key=adapter_key, adapter=adapter)
+        if metadata is None:
+            metadata = {}
+        else:
+            metadata = dict(metadata)
+        metadata["notify"] = True
+
+        loop = getattr(runner, "_gateway_loop", None)
+        if loop is None:
+            return
+        future = safe_schedule_threadsafe(
+            adapter.send(chat_id, _render_gateway_completion_message(record, config), metadata=metadata),
+            loop,
+        )
+        if future is not None:
+            future.result(timeout=15)
+    except Exception:
+        pass
+
+
+def _gateway_adapter_for_platform(runner: Any, platform: str) -> tuple[Any, Any]:
+    adapters = getattr(runner, "adapters", None)
+    if not isinstance(adapters, dict):
+        return None, None
+    for key, adapter in adapters.items():
+        value = str(getattr(key, "value", key) or "").lower()
+        if value == platform:
+            return key, adapter
+    return None, None
+
+
+def _gateway_source_for_context(runner: Any, context: dict[str, str]) -> Any:
+    session_key = str(context.get("session_key") or "").strip()
+    sources = getattr(runner, "_session_sources", None)
+    if session_key and hasattr(sources, "get"):
+        try:
+            source = sources.get(session_key)
+        except Exception:
+            source = None
+        if source is not None:
+            return source
+    return None
+
+
+def _gateway_thread_metadata(
+    runner: Any,
+    *,
+    source: Any | None = None,
+    context: dict[str, str] | None = None,
+    adapter_key: Any = None,
+    adapter: Any = None,
+) -> dict[str, Any] | None:
+    if source is not None:
+        method = getattr(runner, "_thread_metadata_for_source", None)
+        if callable(method):
+            try:
+                return method(source, getattr(source, "message_id", None))
+            except Exception:
+                pass
+    context = context or {}
+    thread_id = str(context.get("thread_id") or "").strip()
+    if not thread_id:
+        return None
+    method = getattr(runner, "_thread_metadata_for_target", None)
+    if callable(method):
+        try:
+            return method(
+                adapter_key,
+                str(context.get("chat_id") or ""),
+                thread_id,
+                chat_type="dm",
+                reply_to_message_id=str(context.get("message_id") or "") or None,
+                adapter=adapter,
+            )
+        except Exception:
+            pass
+    return {"thread_id": thread_id}
+
+
+def _render_gateway_completion_message(record: dict[str, Any], config: PluginConfig) -> str:
+    status = str(record.get("status") or "completed")
+    task_id = str(record.get("taskId") or record.get("runId") or "")
+    summary = str(record.get("summary") or "Dynamic workflow")
+    icon = "✅" if status == "completed" else "⏹" if status == "stopped" else "❌"
+    lines = [
+        f"{icon} Workflow {status}: {summary}",
+        f"Task: {task_id}",
+    ]
+    if record.get("error"):
+        lines.append(f"Error: {str(record.get('error') or '').strip()}")
+    else:
+        result_text = _completion_output_text(record).strip()
+        if result_text:
+            preview_chars = config.notify_result_preview_chars
+            if preview_chars > 0 and len(result_text) > preview_chars:
+                remaining = len(result_text) - preview_chars
+                result_text = result_text[:preview_chars] + f"\n... (truncated {remaining} chars)"
+            lines.append(f"Result:\n{result_text}")
+    output_file = str(record.get("outputFile") or "")
+    if output_file:
+        lines.append(f"Output: {output_file}")
+    return "\n".join(lines)
 
 
 def _render_task_notification(record: dict[str, Any], preview_chars: int) -> str:

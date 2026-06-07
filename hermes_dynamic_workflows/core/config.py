@@ -61,17 +61,18 @@ class PluginConfig:
     #              the genuinely dangerous; only flagged commands hit the LLM)
     #   deny    -> refuse flagged commands
     #   approve -> allow flagged commands (hardline still blocked upstream)
-    #   ask     -> route to the user if a live approval channel exists (gateway
-    #              buttons); otherwise degrade to ask_fallback (a detached workflow
-    #              child usually has no reachable human in any context)
+    #   ask     -> route to the user if a live approval channel exists (CLI
+    #              approval UI or gateway buttons); otherwise degrade to
+    #              ask_fallback
     child_approval_policy: str = "inherit"
     # What `ask` falls back to when no human is reachable (the common case for a
     # detached workflow child). smart | deny | approve.
     ask_fallback: str = "smart"
-    # On run completion, inject a <task-notification> into the conversation (via
-    # ctx.inject_message) so the model can deliver the result without the user
-    # polling /workflows. CLI-only (no-op in gateway). Result is truncated to
-    # notify_result_preview_chars to protect context.
+    # On run completion, notify the parent session so the user does not need to
+    # poll /workflows. CLI receives a Claude-Code-style <task-notification>
+    # through ctx.inject_message; gateway sends a concise completion message to
+    # the originating chat. Result previews are truncated to
+    # notify_result_preview_chars to protect context/chat length.
     notify_on_complete: bool = True
     notify_result_preview_chars: int = 2000
 

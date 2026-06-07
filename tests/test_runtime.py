@@ -46,6 +46,24 @@ class TokenRunner(ChildAgentRunner):
         return ChildAgentResult(content=request.label, metadata={"tokens": self.tokens})
 
 
+class LiveUpdateRunner(ChildAgentRunner):
+    def run(self, request: ChildAgentRequest):
+        if request.on_start is not None:
+            request.on_start({"task_id": "workflow-live", "session_id": "workflow-live"})
+        if request.on_update is not None:
+            request.on_update(
+                {
+                    "tokens": 321,
+                    "tool_calls": 2,
+                    "activity": 'terminal({"command":"pwd"})',
+                }
+            )
+        return ChildAgentResult(
+            content="done",
+            metadata={"tokens": 321, "tool_calls": 2},
+        )
+
+
 class FailingRunner(ChildAgentRunner):
     def run(self, request: ChildAgentRequest):
         raise RuntimeError(f"failed:{request.label}")
@@ -57,6 +75,23 @@ class SkippingRunner(ChildAgentRunner):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_live_child_updates_refresh_snapshot_and_journal(self):
+        events = []
+        result = run_workflow(
+            'meta = {"name": "live", "description": "live"}\nreturn await agent("work")',
+            WorkflowOptions(
+                config=PluginConfig(),
+                child_runner=LiveUpdateRunner(),
+                on_journal=events.append,
+            ),
+        )
+
+        agent = result.state.snapshot()["agents"][0]
+        self.assertEqual(agent["tokens"], 321)
+        self.assertEqual(agent["tool_calls"], 2)
+        self.assertEqual([event["type"] for event in events], ["started", "activity", "result"])
+        self.assertIn("pwd", events[1]["activity"])
+
     def test_runs_strict_async_script_body(self):
         script = """
 meta = {"name": "simple", "description": "Test workflow", "phases": ["scan"]}
@@ -264,7 +299,29 @@ return await pipeline(
         runner = HalfFailingRunner()
         result = run_workflow(script, WorkflowOptions(child_runner=runner))
         self.assertEqual(result.value, [None, "after-b"])
+        self.assertEqual(result.error_count, 1)
         self.assertNotIn("after-a", runner.labels)
+
+    def test_parallel_child_failure_is_counted_once(self):
+        script = """
+meta = {"name": "parallel-failure-count", "description": "Test workflow"}
+
+return await parallel([
+    lambda: agent("a", {"label": "a"}),
+    lambda: agent("b", {"label": "b"}),
+])
+"""
+
+        class HalfFailingRunner(ChildAgentRunner):
+            def run(self, request):
+                if request.label == "a":
+                    raise RuntimeError("no a")
+                return request.label
+
+        result = run_workflow(script, WorkflowOptions(child_runner=HalfFailingRunner()))
+
+        self.assertEqual(result.value, [None, "b"])
+        self.assertEqual(result.error_count, 1)
 
     def test_intentionally_skipped_agent_returns_none(self):
         script = """
