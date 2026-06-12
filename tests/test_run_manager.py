@@ -173,6 +173,26 @@ class TranscriptRunner(ChildAgentRunner):
             },
         )
 
+class StructuredResultRunner(ChildAgentRunner):
+    def __init__(self):
+        self.calls = 0
+
+    def run(self, request: ChildAgentRequest):
+        self.calls += 1
+        return ChildAgentResult(
+            content="ignored final text",
+            metadata={
+                "task_id": f"structured-child-{request.id}",
+                "session_id": f"structured-child-{request.id}",
+                "hermes_session_id": f"structured-child-{request.id}",
+                "structured_captured": True,
+                "structured_result": {"ok": True, "label": request.label},
+                "structured_attempts": 1,
+                "tokens": 13,
+                "tool_calls": 1,
+            },
+        )
+
 
 class LiveTranscriptRunner(ChildAgentRunner):
     def __init__(self):
@@ -528,6 +548,47 @@ return [
         self.assertEqual(second_final["result"], ["1:a", "2:b"])
         self.assertEqual(CountingRunner.calls, 2)
 
+    def test_structured_output_result_survives_manager_resume(self):
+        script = """
+meta = {"name": "structured-manager", "description": "Test workflow"}
+
+return await agent(
+    "return status",
+    {"label": "json", "schema": {"type": "object", "required": ["ok", "label"]}},
+)
+"""
+        runner = StructuredResultRunner()
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig(require_launch_approval=False))
+            with (
+                patch(
+                    "hermes_dynamic_workflows.child.runner._discoverable_child_toolsets",
+                    return_value=["mcp-static"],
+                ),
+                patch(
+                    "hermes_dynamic_workflows.child.runner.HermesChildAgentRunner",
+                    return_value=runner,
+                ),
+            ):
+                first = manager.start_from_params(
+                    {"script": script},
+                    cwd=tmp,
+                    plugin_context=RecordingCtx(),
+                )
+                first_final = manager.wait(first["runId"], timeout=2)
+                second = manager.start_from_params(
+                    {"script": script, "resumeFromRunId": first["runId"]},
+                    cwd=tmp,
+                    plugin_context=RecordingCtx(),
+                )
+                second_final = manager.wait(second["runId"], timeout=2)
+
+        if first_final is None or second_final is None:
+            self.fail("workflow did not finish")
+        self.assertEqual(first_final["result"], {"ok": True, "label": "json"})
+        self.assertEqual(second_final["result"], first_final["result"])
+        self.assertEqual(runner.calls, 1)
+
     def test_formats_agent_overview(self):
         script = """
 meta = {"name": "inspectable", "description": "Test workflow", "phases": ["Search"]}
@@ -812,20 +873,27 @@ meta = {"name": "live-transcripts", "description": "Test workflow"}
 return await agent("do it", {"label": "worker"})
 """
         runner = LiveTranscriptRunner()
-        fake_messages = [{"role": "user", "content": "running message"}]
+        db = IncrementalTestDB()
+        db.create_session("live-child-session")
+        db.append_message("live-child-session", "user", "running message")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manager = WorkflowRunManager(
                 store=WorkflowStore(root / "store"),
                 config=PluginConfig(require_launch_approval=False),
             )
+
+            def exporter_factory(*, run_id):
+                return transcripts_module.LiveTranscriptExporter(
+                    run_id=run_id,
+                    interval_seconds=60,
+                    reader=SessionTranscriptReader(db),
+                )
+
             with patch(
                 "hermes_dynamic_workflows.child.runner.HermesChildAgentRunner",
                 return_value=runner,
-            ), patch(
-                "hermes_dynamic_workflows.run.transcripts._load_session_messages",
-                side_effect=lambda session_id: list(fake_messages),
-            ):
+            ), patch.object(manager_module, "LiveTranscriptExporter", side_effect=exporter_factory):
                 rec = manager.start_from_params({"script": script}, cwd=str(root), plugin_context=RecordingCtx())
                 self.assertTrue(runner.started.wait(timeout=2))
 
@@ -842,7 +910,7 @@ return await agent("do it", {"label": "worker"})
                 self.assertEqual(meta["session_id"], "live-child-session")
                 self.assertEqual(meta["agent_label"], "worker")
 
-                fake_messages.append({"role": "assistant", "content": "final message"})
+                db.append_message("live-child-session", "assistant", "final message")
                 runner.release.set()
                 final = manager.wait(rec["runId"], timeout=2)
 
@@ -1229,20 +1297,25 @@ meta = {"name": "transcripts", "description": "Test workflow"}
 
 return await agent("do it", {"label": "worker"})
 """
-        fake_messages = [
-            {"role": "user", "content": "do it"},
-            {"role": "assistant", "content": "done"},
-        ]
+        db = IncrementalTestDB()
+        db.create_session("child-session-1")
+        db.append_message("child-session-1", "user", "do it")
+        db.append_message("child-session-1", "assistant", "done")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manager = WorkflowRunManager(store=WorkflowStore(root / "store"), config=PluginConfig(require_launch_approval=False))
+
+            def exporter_factory(*, run_id):
+                return transcripts_module.LiveTranscriptExporter(
+                    run_id=run_id,
+                    interval_seconds=60,
+                    reader=SessionTranscriptReader(db),
+                )
+
             with patch(
                 "hermes_dynamic_workflows.child.runner.HermesChildAgentRunner",
                 return_value=TranscriptRunner(),
-            ), patch(
-                "hermes_dynamic_workflows.run.transcripts._load_session_messages",
-                return_value=fake_messages,
-            ):
+            ), patch.object(manager_module, "LiveTranscriptExporter", side_effect=exporter_factory):
                 rec = manager.start_from_params({"script": script}, cwd=str(root), plugin_context=RecordingCtx())
                 final = manager.wait(rec["runId"], timeout=2)
 
