@@ -129,7 +129,36 @@ class LaunchApprovalDecisionTests(unittest.TestCase):
 
     def test_headless_no_channel_denies(self):
         env = {k: v for k, v in os.environ.items() if k != "HERMES_INTERACTIVE"}
-        with fake_approval(gateway=False), patch.dict(os.environ, env, clear=True):
+        with fake_approval(gateway=False, notify_present=False), patch.dict(os.environ, env, clear=True):
+            approved, reason = _approve_launch(META, PluginConfig(), None)
+        self.assertFalse(approved)
+        self.assertIn("no interactive channel", reason)
+
+    def test_ambient_gateway_session_key_recovers_lost_context(self):
+        with fake_approval(gateway=False, gateway_choice="once", notify_present=True), patch.dict(
+            os.environ,
+            {"HERMES_SESSION_KEY": "sess"},
+            clear=True,
+        ):
+            approved, _ = _approve_launch(META, PluginConfig(), None)
+        self.assertTrue(approved)
+
+    def test_lost_context_does_not_guess_unrelated_single_gateway_channel(self):
+        with fake_approval(gateway=False, gateway_choice="once", notify_present=True), patch.dict(
+            os.environ,
+            {},
+            clear=True,
+        ):
+            approved, reason = _approve_launch(META, PluginConfig(), None)
+        self.assertFalse(approved)
+        self.assertIn("no interactive channel", reason)
+
+    def test_cron_does_not_recover_unrelated_single_gateway_channel(self):
+        with fake_approval(gateway=False, gateway_choice="once", notify_present=True), patch.dict(
+            os.environ,
+            {"HERMES_CRON_SESSION": "1"},
+            clear=True,
+        ):
             approved, reason = _approve_launch(META, PluginConfig(), None)
         self.assertFalse(approved)
         self.assertIn("no interactive channel", reason)

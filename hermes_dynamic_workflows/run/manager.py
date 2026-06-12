@@ -71,6 +71,7 @@ class WorkflowRunManager:
         enable_control: bool = False,
     ):
         self.store = store or WorkflowStore()
+        self._static_config = config is not None
         self.config = config or load_config()
         self.control_owner = new_control_owner()
         self._runs: dict[str, ManagedRun] = {}
@@ -121,7 +122,8 @@ class WorkflowRunManager:
         approval_callback_override: Any = None,
         parent_runtime_override: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        config = self.config
+        config = self.config if self._static_config else load_config()
+        self.config = config
         cwd_value = cwd or os.environ.get("TERMINAL_CWD") or os.getcwd()
         source = resolve_workflow_source(params, store=self.store, cwd=cwd)
         meta = extract_meta(parse_script(source.script, config))
@@ -922,11 +924,9 @@ def _approve_launch(meta: dict[str, Any], config: PluginConfig, plugin_context: 
 
     # Gateway: reuse the session-keyed approve/deny flow (blocks until resolved).
     try:
-        if _approval._is_gateway_approval_context():
-            session_key = _approval.get_current_session_key()
-            notify_cb = _approval._gateway_notify_cbs.get(session_key)
-            if notify_cb is None:
-                return False, "launch approval required but no gateway approval channel is registered"
+        gateway_channel = _workflow_gateway_approval_channel(_approval)
+        if gateway_channel is not None:
+            session_key, notify_cb = gateway_channel
             decision = _await_gateway_launch_decision(
                 _approval,
                 session_key,
@@ -940,6 +940,8 @@ def _approve_launch(meta: dict[str, Any], config: PluginConfig, plugin_context: 
             )
             ok = bool(decision.get("resolved")) and decision.get("choice") not in (None, "deny")
             return (True, "") if ok else (False, "workflow launch was denied or timed out")
+        if _approval._is_gateway_approval_context():
+            return False, "launch approval required but no gateway approval channel is registered"
     except Exception as exc:
         return False, f"launch approval failed: {type(exc).__name__}: {exc}"
 
@@ -962,6 +964,41 @@ def _approve_launch(meta: dict[str, Any], config: PluginConfig, plugin_context: 
         "(set require_launch_approval=false / HERMES_DYNAMIC_WORKFLOWS_REQUIRE_LAUNCH_APPROVAL=0 "
         "for unattended/headless use)"
     )
+
+
+def _workflow_gateway_approval_channel(_approval: Any) -> tuple[str, Any] | None:
+    """Return a registered gateway approval channel for workflow launch gating.
+
+    Normal gateway turns carry the current session key in approval/session
+    contextvars. Some host/tool-dispatch paths preserve the registered gateway
+    notify callback plus ambient session env, but lose the contextvar, making
+    launch approval fail as "headless" even though the user is sitting in
+    Telegram. Recover only when the ambient session key maps to a registered
+    callback; never guess from an unrelated single live gateway callback.
+    """
+
+    callbacks = getattr(_approval, "_gateway_notify_cbs", None)
+    if not isinstance(callbacks, dict):
+        callbacks = {}
+
+    if _approval._is_gateway_approval_context():
+        session_key = str(_approval.get_current_session_key() or "")
+        notify_cb = callbacks.get(session_key)
+        if notify_cb is not None:
+            return session_key, notify_cb
+        return None
+
+    if (os.environ.get("HERMES_INTERACTIVE") or "").strip().lower() in ("1", "true", "yes", "on"):
+        return None
+
+    ambient_session_key = _get_hermes_session_env("HERMES_SESSION_KEY")
+    if ambient_session_key:
+        notify_cb = callbacks.get(ambient_session_key)
+        if notify_cb is not None:
+            return ambient_session_key, notify_cb
+        return None
+
+    return None
 
 
 def _await_gateway_launch_decision(_approval: Any, session_key: str, notify_cb: Any, data: dict[str, Any]) -> dict[str, Any]:

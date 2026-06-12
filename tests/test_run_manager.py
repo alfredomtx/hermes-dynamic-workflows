@@ -431,6 +431,31 @@ class RunManagerTests(unittest.TestCase):
                     override_path = store.task_output_path("/repo", "session-2", "task-2")
             override_path.relative_to(Path(output_tmp))
 
+    def test_default_manager_reloads_config_for_each_launch(self):
+        script = """
+meta = {"name": "reload-config", "description": "Test workflow"}
+
+return "ok"
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch(
+                "hermes_dynamic_workflows.run.manager.load_config",
+                side_effect=[
+                    PluginConfig(require_launch_approval=True),
+                    PluginConfig(require_launch_approval=False),
+                ],
+            ) as load_config:
+                manager = WorkflowRunManager(store=WorkflowStore(root / "store"))
+                record = manager.start_from_params({"script": script}, cwd=str(root), plugin_context=RecordingCtx())
+                final = manager.wait(record["runId"], timeout=2)
+
+        if final is None:
+            self.fail("workflow did not finish")
+        self.assertEqual(load_config.call_count, 2)
+        self.assertEqual(final["status"], "completed")
+        self.assertEqual(final["result"], "ok")
+
     def test_manager_routes_internal_single_agent_skip(self):
         script = """
 meta = {"name": "skip-one", "description": "Test workflow"}
