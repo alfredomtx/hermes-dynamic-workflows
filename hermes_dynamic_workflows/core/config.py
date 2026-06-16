@@ -16,6 +16,14 @@ class PluginConfig:
     concurrency: int = field(default_factory=default_concurrency)
     max_concurrency: int = 16
     max_agents: int = 1000
+    # Maximum workflow() nesting depth. depth=0 is the top-level run; each
+    # nested workflow() call goes one deeper. A value of N allows the root plus
+    # N nested levels (N+1 total), so the default 2 permits root -> child ->
+    # grandchild. Setting 1 reproduces the original single-nested-level limit.
+    # Run-wide caps (max_agents, the concurrency semaphore, the token budget,
+    # the deadline) are shared across every frame regardless of depth, so a
+    # deeper tree cannot exceed those ceilings — only the call tree gets taller.
+    max_nesting_depth: int = 2
     # Runaway-loop backstop: caps total `while`-loop iterations across the run.
     # Generous so legitimate loop-until-budget/dry never trips it; the wall-clock
     # deadline is the primary bound (now enforced inside loops via tick_loop).
@@ -155,6 +163,15 @@ def load_config() -> PluginConfig:
         concurrency=min(concurrency, max_concurrency),
         max_concurrency=max_concurrency,
         max_agents=_as_int(raw.get("max_agents"), default.max_agents, minimum=1, maximum=1000),
+        max_nesting_depth=_as_int(
+            os.getenv(
+                "HERMES_DYNAMIC_WORKFLOWS_MAX_NESTING_DEPTH",
+                raw.get("max_nesting_depth"),
+            ),
+            default.max_nesting_depth,
+            minimum=1,
+            maximum=8,
+        ),
         max_loop_iterations=_as_int(
             os.getenv(
                 "HERMES_DYNAMIC_WORKFLOWS_MAX_LOOP_ITERATIONS",

@@ -47,7 +47,7 @@ required; `whenToUse` and `phases` optional).
 | `parallel` | `await parallel(thunks)` | Runs concurrently, **with a barrier**: returns only once all complete. A single failure → `None` in the results (the whole call does not throw). |
 | `phase` | `phase(title)` | Starts a progress group. |
 | `log` | `log(message)` | Sends a line of progress to the user. |
-| `workflow` | `await workflow(name_or_ref, args=None)` | Runs another workflow inline, sharing concurrency/counts/stop/budget; one level of nesting only. |
+| `workflow` | `await workflow(name_or_ref, args=None)` | Runs another workflow inline, sharing concurrency/counts/stop/budget; bounded by `max_nesting_depth` (default 2). |
 | `args` | — | The tool input `args` verbatim; `None` if not passed. |
 | `budget` | `budget.total` / `spent()` / `remaining()` | Taken from a `+500k`-style target in the user's message. `total` is a hard cap — once reached, `agent()` throws; when unset, `remaining()` is `math.inf`. |
 
@@ -277,6 +277,13 @@ share the cache prefix. The savings depend on the provider (0 for non-cacheable 
   number of items, but only about slot-many run at once and the rest queue.
 - **Agent cap** `max_agents` (default 1000): a runaway fallback gate, far above any real
   workflow.
+- **Nesting depth** `max_nesting_depth` (default 2): the maximum `workflow()` nesting
+  depth — root plus N nested levels. `workflow()` past this depth raises
+  `WorkflowRuntimeError`. The depth is plumbed `WorkflowAPI.depth → _workflow_sync →
+  WorkflowOptions.depth`; every nested frame shares the SAME run context, so the agent
+  cap, concurrency semaphore, token budget, and deadline above bind across the whole tree
+  regardless of depth. Set to 1 for the original single-level behavior. Env override:
+  `HERMES_DYNAMIC_WORKFLOWS_MAX_NESTING_DEPTH`.
 - **Loop gate**: each `while/for` iteration injects `__wf_tick__()`, which checks for
   stop / deadline / the loop cap `max_loop_iterations` (default 1e7). This lets the
   deadline fire even inside a pure compute loop.

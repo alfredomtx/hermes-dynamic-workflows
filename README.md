@@ -51,6 +51,7 @@ plugins:
         concurrency: 8                # Max concurrent agents (default: min(16, cpu-2))
         max_concurrency: 16           # Hard cap on concurrency
         max_agents: 1000              # Max total agents per run (runaway guard)
+        max_nesting_depth: 2          # Max workflow() nesting depth (root + N levels); run-wide caps still bind across all levels
         workflow_timeout_seconds: 900 # Wall-clock timeout for the whole run (excludes paused time)
         child_timeout_seconds: 300    # Timeout for a single child agent
         blocked_child_toolsets: [workflow, delegation, code_execution, memory, messaging, clarify]

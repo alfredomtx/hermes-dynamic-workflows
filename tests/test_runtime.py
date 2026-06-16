@@ -11,6 +11,7 @@ from hermes_dynamic_workflows.core.errors import (
     ChildAgentSkipped,
     WorkflowLimitExceeded,
     WorkflowParseError,
+    WorkflowRuntimeError,
 )
 from hermes_dynamic_workflows.engine.runtime import WorkflowOptions, run_workflow
 from hermes_dynamic_workflows.core.types import ChildAgentRequest, ChildAgentResult, ChildAgentRunner
@@ -550,7 +551,9 @@ return {"total": budget.total, "remaining": budget.remaining()}
         self.assertIsNone(result.value["total"])
         self.assertEqual(result.value["remaining"], float("inf"))
 
-    def test_workflow_helper_nesting_is_one_level(self):
+    def test_workflow_helper_nesting_respects_configured_single_level(self):
+        # With max_nesting_depth=1, parent(0) -> child(1) is allowed but the
+        # child calling workflow() again (depth 1 >= 1) raises.
         parent = """
 meta = {"name": "parent", "description": "Test workflow"}
 
@@ -577,7 +580,7 @@ return await agent("grand")
                     WorkflowOptions(
                         args={"child": str(child_path), "grand": str(grand_path)},
                         cwd=tmp,
-                        config=PluginConfig(),
+                        config=PluginConfig(max_nesting_depth=1),
                         child_runner=FakeRunner(),
                     ),
                 )
@@ -840,6 +843,147 @@ return value
                     child_runner=TokenRunner(tokens=1),
                 ),
             )
+
+
+class NestingDepthTests(unittest.TestCase):
+    """workflow() nesting depth is config-driven and run-wide caps bind across frames."""
+
+    @staticmethod
+    def _write_chain(tmp: str) -> dict[str, str]:
+        # grandchild: depth 2 when reached via root -> child -> grandchild.
+        grandchild = """
+meta = {"name": "gc", "description": "grandchild"}
+
+return await agent("gc-work", {"label": "gc"})
+"""
+        child = """
+meta = {"name": "child", "description": "child"}
+
+inner = await workflow({"scriptPath": args["grandchild"]}, args)
+mine = await agent("child-work", {"label": "child"})
+return [inner, mine]
+"""
+        root = """
+meta = {"name": "root", "description": "root"}
+
+mine = await agent("root-work", {"label": "root"})
+nested = await workflow({"scriptPath": args["child"]}, args)
+return [mine, nested]
+"""
+        gc_path = Path(tmp) / "gc.py"
+        child_path = Path(tmp) / "child.py"
+        gc_path.write_text(grandchild, encoding="utf-8")
+        child_path.write_text(child, encoding="utf-8")
+        return {"grandchild": str(gc_path), "child": str(child_path)}
+
+    def test_nesting_allowed_to_configured_depth(self):
+        # Default max_nesting_depth=2 permits root -> child -> grandchild.
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._write_chain(tmp)
+            runner = FakeRunner()
+            result = run_workflow(
+                """
+meta = {"name": "root", "description": "root"}
+
+mine = await agent("root-work", {"label": "root"})
+nested = await workflow({"scriptPath": args["child"]}, args)
+return [mine, nested]
+""",
+                WorkflowOptions(
+                    args={"child": paths["child"], "grandchild": paths["grandchild"]},
+                    cwd=tmp,
+                    config=PluginConfig(max_nesting_depth=2),
+                    child_runner=runner,
+                ),
+            )
+        # root agent + child's grandchild result + child agent all resolved.
+        self.assertEqual(result.value, ["root:root-work", ["gc:gc-work", "child:child-work"]])
+        self.assertEqual(result.agent_count, 3)
+
+    def test_nesting_rejected_past_max_depth(self):
+        # A workflow() call from the grandchild (depth 2) exceeds the default
+        # max_nesting_depth=2 and raises, surfacing as a child-agent failure up
+        # the chain.
+        deep = """
+meta = {"name": "too-deep", "description": "depth-3 attempt"}
+
+return await workflow({"scriptPath": args["self"]}, args)
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            self_path = Path(tmp) / "deep.py"
+            self_path.write_text(deep, encoding="utf-8")
+            root = """
+meta = {"name": "root", "description": "root"}
+
+a = await workflow({"scriptPath": args["self"]}, args)
+b = await workflow({"scriptPath": args["self"]}, args)
+return [a, b]
+"""
+            # root(0) -> deep(1) -> deep(2) -> deep tries workflow() at depth 2 -> raise.
+            with self.assertRaises(WorkflowRuntimeError) as ctx:
+                run_workflow(
+                    root,
+                    WorkflowOptions(
+                        args={"self": str(self_path)},
+                        cwd=tmp,
+                        config=PluginConfig(max_nesting_depth=2),
+                        child_runner=FakeRunner(),
+                    ),
+                )
+        self.assertIn("nested workflows are limited to 2 levels deep", str(ctx.exception))
+
+    def test_depth_one_reproduces_single_level_limit(self):
+        # max_nesting_depth=1 is the original behavior: the child (depth 1)
+        # cannot call workflow() again.
+        child = """
+meta = {"name": "child", "description": "child"}
+
+return await workflow({"scriptPath": args["child"]}, args)
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            child_path = Path(tmp) / "child.py"
+            child_path.write_text(child, encoding="utf-8")
+            root = """
+meta = {"name": "root", "description": "root"}
+
+return await workflow({"scriptPath": args["child"]}, args)
+"""
+            with self.assertRaises(WorkflowRuntimeError) as ctx:
+                run_workflow(
+                    root,
+                    WorkflowOptions(
+                        args={"child": str(child_path)},
+                        cwd=tmp,
+                        config=PluginConfig(max_nesting_depth=1),
+                        child_runner=FakeRunner(),
+                    ),
+                )
+        self.assertIn("nested workflows are limited to 1 level deep", str(ctx.exception))
+
+    def test_run_wide_agent_cap_binds_across_nested_frames(self):
+        # SAFETY REGRESSION: the run-wide agent cap is enforced on a SHARED
+        # counter across every nesting level. root(1 agent) -> child(1 agent) ->
+        # grandchild tries a 3rd agent and trips max_agents=2, proving deeper
+        # nesting cannot escape the run-wide ceiling.
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._write_chain(tmp)
+            with self.assertRaises(WorkflowLimitExceeded) as ctx:
+                run_workflow(
+                    """
+meta = {"name": "root", "description": "root"}
+
+mine = await agent("root-work", {"label": "root"})
+nested = await workflow({"scriptPath": args["child"]}, args)
+return [mine, nested]
+""",
+                    WorkflowOptions(
+                        args={"child": paths["child"], "grandchild": paths["grandchild"]},
+                        cwd=tmp,
+                        config=PluginConfig(max_agents=2, max_nesting_depth=2),
+                        child_runner=FakeRunner(),
+                    ),
+                )
+        self.assertIn("agent count exceeded (2)", str(ctx.exception))
 
 
 if __name__ == "__main__":

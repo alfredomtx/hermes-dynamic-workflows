@@ -373,8 +373,12 @@ class WorkflowAPI:
     def _workflow_sync(self, name_or_ref: Any, args: Any = None) -> Any:
         """Run a child workflow from async Python scripts."""
         self._check_deadline()
-        if self.depth >= 1:
-            raise WorkflowRuntimeError("nested workflows are limited to one level")
+        max_depth = getattr(self.config, "max_nesting_depth", 1)
+        if self.depth >= max_depth:
+            raise WorkflowRuntimeError(
+                f"nested workflows are limited to {max_depth} "
+                f"level{'s' if max_depth != 1 else ''} deep"
+            )
         from .runtime import WorkflowOptions, run_workflow
         from ..storage.store import WorkflowStore, resolve_workflow_source
 

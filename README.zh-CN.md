@@ -45,6 +45,7 @@ plugins:
         concurrency: 8                # 最大并发 agent 数（默认 min(16, cpu-2)）
         max_concurrency: 16           # 并发上限硬限制
         max_agents: 1000              # 单个 run 的 agent 总数上限（防逃逸）
+        max_nesting_depth: 2          # workflow() 最大嵌套深度（根 + N 层）；run 级别上限仍跨所有层级生效
         workflow_timeout_seconds: 900 # 整个 run 的 wall-clock 超时（不含暂停时间）
         child_timeout_seconds: 300    # 单个子 agent 超时
         blocked_child_toolsets: [workflow, delegation, code_execution, memory, messaging, clarify]
