@@ -83,6 +83,19 @@ class PluginConfig:
     # notify_result_preview_chars to protect context/chat length.
     notify_on_complete: bool = True
     notify_result_preview_chars: int = 2000
+    # --- Autoflow (ultracode-style auto-workflow steering) ---------------
+    # A per-session mode toggled with `/autoflow on|off` in the gateway. While
+    # ON for a session, each substantive inbound message (a) bumps reasoning
+    # effort to auto_workflow_effort and (b) gets a steering directive appended
+    # that nudges the model to prefer the `workflow` tool. It is a NUDGE, not a
+    # hard force (matching Claude Code's ultracode "Claude decides" model), it
+    # is gateway-only, and launch approval still applies. Default per-session
+    # state is OFF; these keys only set the behavior once a session opts in.
+    auto_workflow_effort: str = "xhigh"
+    # Minimum stripped-text length for a message to count as "substantive" and
+    # be steered/effort-bumped. Trivial replies ("ok", "thanks") fall through
+    # untouched so they don't pay xhigh latency. Cheap prefilter, no LLM call.
+    auto_workflow_min_chars: int = 24
 
 
 def _as_int(value: Any, default: int, *, minimum: int = 1, maximum: int | None = None) -> int:
@@ -241,5 +254,19 @@ def load_config() -> PluginConfig:
             default.notify_result_preview_chars,
             minimum=0,
             maximum=20000,
+        ),
+        auto_workflow_effort=_as_mode(
+            os.getenv(
+                "HERMES_DYNAMIC_WORKFLOWS_AUTO_WORKFLOW_EFFORT",
+                raw.get("auto_workflow_effort"),
+            ),
+            default.auto_workflow_effort,
+            {"minimal", "low", "medium", "high", "xhigh", "max"},
+        ),
+        auto_workflow_min_chars=_as_int(
+            raw.get("auto_workflow_min_chars"),
+            default.auto_workflow_min_chars,
+            minimum=1,
+            maximum=10000,
         ),
     )

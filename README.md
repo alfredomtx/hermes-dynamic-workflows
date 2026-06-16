@@ -65,7 +65,35 @@ plugins:
         ask_fallback: smart           # Fallback when "ask" has no one to reach: smart|deny|approve
         notify_on_complete: true      # Notify the originating CLI or gateway session on completion
         notify_result_preview_chars: 2000  # Truncation length (chars) for the result preview in notifications
+        auto_workflow_effort: xhigh    # Reasoning effort applied to steered messages while /autoflow is ON
+        auto_workflow_min_chars: 24    # Min message length to count as "substantive" (cheap prefilter, no LLM call)
 ```
+
+## Autoflow (ultracode-style auto-workflow steering)
+
+`/autoflow on` turns on a **sticky per-session mode** in the gateway
+(Telegram/Discord/etc.). While it's on, every *substantive* message you send
+that session is automatically steered toward the `workflow` tool — no need to
+type "use a workflow" each time. This is Hermes' analogue of Claude Code's
+`ultracode`.
+
+```text
+/autoflow on       # enable for this session (sticky until you turn it off)
+/autoflow off      # back to normal turn-by-turn handling
+/autoflow          # report current state
+```
+
+While on, each substantive inbound message:
+
+1. bumps the session's reasoning effort to `auto_workflow_effort` (default `xhigh`), and
+2. gets a steering directive appended that tells the model the task is
+   pre-authorized for orchestration, so it prefers the `workflow` tool.
+
+It is a **nudge, not a hard force** (the model still decides, matching
+ultracode), it is **gateway-only** (CLI/TUI unaffected), and **launch approval
+still applies** — `require_launch_approval` gates every workflow launch
+regardless. Trivial messages (short acks, slash commands) pass through
+untouched so they don't pay the higher reasoning latency.
 
 ## Script API
 
