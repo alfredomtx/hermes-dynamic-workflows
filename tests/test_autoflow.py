@@ -154,6 +154,14 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         # Isolate the module-level state between tests.
         autoflow._STATE = AutoflowState()
+        # Pin config to shipped defaults (default-off) so these tests are
+        # hermetic and don't read the host's live config.yaml (which may set
+        # auto_workflow_default_on=true for benchmarking).
+        self._cfg_patch = patch.object(autoflow_hook, "load_config", return_value=PluginConfig())
+        self._cfg_patch.start()
+
+    def tearDown(self):
+        self._cfg_patch.stop()
 
     async def test_toggle_on_skips_and_confirms_and_does_not_steer_yet(self):
         gw = FakeGateway()
