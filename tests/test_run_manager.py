@@ -26,6 +26,8 @@ from hermes_dynamic_workflows.run.manager import (
     WorkflowRunManager,
     _capture_parent_runtime,
     _gateway_running_agent,
+    _notify_launch,
+    _render_gateway_launch_message,
 )
 from hermes_dynamic_workflows.core.types import ChildAgentRequest, ChildAgentResult, ChildAgentRunner
 from hermes_dynamic_workflows.storage.store import WorkflowStore
@@ -852,13 +854,127 @@ return await agent("do it", {"label": "worker"})
                 final = manager.wait(rec["runId"], timeout=2)
 
         self.assertEqual(final["status"], "completed")
-        self.assertEqual(len(adapter.sent), 1)
-        chat_id, content, metadata = adapter.sent[0]
+        # With notify_on_launch on (default), the run emits a "started" marker
+        # at launch plus the completion notification: two sends, launch first.
+        self.assertEqual(len(adapter.sent), 2)
+        launch_chat, launch_content, launch_metadata = adapter.sent[0]
+        self.assertEqual(launch_chat, "chat-1")
+        self.assertIn("Workflow started: Gateway notification test", launch_content)
+        self.assertEqual(launch_metadata, {"reply": "message-1", "notify": True})
+        chat_id, content, metadata = adapter.sent[1]
         self.assertEqual(chat_id, "chat-1")
         self.assertIn("Workflow completed: Gateway notification test", content)
         self.assertIn("Result:\n", content)
         self.assertIn("worker", content)
         self.assertEqual(metadata, {"reply": "message-1", "notify": True})
+
+    def test_gateway_launch_notification_can_be_disabled(self):
+        script = """
+meta = {"name": "no-launch-note", "description": "Launch note disabled"}
+
+return await agent("do it", {"label": "worker"})
+"""
+
+        class FakeAdapter:
+            def __init__(self):
+                self.sent = []
+
+            async def send(self, chat_id, content, metadata=None):
+                self.sent.append((chat_id, content, metadata))
+                return SimpleNamespace(success=True)
+
+        adapter = FakeAdapter()
+        runner = SimpleNamespace(
+            adapters={"telegram": adapter},
+            _gateway_loop=object(),
+            _session_sources={
+                "agent:main:telegram:dm:chat-1": SimpleNamespace(
+                    platform="telegram",
+                    chat_id="chat-1",
+                    thread_id=None,
+                    message_id="message-1",
+                )
+            },
+            _thread_metadata_for_source=lambda source, reply_to_message_id=None: {"reply": reply_to_message_id},
+        )
+
+        def schedule(coro, loop, **kwargs):
+            result = asyncio.run(coro)
+            future = Future()
+            future.set_result(result)
+            return future
+
+        agent_pkg = ModuleType("agent")
+        async_utils = ModuleType("agent.async_utils")
+        async_utils.safe_schedule_threadsafe = schedule
+        agent_pkg.async_utils = async_utils
+        session_context = {
+            "platform": "telegram",
+            "chat_id": "chat-1",
+            "session_key": "agent:main:telegram:dm:chat-1",
+            "message_id": "message-1",
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(
+                store=WorkflowStore(Path(tmp)),
+                config=PluginConfig(require_launch_approval=False, notify_on_launch=False),
+            )
+            with (
+                patch(
+                    "hermes_dynamic_workflows.child.runner.HermesChildAgentRunner",
+                    return_value=CountingRunner(),
+                ),
+                patch(
+                    "hermes_dynamic_workflows.host.gateway.gateway_runner_ref",
+                    return_value=runner,
+                ),
+                patch.dict(sys.modules, {"agent": agent_pkg, "agent.async_utils": async_utils}),
+            ):
+                rec = manager.start_from_params(
+                    {"script": script},
+                    cwd=tmp,
+                    host_session_id="gateway-test-session",
+                    session_context_override=session_context,
+                )
+                final = manager.wait(rec["runId"], timeout=2)
+
+        self.assertEqual(final["status"], "completed")
+        # notify_on_launch off -> only the completion notification is sent.
+        self.assertEqual(len(adapter.sent), 1)
+        self.assertIn("Workflow completed", adapter.sent[0][1])
+
+    def test_render_launch_message_includes_summary_and_task(self):
+        msg = _render_gateway_launch_message(
+            {"summary": "Repo audit", "taskId": "wg8nxqxzq", "runId": "wf_abc123"}
+        )
+        self.assertIn("🚀 Workflow started: Repo audit", msg)
+        self.assertIn("wg8nxqxzq", msg)
+        self.assertIn("/workflows", msg)
+
+    def test_notify_launch_is_noop_outside_gateway_session(self):
+        # No session_context (CLI / non-gateway) -> nothing sent, no raise.
+        # Guard against accidental network/loop access by asserting it returns
+        # cleanly with both None and an empty context.
+        _notify_launch({"summary": "x", "taskId": "t"}, PluginConfig(), None)
+        _notify_launch({"summary": "x", "taskId": "t"}, PluginConfig(), {})
+
+    def test_notify_launch_respects_disable_flag(self):
+        # Even with a valid-looking gateway context, notify_on_launch=False
+        # must short-circuit before any gateway lookup.
+        calls = []
+
+        original = manager_module._send_gateway_text
+        manager_module._send_gateway_text = lambda *a, **k: calls.append(a)
+        try:
+            _notify_launch(
+                {"summary": "x", "taskId": "t"},
+                PluginConfig(notify_on_launch=False),
+                {"platform": "telegram", "chat_id": "c1"},
+            )
+        finally:
+            manager_module._send_gateway_text = original
+        self.assertEqual(calls, [])
 
     def test_runtime_failure_injects_failed_task_notification_without_result(self):
         script = """

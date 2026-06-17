@@ -82,6 +82,13 @@ class PluginConfig:
     # the originating chat. Result previews are truncated to
     # notify_result_preview_chars to protect context/chat length.
     notify_on_complete: bool = True
+    # On launch, send a concise "workflow started" message to the origin
+    # gateway chat so the user sees an auto-fired (or approved) run begin and
+    # can track timing. CLI is unaffected (the launch tool result already
+    # surfaces there). Best-effort; never blocks or fails the launch. Pairs
+    # with notify_on_complete to bracket each run with start+end markers —
+    # useful when autoflow auto-launches workflows with approval off.
+    notify_on_launch: bool = True
     notify_result_preview_chars: int = 2000
     # --- Autoflow (ultracode-style auto-workflow steering) ---------------
     # A per-session mode toggled with `/autoflow on|off` in the gateway. While
@@ -248,6 +255,10 @@ def load_config() -> PluginConfig:
         notify_on_complete=_as_bool(
             os.getenv("HERMES_DYNAMIC_WORKFLOWS_NOTIFY_ON_COMPLETE", raw.get("notify_on_complete")),
             default.notify_on_complete,
+        ),
+        notify_on_launch=_as_bool(
+            os.getenv("HERMES_DYNAMIC_WORKFLOWS_NOTIFY_ON_LAUNCH", raw.get("notify_on_launch")),
+            default.notify_on_launch,
         ),
         notify_result_preview_chars=_as_int(
             raw.get("notify_result_preview_chars"),

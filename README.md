@@ -64,6 +64,7 @@ plugins:
         child_approval_policy: inherit # Child agent approval policy: inherit|smart|deny|approve|ask
         ask_fallback: smart           # Fallback when "ask" has no one to reach: smart|deny|approve
         notify_on_complete: true      # Notify the originating CLI or gateway session on completion
+        notify_on_launch: true        # Send a "workflow started" marker to the origin gateway chat at launch
         notify_result_preview_chars: 2000  # Truncation length (chars) for the result preview in notifications
         auto_workflow_effort: xhigh    # Reasoning effort applied to steered messages while /autoflow is ON
         auto_workflow_min_chars: 24    # Min message length to count as "substantive" (cheap prefilter, no LLM call)
@@ -94,6 +95,12 @@ ultracode), it is **gateway-only** (CLI/TUI unaffected), and **launch approval
 still applies** — `require_launch_approval` gates every workflow launch
 regardless. Trivial messages (short acks, slash commands) pass through
 untouched so they don't pay the higher reasoning latency.
+
+When a workflow launches, `notify_on_launch` (default on) posts a concise
+"🚀 Workflow started" marker to the origin chat, and `notify_on_complete` posts
+the result at the end — so each run is bracketed with start/end markers in the
+chat, with timing visible. Useful when autoflow auto-launches runs with
+approval off and you want to keep an eye on what fired and how long it took.
 
 ## Script API
 

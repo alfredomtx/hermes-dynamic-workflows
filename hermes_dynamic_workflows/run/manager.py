@@ -241,6 +241,13 @@ class WorkflowRunManager:
         )
         managed.thread = thread
         thread.start()
+        # Gateway-only "started" marker so an auto-fired (or approved) run is
+        # visible in the origin chat and its timing is trackable. Best-effort;
+        # no-op outside a gateway session and never raises into the launch.
+        try:
+            _notify_launch(record, config, session_context)
+        except Exception:
+            pass
         return self._public_record(record)
 
     def get(self, run_id: str) -> dict[str, Any] | None:
@@ -1152,10 +1159,37 @@ def _send_gateway_completion_notification(
     config: PluginConfig,
     session_context: dict[str, str] | None,
 ) -> None:
+    _send_gateway_text(
+        record,
+        session_context,
+        _render_gateway_completion_message(record, config),
+        block=True,
+    )
+
+
+def _send_gateway_text(
+    record: dict[str, Any],
+    session_context: dict[str, str] | None,
+    text: str,
+    *,
+    block: bool = True,
+) -> None:
+    """Send a one-off message to the origin gateway chat for this run.
+
+    Shared by the launch and completion notifications. Resolves the adapter,
+    source, and thread/topic metadata from the captured session context so the
+    message lands in the originating chat/topic. Best-effort: any failure is
+    swallowed so it never affects the run.
+
+    ``block=True`` (completion, on a background thread) waits for delivery so
+    the run record reflects the send. ``block=False`` (launch, on the
+    synchronous tool-return path) fires and forgets so it never adds latency to
+    the workflow tool result; the loop owns the coroutine once scheduled.
+    """
     context = dict(session_context or {})
     platform = str(context.get("platform") or "").strip().lower()
     chat_id = str(context.get("chat_id") or "").strip()
-    if not platform or not chat_id:
+    if not platform or not chat_id or not text:
         return
 
     try:
@@ -1185,13 +1219,38 @@ def _send_gateway_completion_notification(
         if loop is None:
             return
         future = safe_schedule_threadsafe(
-            adapter.send(chat_id, _render_gateway_completion_message(record, config), metadata=metadata),
+            adapter.send(chat_id, text, metadata=metadata),
             loop,
         )
-        if future is not None:
+        if block and future is not None:
             future.result(timeout=15)
     except Exception:
         pass
+
+
+def _notify_launch(
+    record: dict[str, Any],
+    config: PluginConfig,
+    session_context: dict[str, str] | None,
+) -> None:
+    """On launch, send a concise "workflow started" marker to the origin
+    gateway chat. Gateway-only (no-op outside a gateway session); best-effort,
+    fire-and-forget so it never delays the synchronous launch return.
+    """
+    if not config.notify_on_launch:
+        return
+    _send_gateway_text(record, session_context, _render_gateway_launch_message(record), block=False)
+
+
+def _render_gateway_launch_message(record: dict[str, Any]) -> str:
+    summary = str(record.get("summary") or "Dynamic workflow")
+    task_id = str(record.get("taskId") or record.get("runId") or "")
+    lines = [
+        f"🚀 Workflow started: {summary}",
+        f"Task: {task_id}",
+        "Running in background. Use /workflows to watch live progress.",
+    ]
+    return "\n".join(lines)
 
 
 def _gateway_adapter_for_platform(runner: Any, platform: str) -> tuple[Any, Any]:

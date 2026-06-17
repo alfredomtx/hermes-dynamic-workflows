@@ -58,6 +58,7 @@ plugins:
         child_approval_policy: inherit # 子 agent 审批策略: inherit|smart|deny|approve|ask
         ask_fallback: smart           # ask 无人可达时的降级: smart|deny|approve
         notify_on_complete: true      # 完成时通知发起的 CLI 或 gateway 会话
+        notify_on_launch: true        # 启动时向来源 gateway 聊天发送「workflow 已启动」标记
         notify_result_preview_chars: 2000  # 通知中结果预览的截断长度（字符）
         auto_workflow_effort: xhigh    # /autoflow 开启时，对被引导消息应用的推理强度
         auto_workflow_min_chars: 24    # 判定为「实质性」消息的最小长度（廉价预过滤，无 LLM 调用）

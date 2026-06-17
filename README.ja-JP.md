@@ -66,6 +66,7 @@ plugins:
         ask_fallback: smart           # "ask" で連絡先が誰もいない場合のフォールバック: smart|deny|approve
         notify_on_complete: true      # 完了時に起点となった CLI または gateway セッションへ通知する
         notify_result_preview_chars: 2000  # 通知での結果プレビューの切り詰め長（文字数）
+        notify_on_launch: true        # 起動時に起点となった gateway チャットへ「workflow 開始」マーカーを送信
         auto_workflow_effort: xhigh    # /autoflow が ON のとき、誘導されたメッセージに適用する推論強度
         auto_workflow_min_chars: 24    # 「実質的」とみなす最小メッセージ長（安価な事前フィルタ、LLM 呼び出しなし）
 ```
