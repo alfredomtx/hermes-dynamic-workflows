@@ -118,6 +118,7 @@ def status_icon(status: Any) -> str:
         "error": "!",
         "failed": "!",
         "stopped": "x",
+        "interrupted": "#",
         "skipped": "-",
     }.get(str(status or ""), "?")
 

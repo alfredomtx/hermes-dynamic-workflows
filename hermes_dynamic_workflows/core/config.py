@@ -111,6 +111,32 @@ class PluginConfig:
     # be steered/effort-bumped. Trivial replies ("ok", "thanks") fall through
     # untouched so they don't pay xhigh latency. Cheap prefilter, no LLM call.
     auto_workflow_min_chars: int = 24
+    # --- Orphan reaping + auto-resume ------------------------------------
+    # A workflow run executes inside the Hermes process that launched it (the
+    # gateway daemon or a CLI). If that process exits — a `hermes gateway
+    # restart` is the common case — the run thread is killed mid-flight and its
+    # record is frozen at whatever active status it held ("running"), with no
+    # chance to write a terminal state. The record then lies "running" forever.
+    # reap_orphans() detects such runs on the next manager boot (their
+    # controlOwner PID is dead, or they are stale past the grace window while
+    # not paused) and marks them "interrupted", first harvesting completed
+    # child-agent results from the run's journal into agentCache so any later
+    # resume reuses them instead of re-running. Grace backstops PID recycling.
+    orphan_grace_seconds: float = 900.0
+    # When true, the manager also relaunches freshly-reaped orphans on boot
+    # (resumeFromRunId, reusing the harvested cache) so an interrupted run
+    # finishes without manual intervention. Shipped default is FALSE: resuming
+    # spends tokens and a restart may have been intentional. Enable in
+    # config.yaml only for unattended / benchmark setups. Only freshly-orphaned,
+    # recent (auto_resume_window_seconds), in-cap (auto_resume_max) runs are
+    # revived, and only when a gateway loop is present to route completion.
+    auto_resume_on_boot: bool = False
+    # Max orphans auto-resumed per boot — bounds a resurrection storm when many
+    # runs were orphaned at once (e.g. a crash with several in flight).
+    auto_resume_max: int = 3
+    # Only auto-resume orphans whose last journal activity was within this
+    # window. Older abandoned runs stay interrupted (no week-late resurrection).
+    auto_resume_window_seconds: float = 21600.0
 
 
 def _as_int(value: Any, default: int, *, minimum: int = 1, maximum: int | None = None) -> int:
@@ -294,5 +320,37 @@ def load_config() -> PluginConfig:
             default.auto_workflow_min_chars,
             minimum=1,
             maximum=10000,
+        ),
+        orphan_grace_seconds=_as_float(
+            os.getenv(
+                "HERMES_DYNAMIC_WORKFLOWS_ORPHAN_GRACE_SECONDS",
+                raw.get("orphan_grace_seconds"),
+            ),
+            default.orphan_grace_seconds,
+            minimum=0.0,
+        ),
+        auto_resume_on_boot=_as_bool(
+            os.getenv(
+                "HERMES_DYNAMIC_WORKFLOWS_AUTO_RESUME_ON_BOOT",
+                raw.get("auto_resume_on_boot"),
+            ),
+            default.auto_resume_on_boot,
+        ),
+        auto_resume_max=_as_int(
+            os.getenv(
+                "HERMES_DYNAMIC_WORKFLOWS_AUTO_RESUME_MAX",
+                raw.get("auto_resume_max"),
+            ),
+            default.auto_resume_max,
+            minimum=1,
+            maximum=100,
+        ),
+        auto_resume_window_seconds=_as_float(
+            os.getenv(
+                "HERMES_DYNAMIC_WORKFLOWS_AUTO_RESUME_WINDOW_SECONDS",
+                raw.get("auto_resume_window_seconds"),
+            ),
+            default.auto_resume_window_seconds,
+            minimum=0.0,
         ),
     )

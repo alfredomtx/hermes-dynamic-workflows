@@ -209,6 +209,12 @@ class WorkflowRunManager:
             "restartedFromRunId": restart_from_run_id,
             "args": args,
             "tokenBudget": token_budget,
+            # Routing-only gateway context (platform/chat/thread/user — never
+            # credentials; parent_runtime with secrets stays off-record on the
+            # in-memory ManagedRun). Persisted so a run reaped+resumed in a
+            # later process can still route its completion message to the
+            # originating chat. None outside a gateway session.
+            "sessionContext": session_context,
             "result": None,
             "error": None,
             "display": "",
@@ -343,6 +349,169 @@ class WorkflowRunManager:
             self._public_record(run)
             for run in self.store.list_runs(limit=limit, session_id=session_id)
         ]
+
+    # --- Orphan reaping + auto-resume ------------------------------------
+
+    _ACTIVE_STATUSES = ("queued", "running", "paused", "stopping")
+
+    def reap_orphans(self, *, now: float | None = None) -> list[str]:
+        """Mark abandoned runs ``interrupted`` and harvest their cache.
+
+        A run is an orphan when its record still holds an active status
+        (queued/running/paused/stopping) but the process that owned it is gone:
+        the run thread died with the process and never wrote a terminal state.
+        Detection is two-pronged:
+
+          1. The ``controlOwner`` PID is no longer alive (primary signal — a
+             ``hermes gateway restart`` kills the old PID exactly this way).
+          2. The run is stale past ``orphan_grace_seconds`` of journal
+             inactivity while not paused (backstop for PID recycling, where a
+             dead PID is reused by an unrelated process, and for records that
+             never recorded a parseable owner).
+
+        A run currently owned by THIS live manager (in ``self._runs``) or by
+        another live process is never reaped. Before flipping to
+        ``interrupted`` the completed child-agent results are harvested from
+        the journal into ``agentCache`` (see ``_harvest_journal_cache``) so a
+        later resume — manual or auto — reuses them instead of re-running.
+
+        Returns the run ids reaped this call.
+        """
+        config = self.config if self._static_config else load_config()
+        self.config = config
+        clock = time.time() if now is None else now
+        reaped: list[str] = []
+        with self._lock:
+            live_run_ids = set(self._runs)
+        for record in self.store.list_runs(limit=10_000):
+            run_id = str(record.get("runId") or "")
+            if not run_id or run_id in live_run_ids:
+                continue
+            if record.get("status") not in self._ACTIVE_STATUSES:
+                continue
+            if not self._is_orphan(record, clock, config):
+                continue
+            # Re-load under no lock contention; another process could have
+            # finalized it between listing and now. Skip if it did.
+            fresh = self.store.load_run(run_id)
+            if not fresh or fresh.get("status") not in self._ACTIVE_STATUSES:
+                continue
+            self._mark_interrupted(fresh, clock)
+            reaped.append(run_id)
+        return reaped
+
+    def _is_orphan(self, record: dict[str, Any], clock: float, config: PluginConfig) -> bool:
+        owner = str(record.get("controlOwner") or "").strip()
+        owner_pid = _owner_pid(owner)
+        if owner_pid is not None:
+            # A parseable owner PID is the reliable signal: a dead PID is a
+            # definitive orphan (a gateway restart kills the old PID exactly
+            # this way). A LIVE PID is never reaped — it may be a concurrent
+            # gateway busy inside a long child-agent call with no recent
+            # journal event, and stale-reaping it would clobber a live run.
+            # We deliberately give up the rare PID-recycling case (an unrelated
+            # process inherited the number) rather than risk a false positive;
+            # the only cost is a stale record lingering until that PID frees.
+            return not _pid_alive(owner_pid)
+        # No parseable owner (older records, hand-edited data): liveness is
+        # unknowable, so staleness is the only available signal. Paused runs
+        # are intentionally idle, so never stale-reap them.
+        if record.get("status") == "paused":
+            return False
+        idle = clock - _last_activity_epoch(record)
+        return idle >= max(0.0, config.orphan_grace_seconds)
+
+    def _mark_interrupted(self, record: dict[str, Any], clock: float) -> None:
+        harvested = _harvest_journal_cache(record)
+        if harvested:
+            cache = record.get("agentCache")
+            if not isinstance(cache, dict):
+                cache = {}
+            for fingerprint, results in harvested.items():
+                cache.setdefault(fingerprint, []).extend(results)
+            record["agentCache"] = cache
+        record["status"] = "interrupted"
+        record["finishedAt"] = utc_now_iso()
+        record.setdefault("error", None)
+        if not record.get("error"):
+            record["error"] = (
+                "Run interrupted: the Hermes process that owned it exited "
+                "before it finished (e.g. a gateway restart)."
+            )
+        self.store.save_run(record)
+
+    def auto_resume_orphans(
+        self,
+        reaped_run_ids: list[str],
+        *,
+        now: float | None = None,
+    ) -> list[str]:
+        """Relaunch freshly-reaped orphans (gated; off by default).
+
+        Only the runs ``reap_orphans`` just marked ``interrupted`` this boot
+        are candidates — never historical interrupted runs. Each candidate must
+        also be recent (within ``auto_resume_window_seconds`` of its last
+        activity) and have its script still on disk. At most
+        ``auto_resume_max`` are revived per call. Each relaunch reuses the
+        harvested cache via ``resumeFromRunId`` so completed agents are not
+        re-run, and carries the persisted ``sessionContext`` so its completion
+        message routes back to the originating chat.
+
+        Returns the new run ids started.
+        """
+        config = self.config if self._static_config else load_config()
+        self.config = config
+        if not config.auto_resume_on_boot:
+            return []
+        # Only a process that actually hosts the gateway loop can keep a resumed
+        # run alive and route its completion back to the originating chat. Any
+        # process can build a manager (a short-lived CLI/tool invocation calls
+        # get_run_manager() too); if such a process relaunched runs they would
+        # execute on daemon threads and be killed again the instant it exits,
+        # causing interrupt/resume churn and wasted spend. Reaping is universal
+        # (safe, just bookkeeping); resuming is gateway-only.
+        if not _gateway_loop_present():
+            return []
+        clock = time.time() if now is None else now
+        started: list[str] = []
+        for run_id in reaped_run_ids:
+            if len(started) >= max(1, config.auto_resume_max):
+                break
+            record = self.store.load_run(run_id)
+            if not record or record.get("status") != "interrupted":
+                continue
+            idle = clock - _last_activity_epoch(record)
+            if idle > max(0.0, config.auto_resume_window_seconds):
+                continue
+            script_path = str(record.get("scriptPath") or "")
+            if not script_path or not Path(script_path).is_file():
+                continue
+            try:
+                new_record = self.start_from_params(
+                    {"scriptPath": script_path, "resumeFromRunId": run_id, "args": record.get("args")},
+                    cwd=str(record.get("cwd") or os.getcwd()),
+                    host_session_id=str(record.get("workflowSessionId") or "") or None,
+                    launch_approved=True,
+                    token_budget_total_override=record.get("tokenBudget"),
+                    session_context_override=record.get("sessionContext") or None,
+                )
+            except Exception:
+                continue
+            new_run_id = str(new_record.get("runId") or "")
+            if new_run_id:
+                started.append(new_run_id)
+        return started
+
+    def reap_and_maybe_resume(self) -> dict[str, list[str]]:
+        """Boot entrypoint: reap orphans, then auto-resume if enabled.
+
+        Reaping is always safe and fast (a few file reads/writes), so it runs
+        synchronously. Auto-resume is gated by ``auto_resume_on_boot`` and only
+        acts on the just-reaped runs.
+        """
+        reaped = self.reap_orphans()
+        resumed = self.auto_resume_orphans(reaped) if reaped else []
+        return {"reaped": reaped, "resumed": resumed}
 
     def stop(self, run_id: str) -> bool:
         with self._lock:
@@ -747,6 +916,144 @@ def _write_output_file(record: dict[str, Any], store: WorkflowStore) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     record["outputFile"] = str(path)
+
+
+def _owner_pid(owner: str) -> int | None:
+    """Extract the launching PID from a controlOwner string.
+
+    ``new_control_owner()`` formats it as ``"<pid>-<uuid12>"`` (see
+    storage/control.py). Returns None when the owner is empty or unparseable
+    (older records, hand-edited data) so the caller falls back to staleness.
+    """
+    head = str(owner or "").strip().split("-", 1)[0]
+    if not head.isdigit():
+        return None
+    try:
+        pid = int(head)
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def _pid_alive(pid: int) -> bool:
+    """Best-effort liveness check for a local PID via signal 0.
+
+    ``os.kill(pid, 0)`` raises ProcessLookupError when no such process exists
+    and PermissionError when it exists but is owned by another user (still
+    alive). Any other OSError is treated as "assume alive" so we never reap a
+    run we cannot prove is dead.
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def _gateway_loop_present() -> bool:
+    """True only inside a process that hosts a running gateway loop.
+
+    Mirrors how _send_gateway_text resolves the runner + loop: an auto-resumed
+    run is only viable where the gateway loop lives (it keeps the run alive and
+    routes its completion message). Returns False outside a gateway (CLI/TUI,
+    tests, headless tool processes), where auto-resume must not act.
+    """
+    try:
+        from ..host import gateway as host_gateway
+
+        runner = host_gateway.gateway_runner_ref()
+    except Exception:
+        return False
+    if runner is None:
+        return False
+    return getattr(runner, "_gateway_loop", None) is not None
+
+
+def _parse_iso_epoch(value: Any) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        from datetime import datetime
+
+        return datetime.fromisoformat(text).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _last_activity_epoch(record: dict[str, Any]) -> float:
+    """Best-effort wall-clock epoch of a run's most recent activity.
+
+    Prefers the journal file's mtime (touched on every agent event), then the
+    run record's own ISO timestamps. Falls back to 0.0 (epoch) so a record with
+    no usable signal reads as maximally stale and is reaped by the grace
+    backstop rather than lingering active forever.
+    """
+    candidates: list[float] = []
+    journal = str(record.get("journalFile") or "")
+    if journal:
+        try:
+            candidates.append(Path(journal).stat().st_mtime)
+        except OSError:
+            pass
+    for key in ("resumedAt", "pausedAt", "startedAt", "createdAt"):
+        epoch = _parse_iso_epoch(record.get(key))
+        if epoch is not None:
+            candidates.append(epoch)
+    return max(candidates) if candidates else 0.0
+
+
+def _harvest_journal_cache(record: dict[str, Any]) -> dict[str, list[Any]]:
+    """Rebuild the resume cache from a run's journal.
+
+    Every completed (or cached) agent writes a ``{"type": "result", "key":
+    "v2:<fingerprint>", "result": ...}`` event to the journal as it finishes
+    (engine/api.py). The persisted ``agentCache``, by contrast, is only flushed
+    at terminal state — so a hard-killed run has the answers in its journal but
+    an empty cache. This reads those result events back into the
+    ``{fingerprint: [results]}`` shape ``ResumeCache`` consumes, keyed by the
+    fingerprint embedded in ``key`` (the ``v2:`` prefix stripped). Skipped
+    agents (result None) are recorded too, so a resume reproduces the skip
+    rather than re-running. Errors are not harvested — a failed agent should
+    re-run on resume. Best-effort and tolerant of a partial/corrupt journal.
+    """
+    journal = str(record.get("journalFile") or "")
+    if not journal:
+        return {}
+    path = Path(journal)
+    if not path.is_file():
+        return {}
+    harvested: dict[str, list[Any]] = {}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(event, dict) or event.get("type") != "result":
+                    continue
+                key = str(event.get("key") or "")
+                if not key.startswith("v2:"):
+                    continue
+                fingerprint = key[3:]
+                if not fingerprint:
+                    continue
+                harvested.setdefault(fingerprint, []).append(event.get("result"))
+    except OSError:
+        return {}
+    return harvested
 
 
 def _resolve_workflow_session_id(plugin_context: Any, *, host_session_id: str | None = None) -> str:
@@ -1411,6 +1718,19 @@ _MANAGER_LOCK = threading.Lock()
 def get_run_manager() -> WorkflowRunManager:
     global _MANAGER
     with _MANAGER_LOCK:
+        first_build = _MANAGER is None
         if _MANAGER is None:
             _MANAGER = WorkflowRunManager(enable_control=True)
-        return _MANAGER
+        manager = _MANAGER
+    if first_build:
+        # On the first manager build of this process, reap runs orphaned by a
+        # prior process (e.g. the gateway we just replaced) so they stop lying
+        # "running", and auto-resume the fresh orphans if enabled. Reaping is a
+        # few file ops (synchronous); the resume relaunches run on their own
+        # daemon threads inside start_from_params, so this whole hook is fast.
+        # Best-effort: never let boot bookkeeping break manager construction.
+        try:
+            manager.reap_and_maybe_resume()
+        except Exception:
+            pass
+    return manager

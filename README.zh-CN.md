@@ -63,7 +63,35 @@ plugins:
         auto_workflow_effort: xhigh    # /autoflow 开启时，对被引导消息应用的推理强度
         auto_workflow_default_on: false # 为 true 时每个会话默认 ON，除非运行 /autoflow off（会提高所有聊天的成本）
         auto_workflow_min_chars: 24    # 判定为「实质性」消息的最小长度（廉价预过滤，无 LLM 调用）
+        orphan_grace_seconds: 900      # 无「PID 已死」信号时，判定为陈旧并回收的空闲时间窗（兜底 PID 复用）
+        auto_resume_on_boot: false     # 为 true 时在启动时重新拉起刚回收的孤儿运行（从缓存恢复）；默认关闭
+        auto_resume_max: 3             # 每次启动自动恢复的孤儿运行数上限（防止恢复风暴）
+        auto_resume_window_seconds: 21600 # 仅自动恢复最近活动在此时间窗内的孤儿运行（6 小时）
 ```
+
+## 崩溃恢复（孤儿回收 + 自动恢复）
+
+运行在启动它的 Hermes 进程内执行（gateway 守护进程或 CLI）。如果该进程在运行
+进行中退出——最常见的是 `hermes gateway restart`——运行线程随之死亡，来不及写入
+终态，因此其记录被永久冻结在 `running`，`/workflows` 会一直把它显示为存活。
+
+下次 manager 启动时，插件会**回收**这些孤儿：任何仍处于活动状态、但其所属进程已
+消失的运行，会被翻转为新的终态 `interrupted`。「消失」有两种判定方式——运行的
+owner PID 不再存活（主信号；重启正是这样杀掉旧 PID），或运行空闲超过
+`orphan_grace_seconds`（兜底 PID 复用以及无可解析 owner 的记录）。仍由存活进程
+持有的运行——另一个 gateway，或独立的 `hermes-workflows` TUI——永不触碰。
+
+在标记 `interrupted` 之前，回收器会把运行 journal 中每个已完成子代理的结果**收割**
+回其恢复缓存。每个代理在完成时就把结果写入 journal，且使用与恢复缓存相同的指纹键，
+因此崩溃不会丢失任何已完成的工作——这些结果只需被重新拾起。这使后续任何恢复都很
+廉价：已完成的代理被复用，只有未完成的才重跑。
+
+`auto_resume_on_boot`（出厂**关闭**）更进一步：开启后，manager 会重新拉起它刚回收的
+运行，从收割的缓存恢复，从而跳过已完成的代理。它是有界的——每次启动最多
+`auto_resume_max` 个、仅最近活动在 `auto_resume_window_seconds` 内、仅当脚本仍在磁盘上、
+且仅当存在 gateway 循环可把完成消息路由回来源聊天（运行的路由上下文——平台/聊天/线程，
+绝不含凭据——正为此持久化在记录上）。常规使用请保持关闭（重启往往是有意的，恢复会
+花费 token）；在运行应始终完成的无人值守 / 基准测试场景再开启。
 
 ## Script API
 

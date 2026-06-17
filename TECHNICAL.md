@@ -359,6 +359,53 @@ scheduling order changes, unchanged calls still hit. When editing the script, tr
 the early, stable `agent()` calls: an early change flows downstream into later prompts and
 reduces reuse, while a late change preserves more of the cache.
 
+### Crash recovery: orphan reaping + journal harvest + auto-resume
+
+A run executes on a daemon thread inside the launching process. If that process exits
+mid-run (`hermes gateway restart` is the common case), the thread dies before
+`_run_thread` can write a terminal state, so the record is frozen at an active status
+(`running`) forever and `/workflows` keeps showing it as live.
+
+**Reaping** (`WorkflowRunManager.reap_orphans`, run once on the first `get_run_manager()`
+of a process via `reap_and_maybe_resume`): for each stored run still in an active state
+(`queued`/`running`/`paused`/`stopping`) and **not** owned by this live manager, decide
+orphan-hood:
+
+- **Dead owner PID** — `controlOwner` is `"<pid>-<uuid>"`; if that PID fails an
+  `os.kill(pid, 0)` liveness check it is the primary orphan signal (a restart kills the
+  old PID exactly this way). `PermissionError` counts as alive (foreign-owned), so a
+  run is never reaped unless provably dead.
+- **Staleness backstop** — if the PID is alive (possibly recycled) or unparseable, and
+  the run has been idle past `orphan_grace_seconds` (last journal mtime / ISO
+  timestamps), reap it. Paused runs are exempt from staleness (intentionally idle); only
+  a dead PID reaps a paused run.
+
+Orphans are flipped to a new terminal status, **`interrupted`** (distinct from `failed`,
+which is a workflow-logic error). A run still in `self._runs` (owned by this live process)
+is always skipped.
+
+**Journal harvest** (`_harvest_journal_cache`, the keystone): `agentCache` on the record
+is only flushed at terminal state, so a hard-killed run has an empty cache even though
+agents completed. But every agent writes a `{"type":"result","key":"v2:<fingerprint>",
+"result":…}` event to `journal.jsonl` *as it finishes*, keyed by the exact resume-cache
+fingerprint. Before marking `interrupted`, the reaper replays those `result` events into
+`agentCache` (`{fingerprint: [results]}`), so a later resume reuses completed agents
+instead of re-running them. Skips (result `None`) are harvested too; errors are not (a
+failed agent should re-run). No change to the hot write path — the journal already is the
+durable per-agent record.
+
+**Auto-resume** (`auto_resume_orphans`, gated by `auto_resume_on_boot`, shipped **off**):
+relaunches each just-reaped run via `start_from_params({scriptPath, resumeFromRunId,
+args}, launch_approved=True, …)`, loading the harvested cache through
+`ResumeCache.from_run`. Bounded by `auto_resume_max` per boot, `auto_resume_window_seconds`
+recency, script-still-on-disk, and only acts on runs reaped *this* boot (never historical
+`interrupted` runs). To route the completion message back to the origin chat after a
+restart, the run's **`sessionContext`** (platform/chat/thread/user — routing only, never
+credentials; `parent_runtime` with secrets stays off-record on the in-memory `ManagedRun`)
+is persisted on the record. When `parent_runtime` is absent at boot, child model resolution
+falls back to Hermes config (`HERMES_INFERENCE_MODEL` / `model.default`), so a resumed run
+still resolves a model.
+
 ## Token Budget
 
 `budget.total` is parsed from a target in the current user message (`+500k`,

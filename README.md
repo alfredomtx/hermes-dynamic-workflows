@@ -69,6 +69,10 @@ plugins:
         auto_workflow_effort: xhigh    # Reasoning effort applied to steered messages while /autoflow is ON
         auto_workflow_default_on: false # When true, every session starts ON unless it runs /autoflow off (raises cost across all chats)
         auto_workflow_min_chars: 24    # Min message length to count as "substantive" (cheap prefilter, no LLM call)
+        orphan_grace_seconds: 900      # Idle window before a run with no dead-PID signal is reaped as stale (backstops PID recycling)
+        auto_resume_on_boot: false     # When true, relaunch freshly-reaped orphans on boot (resumes from cache); shipped off
+        auto_resume_max: 3             # Max orphans auto-resumed per boot (bounds a resurrection storm)
+        auto_resume_window_seconds: 21600 # Only auto-resume orphans whose last activity was within this window (6h)
 ```
 
 ## Autoflow (ultracode-style auto-workflow steering)
@@ -108,6 +112,40 @@ When a workflow launches, `notify_on_launch` (default on) posts a concise
 the result at the end — so each run is bracketed with start/end markers in the
 chat, with timing visible. Useful when autoflow auto-launches runs with
 approval off and you want to keep an eye on what fired and how long it took.
+
+## Crash recovery (orphan reaping + auto-resume)
+
+A run executes inside the Hermes process that launched it (the gateway daemon
+or a CLI). If that process exits while a run is in flight — a `hermes gateway
+restart` is the usual cause — the run thread dies with it and never gets to
+write a terminal status, so its record is frozen at `running` forever and
+`/workflows` keeps showing it as live.
+
+On the next manager boot the plugin **reaps** such orphans: any run still in an
+active state whose owning process is gone is flipped to a new terminal status,
+`interrupted`. "Gone" is detected two ways — the run's owner PID is no longer
+alive (primary signal; a restart kills the old PID exactly this way), or the
+run has been idle past `orphan_grace_seconds` (a backstop for PID recycling and
+for records with no parseable owner). A run still owned by a live process —
+another gateway, or a standalone `hermes-workflows` TUI — is never touched.
+
+Before marking a run `interrupted`, the reaper **harvests** every completed
+child-agent result from the run's journal back into its resume cache. Each
+agent writes its result to the journal as it finishes, keyed by the same
+fingerprint the resume cache uses, so a crash loses nothing that already
+completed — those results just need to be picked back up. This makes any later
+resume cheap: the finished agents are reused, only the unfinished ones re-run.
+
+`auto_resume_on_boot` (shipped **off**) takes the next step: when on, the
+manager relaunches the runs it just reaped, resuming from the harvested cache
+so completed agents are skipped. It's bounded — at most `auto_resume_max` per
+boot, only runs whose last activity was within `auto_resume_window_seconds`,
+only when their script is still on disk, and only when a gateway loop is
+present to route the completion message back to the originating chat (the
+run's routing context — platform/chat/thread, never credentials — is persisted
+on the record for exactly this). Leave it off for normal use (a restart is
+often intentional and resuming spends tokens); turn it on for unattended /
+benchmark setups where runs should always finish.
 
 ## Script API
 
