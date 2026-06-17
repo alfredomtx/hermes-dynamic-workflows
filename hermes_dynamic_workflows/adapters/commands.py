@@ -6,16 +6,25 @@ import os
 from typing import Any
 
 from ..run.manager import get_run_manager
+from ..view.render import render_agent_overview
 
 
 def workflows_command(raw_args: str = "", *, plugin_context: Any = None) -> str:
     arg = (raw_args or "").strip()
     if arg:
         return "Usage: /workflows\nFor live monitoring and controls, run `hermes-workflows` in a terminal."
-    return get_run_manager().format_agent_overview(
-        limit=12,
-        session_id=_current_session_id(plugin_context) or None,
-    )
+    manager = get_run_manager()
+    session_id = _current_session_id(plugin_context) or None
+    # Session-scoped view first. The gateway mints a fresh session id on each
+    # restart / new-session window, while a run is tagged with the session id
+    # active at launch — so after a restart the strict filter hides every prior
+    # run ("No workflow runs found." despite live runs existing). Fall back to
+    # the recent-runs view (unfiltered) so runs stay visible across restarts.
+    if session_id:
+        scoped = manager.list(limit=12, session_id=session_id)
+        if scoped:
+            return render_agent_overview(scoped)
+    return render_agent_overview(manager.list(limit=12, session_id=None))
 
 
 def _current_session_id(plugin_context: Any = None) -> str:

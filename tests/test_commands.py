@@ -42,6 +42,37 @@ class CommandTests(unittest.TestCase):
         self.assertIn("agent-session-workflow", output)
         self.assertNotIn("cli-session-workflow", output)
 
+    def test_workflows_command_falls_back_to_recent_when_session_has_none(self):
+        # After a gateway restart the current session id matches no run (runs are
+        # tagged with the session active at launch). The command must fall back
+        # to recent runs instead of "No workflow runs found.".
+        with tempfile.TemporaryDirectory() as tmp:
+            store = WorkflowStore(Path(tmp))
+            _save_run(store, "wf_launch11-aaa", "sess-at-launch", "launched-workflow")
+            manager = WorkflowRunManager(store=store)
+
+            with patch("hermes_dynamic_workflows.adapters.commands.get_run_manager", return_value=manager):
+                # A fresh post-restart session id with zero scoped runs.
+                output = workflows_command(plugin_context=SimpleNamespace(session_id="sess-after-restart"))
+
+        self.assertIn("launched-workflow", output)
+        self.assertNotIn("No workflow runs found", output)
+
+    def test_workflows_command_scoped_view_still_excludes_other_sessions(self):
+        # When the current session DOES have runs, the scoped view wins and the
+        # fallback does not leak other sessions' runs.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = WorkflowStore(Path(tmp))
+            _save_run(store, "wf_mine111-aaa", "sess-current", "my-workflow")
+            _save_run(store, "wf_other22-bbb", "sess-other", "other-workflow")
+            manager = WorkflowRunManager(store=store)
+
+            with patch("hermes_dynamic_workflows.adapters.commands.get_run_manager", return_value=manager):
+                output = workflows_command(plugin_context=SimpleNamespace(session_id="sess-current"))
+
+        self.assertIn("my-workflow", output)
+        self.assertNotIn("other-workflow", output)
+
 
 def _save_run(store: WorkflowStore, run_id: str, session_id: str, name: str) -> None:
     started = datetime.now(timezone.utc) - timedelta(seconds=10)
