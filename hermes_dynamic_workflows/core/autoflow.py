@@ -57,35 +57,40 @@ class AutoflowState:
 
     Keyed by the gateway's canonical session_key (the same key
     ``_set_session_reasoning_override`` / ``_resolve_session_reasoning_config``
-    use). Sticky: once ON it stays ON until ``/autoflow off`` for that session.
-    Process-lifetime only — not persisted, matching ultracode resetting on a
-    new session.
+    use). Sticky: a session's explicit `/autoflow on|off` choice persists for
+    the process lifetime (not persisted to disk, matching ultracode resetting
+    on a new session).
+
+    Override semantics: the store records only EXPLICIT per-session choices. A
+    session with no explicit choice resolves to the ``default`` passed to
+    ``is_on`` (driven by ``auto_workflow_default_on``). So with default-on, a
+    fresh session is ON until it runs ``/autoflow off``; with default-off, it
+    is OFF until ``/autoflow on``. ``/autoflow off`` under default-on records an
+    explicit False that survives — it is not the same as "unset".
     """
 
     def __init__(self) -> None:
-        self._on: set[str] = set()
+        self._explicit: dict[str, bool] = {}
         self._lock = threading.RLock()
 
-    def is_on(self, session_key: str) -> bool:
+    def is_on(self, session_key: str, default: bool = False) -> bool:
         if not session_key:
             return False
         with self._lock:
-            return session_key in self._on
+            return self._explicit.get(session_key, default)
 
     def set(self, session_key: str, enabled: bool) -> bool:
-        """Set the mode for a session. Returns the resulting state (bool)."""
+        """Record an explicit per-session choice. Returns the resulting state."""
         if not session_key:
             return False
         with self._lock:
-            if enabled:
-                self._on.add(session_key)
-            else:
-                self._on.discard(session_key)
-            return session_key in self._on
+            self._explicit[session_key] = bool(enabled)
+            return self._explicit[session_key]
 
     def clear(self, session_key: str) -> None:
+        """Drop the explicit choice so the session falls back to the default."""
         with self._lock:
-            self._on.discard(session_key)
+            self._explicit.pop(session_key, None)
 
 
 # Module-level singleton: the hook and the command share one store, and they

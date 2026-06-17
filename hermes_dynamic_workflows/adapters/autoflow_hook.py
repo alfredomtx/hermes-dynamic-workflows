@@ -139,7 +139,12 @@ def pre_gateway_dispatch_handler(
 
     cfg = load_config()
     store = autoflow_state()
-    decision = decide(text, is_on=store.is_on(session_key), min_chars=cfg.auto_workflow_min_chars)
+    default_on = cfg.auto_workflow_default_on
+    decision = decide(
+        text,
+        is_on=store.is_on(session_key, default_on),
+        min_chars=cfg.auto_workflow_min_chars,
+    )
 
     kind = decision.get("kind")
 
@@ -165,11 +170,14 @@ def pre_gateway_dispatch_handler(
                 pass
             _send_confirmation(gateway, source, "autoflow OFF. Back to normal turn-by-turn handling.")
         else:  # status
-            current = "ON" if store.is_on(session_key) else "OFF"
+            on = store.is_on(session_key, default_on)
+            current = "ON" if on else "OFF"
+            default_note = " (default-on for all sessions)" if default_on else ""
             _send_confirmation(
                 gateway,
                 source,
-                f"autoflow is {current} for this session. Use /autoflow on or /autoflow off.",
+                f"autoflow is {current}{default_note} for this session. "
+                "Use /autoflow on or /autoflow off.",
             )
         return {"action": "skip", "reason": "autoflow-toggle"}
 

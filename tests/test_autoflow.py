@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from unittest.mock import patch
 
 from hermes_dynamic_workflows.core import autoflow
 from hermes_dynamic_workflows.core.autoflow import (
@@ -10,6 +11,7 @@ from hermes_dynamic_workflows.core.autoflow import (
     is_substantive,
     parse_toggle_command,
 )
+from hermes_dynamic_workflows.core.config import PluginConfig
 from hermes_dynamic_workflows.adapters import autoflow_hook
 from hermes_dynamic_workflows.adapters.autoflow_hook import decide, pre_gateway_dispatch_handler
 
@@ -78,6 +80,22 @@ class AutoflowStateTests(unittest.TestCase):
         st = AutoflowState()
         self.assertFalse(st.set("", True))
         self.assertFalse(st.is_on(""))
+
+    def test_default_on_semantics(self):
+        st = AutoflowState()
+        # Unset session resolves to the passed default.
+        self.assertFalse(st.is_on("s1", False))
+        self.assertTrue(st.is_on("s1", True))
+        # Explicit off survives even under default-on.
+        st.set("s1", False)
+        self.assertFalse(st.is_on("s1", True))
+        # Explicit on survives even under default-off.
+        st.set("s2", True)
+        self.assertTrue(st.is_on("s2", False))
+        # clear() drops the explicit choice -> back to default.
+        st.clear("s1")
+        self.assertTrue(st.is_on("s1", True))
+        self.assertFalse(st.is_on("s1", False))
 
 
 class DecideTests(unittest.TestCase):
@@ -191,6 +209,37 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_session_key_bails(self):
         gw = FakeGateway(session_key="")
         result = pre_gateway_dispatch_handler(event=FakeEvent("/autoflow on", FakeSource()), gateway=gw)
+        self.assertIsNone(result)
+
+
+class DefaultOnHandlerTests(unittest.IsolatedAsyncioTestCase):
+    """auto_workflow_default_on=True: fresh sessions steer without /autoflow on,
+    and an explicit /autoflow off still wins."""
+
+    def setUp(self):
+        autoflow._STATE = AutoflowState()
+
+    async def test_default_on_steers_fresh_session(self):
+        gw = FakeGateway()
+        src = FakeSource(thread_id="7")
+        msg = "audit every API endpoint under src/routes for missing auth checks across the app"
+        with patch.object(autoflow_hook, "load_config", return_value=PluginConfig(auto_workflow_default_on=True)):
+            # No /autoflow on issued — default-on should steer anyway.
+            result = pre_gateway_dispatch_handler(event=FakeEvent(msg, src), gateway=gw)
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["action"], "rewrite")
+        self.assertIn("[autoflow on]", result["text"])
+        self.assertEqual(gw.reasoning_overrides.get(gw._session_key), {"enabled": True, "effort": "xhigh"})
+
+    async def test_default_on_explicit_off_disables_session(self):
+        gw = FakeGateway()
+        src = FakeSource(thread_id="7")
+        msg = "audit every API endpoint under src/routes for missing auth checks across the app"
+        with patch.object(autoflow_hook, "load_config", return_value=PluginConfig(auto_workflow_default_on=True)):
+            # Explicit off records a sticky False that beats default-on.
+            off = pre_gateway_dispatch_handler(event=FakeEvent("/autoflow off", src), gateway=gw)
+            self.assertEqual(off, {"action": "skip", "reason": "autoflow-toggle"})
+            result = pre_gateway_dispatch_handler(event=FakeEvent(msg, src), gateway=gw)
         self.assertIsNone(result)
 
 

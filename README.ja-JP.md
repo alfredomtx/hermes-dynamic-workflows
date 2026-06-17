@@ -68,6 +68,7 @@ plugins:
         notify_result_preview_chars: 2000  # 通知での結果プレビューの切り詰め長（文字数）
         notify_on_launch: true        # 起動時に起点となった gateway チャットへ「workflow 開始」マーカーを送信
         auto_workflow_effort: xhigh    # /autoflow が ON のとき、誘導されたメッセージに適用する推論強度
+        auto_workflow_default_on: false # true の場合、各セッションはデフォルトで ON（/autoflow off を実行するまで）。全チャットのコストが上がる
         auto_workflow_min_chars: 24    # 「実質的」とみなす最小メッセージ長（安価な事前フィルタ、LLM 呼び出しなし）
 ```
 

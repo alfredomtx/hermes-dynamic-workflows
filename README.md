@@ -67,6 +67,7 @@ plugins:
         notify_on_launch: true        # Send a "workflow started" marker to the origin gateway chat at launch
         notify_result_preview_chars: 2000  # Truncation length (chars) for the result preview in notifications
         auto_workflow_effort: xhigh    # Reasoning effort applied to steered messages while /autoflow is ON
+        auto_workflow_default_on: false # When true, every session starts ON unless it runs /autoflow off (raises cost across all chats)
         auto_workflow_min_chars: 24    # Min message length to count as "substantive" (cheap prefilter, no LLM call)
 ```
 
@@ -83,6 +84,12 @@ type "use a workflow" each time. This is Hermes' analogue of Claude Code's
 /autoflow off      # back to normal turn-by-turn handling
 /autoflow          # report current state
 ```
+
+Set `auto_workflow_default_on: true` to make **every** gateway session start ON
+without anyone typing `/autoflow on` — each session stays ON until it runs
+`/autoflow off` (an explicit off is sticky and beats the default). Shipped
+default is false; turning it on raises cost across every connected chat, so
+it's intended for benchmarking / always-orchestrate setups.
 
 While on, each substantive inbound message:
 
