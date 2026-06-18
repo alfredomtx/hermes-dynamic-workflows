@@ -90,6 +90,24 @@ class PluginConfig:
     # useful when autoflow auto-launches workflows with approval off.
     notify_on_launch: bool = True
     notify_result_preview_chars: int = 2000
+    # Live, edited-in-place progress bubble in gateway chats. When on (default)
+    # and the run originates from a gateway session, the plugin posts ONE
+    # message at launch and EDITS it in place as phases/agents progress, then
+    # finalizes it with the result on completion — so the user sees readable
+    # live progress without running /workflows. Edits (not new sends) are used
+    # for the mid-run updates, so this does not trip Telegram per-chat send
+    # flood limits. When on and active, it replaces the separate launch marker
+    # and gateway completion text (one evolving bubble instead of three
+    # messages); the in-conversation <task-notification> injection is
+    # unaffected. Falls back to the launch+completion markers if the bubble
+    # cannot be seeded (no gateway context, adapter without edit support, or a
+    # send failure). CLI sessions are unaffected (no bubble).
+    notify_progress: bool = True
+    # Minimum seconds between in-place edits of the progress bubble. A floor,
+    # not a tick: edits only fire on a meaningful change (phase/agent count) and
+    # are skipped when the rendered text is unchanged. The launch seed and the
+    # final completion edit bypass this throttle.
+    notify_progress_min_interval_seconds: float = 6.0
     # --- Autoflow (ultracode-style auto-workflow steering) ---------------
     # A per-session mode toggled with `/autoflow on|off` in the gateway. While
     # ON for a session, each substantive inbound message (a) bumps reasoning
@@ -293,6 +311,18 @@ def load_config() -> PluginConfig:
         notify_on_launch=_as_bool(
             os.getenv("HERMES_DYNAMIC_WORKFLOWS_NOTIFY_ON_LAUNCH", raw.get("notify_on_launch")),
             default.notify_on_launch,
+        ),
+        notify_progress=_as_bool(
+            os.getenv("HERMES_DYNAMIC_WORKFLOWS_NOTIFY_PROGRESS", raw.get("notify_progress")),
+            default.notify_progress,
+        ),
+        notify_progress_min_interval_seconds=_as_float(
+            os.getenv(
+                "HERMES_DYNAMIC_WORKFLOWS_NOTIFY_PROGRESS_MIN_INTERVAL_SECONDS",
+                raw.get("notify_progress_min_interval_seconds"),
+            ),
+            default.notify_progress_min_interval_seconds,
+            minimum=0.0,
         ),
         notify_result_preview_chars=_as_int(
             raw.get("notify_result_preview_chars"),

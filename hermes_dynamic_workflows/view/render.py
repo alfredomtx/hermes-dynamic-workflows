@@ -1,10 +1,28 @@
-"""Text rendering for workflow status snapshots."""
+"""Text rendering for workflow status snapshots.
+
+Two audiences, two densities:
+
+* The compact, glanceable renderers (``render_agent_overview``,
+  ``render_run_progress``) are what a human reads in a chat / the ``/workflows``
+  command. They use emoji status, a phase + done/total summary, and short agent
+  chips. Per-agent token/cache/tool telemetry is noise here and is hidden unless
+  ``verbose=True``.
+* The detailed tree (``render_workflow_text``) and the verbose row
+  (``render_agent_row``) keep the full instrumentation for the saved markdown
+  record and ``verbose`` callers.
+"""
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from ..core.text import preview
+
+# Hard cap on an agent label inside a compact chip. Agent labels are often the
+# full prompt (a paragraph), which is what made the old overview unreadable.
+_CHIP_LABEL_MAX = 32
+_RUNNING_STATES = {"queued", "running", "paused", "stopping"}
 
 
 def render_workflow_text(snapshot: dict[str, Any], *, completed: bool = True, max_agents: int = 12) -> str:
@@ -25,49 +43,54 @@ def render_workflow_text(snapshot: dict[str, Any], *, completed: bool = True, ma
     return "\n".join(parts)
 
 
-def render_agent_overview(runs: list[dict[str, Any]], *, max_agents_per_run: int = 6) -> str:
+def render_agent_overview(
+    runs: list[dict[str, Any]],
+    *,
+    max_chips_per_run: int = 6,
+    verbose: bool = False,
+) -> str:
+    """Glanceable multi-run summary for the ``/workflows`` command.
+
+    One compact block per run: an emoji status, the workflow name, elapsed time,
+    a phase + done/total/running line, a row of short agent chips, and a short
+    id line (taskId/runId) because ``/workflows`` is the control surface used to
+    stop/resume a run. Pass ``verbose=True`` to append the old per-agent
+    telemetry rows (tokens, cache reads, tool counts, agent type) under each run.
+    """
     if not runs:
         return "No workflow runs found.\n\nRun `hermes-workflows` in a terminal for live monitoring and controls."
-    running = sum(1 for run in runs if run.get("status") in {"queued", "running", "paused", "stopping"})
+    running = sum(1 for run in runs if run.get("status") in _RUNNING_STATES)
     completed = sum(1 for run in runs if run.get("status") == "completed")
-    lines = ["Dynamic workflows", f"{running} running . {completed} completed", ""]
+    header_counts = []
+    if running:
+        header_counts.append(f"{running} running")
+    if completed:
+        header_counts.append(f"{completed} completed")
+    other = len(runs) - running - completed
+    if other > 0:
+        header_counts.append(f"{other} other")
+    lines = ["Dynamic workflows", " · ".join(header_counts) or f"{len(runs)} run(s)", ""]
     for run in runs:
-        snapshot = run.get("workflow") or {}
-        meta = snapshot.get("meta") or {}
-        name = meta.get("name") or run.get("source", {}).get("ref") or "workflow"
-        totals = _totals(snapshot)
-        errors = totals.get("errors") or 0
-        if errors:
-            status_line = f"{totals['done']}/{totals['agents']} agents done . {errors} err"
-        else:
-            status_line = f"{totals['done']}/{totals['agents']} agents done"
-        if totals["running"]:
-            status_line += f" . {totals['running']} running"
-        status_line += (
-            f" . {_format_tokens(totals['tokens'])} tokens . "
-            f"{_format_duration(_duration(run, snapshot))} . {run.get('status')}"
-        )
-        task_id = str(run.get("taskId") or "")
-        task_part = f"Task: {task_id} . " if task_id else ""
-        lines.append(f"{status_icon(run.get('status'))} {name}  {run.get('runId')}")
-        lines.append(f"  {task_part}{status_line}")
-        agents = _all_agents(snapshot)
-        if agents:
-            for agent in agents[:max_agents_per_run]:
-                lines.append(f"  - {render_agent_row(agent)}")
-            hidden = len(agents) - max_agents_per_run
-            if hidden > 0:
-                lines.append(f"  - ... {hidden} more agent(s)")
-        else:
-            lines.append("  - no agents started")
+        lines.append(_render_run_block(run, max_chips=max_chips_per_run, verbose=verbose, include_ids=True))
         lines.append("")
     lines.append("Run `hermes-workflows` in a terminal for live monitoring and controls.")
     return "\n".join(lines).rstrip()
 
 
+def render_run_progress(run: dict[str, Any], *, max_chips: int = 8, verbose: bool = False) -> str:
+    """Compact single-run progress block.
+
+    Reused by the gateway live-progress bubble (launch / mid-run edits /
+    completion) so the chat shows the same readable visual language as
+    ``/workflows`` instead of raw telemetry. No id line: the launch/completion
+    markers around the bubble already carry the Task ID.
+    """
+    return _render_run_block(run, max_chips=max_chips, verbose=verbose, include_ids=False)
+
+
 def render_saved_markdown(run: dict[str, Any]) -> str:
     snapshot = run.get("workflow") or {}
-    completed = run.get("status") not in {"queued", "running", "paused", "stopping"}
+    completed = run.get("status") not in _RUNNING_STATES
     lines = ["# Workflow Run", "", render_workflow_text(snapshot, completed=completed), ""]
     if run.get("result") is not None:
         lines.extend(["## Result", "", preview(run.get("result"), 4000), ""])
@@ -77,6 +100,82 @@ def render_saved_markdown(run: dict[str, Any]) -> str:
         lines.extend(f"- {preview(error, 300)}" for error in errors)
         lines.append("")
     return "\n".join(lines)
+
+
+def _render_run_block(run: dict[str, Any], *, max_chips: int, verbose: bool, include_ids: bool = False) -> str:
+    snapshot = run.get("workflow") or {}
+    meta = snapshot.get("meta") or {}
+    name = meta.get("name") or run.get("source", {}).get("ref") or "workflow"
+    status = run.get("status")
+    totals = _totals(snapshot)
+    agents = _all_agents(snapshot)
+
+    # Line 1: status emoji, name, elapsed, terminal status word.
+    head = f"{status_emoji(status)} {name}"
+    duration = _duration(run, snapshot)
+    if duration:
+        head += f" · {_format_duration(duration)}"
+    if status and status not in {"running", "queued"}:
+        head += f" · {status}"
+    lines = [head]
+
+    # Line 2: phase + progress fraction + running + errors.
+    if totals["agents"]:
+        phase = _current_phase(snapshot)
+        progress = f"{totals['done']}/{totals['agents']} done"
+        bits = [progress]
+        if totals["running"]:
+            bits.append(f"{totals['running']} running")
+        if totals.get("errors"):
+            bits.append(f"{totals['errors']} err")
+        summary = " · ".join(bits)
+        lines.append(f"   {phase + ' · ' if phase else ''}{summary}")
+        # Line 3: agent chips (done/running/errored), truncated.
+        chips = _agent_chips(agents, max_chips=max_chips)
+        if chips:
+            lines.append(f"   {chips}")
+    else:
+        lines.append("   no agents started")
+
+    if include_ids:
+        task_id = str(run.get("taskId") or "")
+        run_id = str(run.get("runId") or "")
+        id_bits = [bit for bit in (f"Task: {task_id}" if task_id else "", run_id) if bit]
+        if id_bits:
+            lines.append(f"   {' · '.join(id_bits)}")
+
+    if verbose and agents:
+        for agent in agents[: max(max_chips, len(agents))]:
+            lines.append(f"   - {render_agent_row(agent)}")
+    return "\n".join(lines)
+
+
+def _agent_chips(agents: list[dict[str, Any]], *, max_chips: int) -> str:
+    """Render agents as short ``<marker> <label>`` chips.
+
+    Running and errored agents are surfaced first (they are what a watcher cares
+    about), then the rest in order, capped at ``max_chips`` with a ``… +K``
+    overflow tail.
+    """
+    if not agents:
+        return ""
+    active = [a for a in agents if a.get("status") in {"running", "error"}]
+    rest = [a for a in agents if a.get("status") not in {"running", "error"}]
+    ordered = active + rest
+    shown = ordered[:max_chips]
+    chips = [f"{_agent_marker(a.get('status'))} {_chip_label(a)}" for a in shown]
+    hidden = len(agents) - len(shown)
+    if hidden > 0:
+        chips.append(f"… +{hidden}")
+    return "  ".join(chips)
+
+
+def _chip_label(agent: dict[str, Any]) -> str:
+    label = str(agent.get("label") or f"agent-{agent.get('id', '?')}")
+    label = " ".join(label.split())  # collapse newlines/whitespace runs
+    if len(label) > _CHIP_LABEL_MAX:
+        label = label[: _CHIP_LABEL_MAX - 1].rstrip() + "…"
+    return label
 
 
 def render_agent_row(agent: dict[str, Any]) -> str:
@@ -107,6 +206,35 @@ def render_agent_row(agent: dict[str, Any]) -> str:
     return " . ".join(parts)
 
 
+def status_emoji(status: Any) -> str:
+    return {
+        "queued": "🕓",
+        "running": "🔄",
+        "stopping": "🛑",
+        "paused": "⏸",
+        "completed": "✅",
+        "done": "✅",
+        "error": "❌",
+        "failed": "❌",
+        "stopped": "⏹",
+        "interrupted": "⚠️",
+        "skipped": "⏭",
+    }.get(str(status or ""), "•")
+
+
+def _agent_marker(status: Any) -> str:
+    return {
+        "queued": "·",
+        "running": "⏳",
+        "paused": "⏸",
+        "done": "✓",
+        "completed": "✓",
+        "error": "✗",
+        "failed": "✗",
+        "skipped": "⏭",
+    }.get(str(status or ""), "·")
+
+
 def status_icon(status: Any) -> str:
     return {
         "queued": ".",
@@ -121,6 +249,24 @@ def status_icon(status: Any) -> str:
         "interrupted": "#",
         "skipped": "-",
     }.get(str(status or ""), "?")
+
+
+def _current_phase(snapshot: dict[str, Any]) -> str:
+    """Best-effort label of the phase the run is currently working in.
+
+    The phase of a running agent wins (that is where work is happening now);
+    otherwise the phase of the most recently touched agent; otherwise the last
+    declared phase. Empty string when the run has no phases at all.
+    """
+    agents = _all_agents(snapshot)
+    for agent in reversed(agents):
+        if agent.get("status") == "running" and agent.get("phase"):
+            return str(agent["phase"])
+    for agent in reversed(agents):
+        if agent.get("phase"):
+            return str(agent["phase"])
+    phases = _phase_names(snapshot, recursive=True)
+    return phases[-1] if phases else ""
 
 
 def _render_frame_tree(parts: list[str], frame: dict[str, Any], *, indent: str, max_agents: int) -> None:
@@ -212,9 +358,28 @@ def _all_errors(snapshot: dict[str, Any]) -> list[str]:
 
 def _duration(run: dict[str, Any], snapshot: dict[str, Any]) -> float:
     value = snapshot.get("duration_seconds")
-    if isinstance(value, (int, float)):
+    if isinstance(value, (int, float)) and value > 0:
         return float(value)
-    return 0.0
+    # Live runs may not have a snapshot duration yet; derive from wall clock so
+    # the progress bubble shows a ticking elapsed time between edits.
+    started = _parse_iso(run.get("startedAt"))
+    if started is None:
+        return 0.0
+    finished = _parse_iso(run.get("finishedAt")) or datetime.now(timezone.utc)
+    return max(0.0, (finished - started).total_seconds())
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        text = str(value).replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def _totals(snapshot: dict[str, Any]) -> dict[str, int]:

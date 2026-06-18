@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import threading
@@ -28,7 +29,9 @@ from ..storage.store import (
 )
 from ..storage.control import ControlListener, new_control_owner
 from ..view.render import (
+    _RUNNING_STATES,
     render_agent_overview,
+    render_run_progress,
     render_saved_markdown,
     render_workflow_text,
 )
@@ -46,6 +49,12 @@ from .transcripts import (
 )
 
 
+# Max seconds _notify_completion waits for an in-flight seed send to resolve its
+# message id before handing completion to the seed's done-callback. Module-level
+# so tests can shrink it to exercise the slow-seed path without a 15s sleep.
+_SEED_RESOLVE_WAIT_SECONDS = 15.0
+
+
 @dataclass
 class ManagedRun:
     run_id: str
@@ -59,6 +68,26 @@ class ManagedRun:
     approval_callback: Any = field(default=None, repr=False)
     parent_runtime: dict[str, Any] | None = field(default=None, repr=False)
     transcript_exporter: "LiveTranscriptExporter | None" = None
+    # --- Live progress bubble (gateway only) ----------------------------
+    # Seeded once at launch with the message id of the posted progress bubble,
+    # then edited in place on meaningful state changes and finalized on
+    # completion. ``progress_active`` stays False when there is no gateway
+    # context / no edit-capable adapter / the seed send failed, in which case
+    # the run falls back to the separate launch + completion markers. The edit
+    # target (adapter/loop/chat) is re-resolved per edit from the session
+    # context rather than cached here, so only the bubble's message id and
+    # throttle bookkeeping live on the run.
+    #
+    # ``progress_requested`` is set synchronously at launch (before the worker
+    # thread starts) the moment we decide to seed a bubble; ``progress_active``
+    # + ``progress_message_id`` are set later by the seed send's done-callback
+    # once the message id is known. Completion waits for that id (bounded) so a
+    # fast run can't finalize before the seed resolves and leave a stuck bubble.
+    progress_requested: bool = False
+    progress_active: bool = False
+    progress_message_id: str | None = None
+    progress_last_edit_ts: float = 0.0
+    progress_last_text: str | None = field(default=None, repr=False)
     lock: threading.RLock = field(default_factory=threading.RLock)
 
 
@@ -246,14 +275,28 @@ class WorkflowRunManager:
             daemon=True,
         )
         managed.thread = thread
-        thread.start()
-        # Gateway-only "started" marker so an auto-fired (or approved) run is
-        # visible in the origin chat and its timing is trackable. Best-effort;
-        # no-op outside a gateway session and never raises into the launch.
+        # Gateway-only live progress: seed an edited-in-place bubble if enabled
+        # and the run came from a gateway session with an edit-capable adapter.
+        # When the bubble seeds, it subsumes the separate "started" marker (one
+        # evolving message instead of two); otherwise fall back to the marker.
+        # Both are best-effort and never raise into the launch.
+        #
+        # Seed BEFORE starting the worker thread: _seed_progress_bubble sets
+        # progress_requested synchronously, so a sub-second run can never reach
+        # _notify_completion (and skip the bubble wait) before the bubble has
+        # been requested. The send itself is async/fire-and-forget, so seeding
+        # first adds no latency to the worker.
+        seeded = False
         try:
-            _notify_launch(record, config, session_context)
+            seeded = _seed_progress_bubble(managed, config)
         except Exception:
-            pass
+            seeded = False
+        if not seeded:
+            try:
+                _notify_launch(record, config, session_context)
+            except Exception:
+                pass
+        thread.start()
         return self._public_record(record)
 
     def get(self, run_id: str) -> dict[str, Any] | None:
@@ -736,7 +779,7 @@ class WorkflowRunManager:
                     stop_event=managed.stop_event,
                     pause_gate=managed.pause_gate,
                     resume_cache=resume_cache,
-                    on_update=lambda state: self._update_state(managed, state),
+                    on_update=lambda state: self._update_state(managed, state, config),
                     on_journal=lambda event: self._append_journal_event(managed, event),
                     plugin_context=plugin_context,
                     token_budget_total=token_budget,
@@ -774,7 +817,7 @@ class WorkflowRunManager:
         finally:
             self._stop_live_transcript_exporter(managed)
             self._finalize_completion_artifacts(managed)
-            _notify_completion(plugin_context, managed.record, config, managed.session_context)
+            _notify_completion(managed, plugin_context, managed.record, config, managed.session_context)
 
     def _finalize_completion_artifacts(self, managed: ManagedRun) -> None:
         with managed.lock:
@@ -789,7 +832,7 @@ class WorkflowRunManager:
                 record["transcriptExportError"] = f"{type(exc).__name__}: {exc}"
             self.store.save_run(record)
 
-    def _update_state(self, managed: ManagedRun, state) -> None:
+    def _update_state(self, managed: ManagedRun, state, config: PluginConfig | None = None) -> None:
         snapshot = state.snapshot()
         self._sync_live_child_transcripts(managed, snapshot)
         self._update(
@@ -797,6 +840,13 @@ class WorkflowRunManager:
             workflow=snapshot,
             display=render_workflow_text(snapshot, completed=False),
         )
+        # Mid-run edit of the live progress bubble (throttled + change-gated
+        # inside the helper). No-op when no bubble is active.
+        if config is not None and config.notify_progress:
+            try:
+                _edit_progress_bubble(managed, config, completed=False)
+            except Exception:
+                pass
 
     def _sync_live_child_transcripts(self, managed: ManagedRun, snapshot: dict[str, Any]) -> None:
         transcript_dir_raw = managed.record.get("transcriptDir")
@@ -1435,6 +1485,7 @@ def _capture_gateway_session_context() -> dict[str, str] | None:
 
 
 def _notify_completion(
+    managed: "ManagedRun",
     plugin_context: Any,
     record: dict[str, Any],
     config: PluginConfig,
@@ -1444,8 +1495,47 @@ def _notify_completion(
     conversation so the model can deliver the result without the user polling
     /workflows. In gateway mode, where CLI injection is unavailable after the
     parent turn returns, send a concise completion message to the origin chat.
+
+    When a live progress bubble is active, the final edit of that bubble IS the
+    gateway completion message (one evolving message instead of a trailing
+    second one), so the separate gateway completion send is skipped — but the
+    in-conversation <task-notification> injection still happens so the parent
+    model can act on the result. The bubble is finalized regardless of
+    notify_on_complete (a seeded bubble must never be left stuck on "running").
     Best effort: any failure is swallowed so it never affects the run.
     """
+    bubble_finalized = False
+    bubble_pending = False
+    if config.notify_progress:
+        # A bubble may have been requested at launch but its message id might not
+        # have resolved yet (async seed send). For a fast run that finishes
+        # almost immediately, briefly wait for the id so the final edit lands on
+        # the seeded bubble instead of racing ahead with a separate completion
+        # send (which would leave the bubble stuck on "running").
+        deadline = time.monotonic() + _SEED_RESOLVE_WAIT_SECONDS
+        requested = False
+        active = False
+        while True:
+            with managed.lock:
+                requested = managed.progress_requested
+                active = managed.progress_active and bool(managed.progress_message_id)
+            if active or not requested or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        if active:
+            try:
+                _edit_progress_bubble(managed, config, completed=True, force=True)
+                bubble_finalized = True
+            except Exception:
+                bubble_finalized = False
+        elif requested:
+            # The seed send is still in flight at the deadline (the slow-seed /
+            # sustained-flood case). Do NOT race ahead with a separate
+            # completion send — the seed's done-callback owns completion once
+            # the send resolves: it finalizes the bubble in place if the send
+            # succeeded, or sends the completion message itself if it failed.
+            # Either way the run gets exactly one terminal message.
+            bubble_pending = True
     if not config.notify_on_complete:
         return
     notification = _render_task_notification(record, config.notify_result_preview_chars)
@@ -1457,6 +1547,12 @@ def _notify_completion(
     except Exception:
         pass
     if injected:
+        return
+    # The bubble's final edit already delivered the completion text to the
+    # origin chat (bubble_finalized), or the still-pending seed callback will
+    # deliver it (bubble_pending); either way, don't also send a separate
+    # trailing completion message.
+    if bubble_finalized or bubble_pending:
         return
     _send_gateway_completion_notification(record, config, session_context)
 
@@ -1501,30 +1597,11 @@ def _send_gateway_text(
 
     try:
         from agent.async_utils import safe_schedule_threadsafe
-        from ..host import gateway as host_gateway
 
-        runner = host_gateway.gateway_runner_ref()
-        if runner is None:
+        target = _resolve_gateway_target(context)
+        if target is None:
             return
-        adapter_key, adapter = _gateway_adapter_for_platform(runner, platform)
-        if adapter is None:
-            return
-
-        source = _gateway_source_for_context(runner, context)
-        if source is not None:
-            chat_id = str(getattr(source, "chat_id", chat_id) or chat_id)
-            metadata = _gateway_thread_metadata(runner, source=source, adapter=adapter)
-        else:
-            metadata = _gateway_thread_metadata(runner, context=context, adapter_key=adapter_key, adapter=adapter)
-        if metadata is None:
-            metadata = {}
-        else:
-            metadata = dict(metadata)
-        metadata["notify"] = True
-
-        loop = getattr(runner, "_gateway_loop", None)
-        if loop is None:
-            return
+        adapter, loop, chat_id, metadata = target
         future = safe_schedule_threadsafe(
             adapter.send(chat_id, text, metadata=metadata),
             loop,
@@ -1533,6 +1610,280 @@ def _send_gateway_text(
             future.result(timeout=15)
     except Exception:
         pass
+
+
+def _resolve_gateway_target(
+    session_context: dict[str, str] | None,
+) -> tuple[Any, Any, str, dict[str, Any]] | None:
+    """Resolve the gateway send/edit target for a run's origin chat.
+
+    Returns ``(adapter, loop, chat_id, metadata)`` or ``None`` when the run did
+    not originate from a live gateway session (CLI run, runner/loop absent, or
+    no adapter for the platform). Shared by the one-off text notifications and
+    the live progress bubble so both land in the same chat/topic with the same
+    routing metadata. ``metadata`` always carries ``notify=True``.
+    """
+    context = dict(session_context or {})
+    platform = str(context.get("platform") or "").strip().lower()
+    chat_id = str(context.get("chat_id") or "").strip()
+    if not platform or not chat_id:
+        return None
+    from ..host import gateway as host_gateway
+
+    runner = host_gateway.gateway_runner_ref()
+    if runner is None:
+        return None
+    adapter_key, adapter = _gateway_adapter_for_platform(runner, platform)
+    if adapter is None:
+        return None
+    source = _gateway_source_for_context(runner, context)
+    if source is not None:
+        chat_id = str(getattr(source, "chat_id", chat_id) or chat_id)
+        metadata = _gateway_thread_metadata(runner, source=source, adapter=adapter)
+    else:
+        metadata = _gateway_thread_metadata(runner, context=context, adapter_key=adapter_key, adapter=adapter)
+    metadata = dict(metadata) if metadata else {}
+    metadata["notify"] = True
+    loop = getattr(runner, "_gateway_loop", None)
+    if loop is None:
+        return None
+    return adapter, loop, chat_id, metadata
+
+
+def _adapter_can_edit(adapter: Any) -> bool:
+    """True when the adapter exposes an awaitable ``edit_message``.
+
+    Both the built-in Telegram and Discord adapters do; an adapter without it
+    (or a degraded test stub) makes the run fall back to launch+completion
+    markers instead of an edited bubble.
+    """
+    editor = getattr(adapter, "edit_message", None)
+    return callable(editor)
+
+
+def _edit_accepts_metadata(adapter: Any) -> bool:
+    """Whether ``adapter.edit_message`` accepts a ``metadata`` kwarg.
+
+    Mirrors the gateway's own probe (gateway/run.py): Telegram's edit takes
+    metadata to preserve topic/thread routing on overflow splits; Discord's
+    does not. Passing an unsupported kwarg would raise, so probe first.
+    """
+    try:
+        params = inspect.signature(adapter.edit_message).parameters
+    except (TypeError, ValueError):
+        return False
+    if "metadata" in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _seed_progress_bubble(managed: "ManagedRun", config: PluginConfig) -> bool:
+    """Post the initial live-progress bubble for a gateway run.
+
+    Schedules ONE message (the seed) on the gateway loop and records its id via
+    a done-callback so later state changes edit it in place. Fire-and-forget:
+    it does NOT block the synchronous launch return (the message id arrives
+    asynchronously; mid-run edits are no-ops until it lands). Returns True when
+    the seed was scheduled (so the caller skips the separate launch marker),
+    False when it could not be (notify off / no gateway context / no
+    edit-capable adapter) — the caller then falls back to the launch marker.
+    If the scheduled send ultimately fails, the callback emits the launch
+    marker so the run is never left with no launch notification. Best-effort;
+    never raises.
+    """
+    if not config.notify_progress:
+        return False
+    try:
+        from agent.async_utils import safe_schedule_threadsafe
+
+        target = _resolve_gateway_target(managed.session_context)
+        if target is None:
+            return False
+        adapter, loop, chat_id, metadata = target
+        if not _adapter_can_edit(adapter):
+            # No in-place edit support: a seed would just become a static
+            # duplicate of the launch marker, so decline and let the launch
+            # marker handle it.
+            return False
+        with managed.lock:
+            text = _progress_bubble_text(managed.record, config, completed=False)
+            # Mark synchronously (before the async send resolves) so completion
+            # knows a bubble is pending and waits for its id rather than racing
+            # ahead and sending a separate completion message.
+            managed.progress_requested = True
+        future = safe_schedule_threadsafe(
+            adapter.send(chat_id, text, metadata=metadata),
+            loop,
+        )
+        if future is None:
+            with managed.lock:
+                managed.progress_requested = False
+            return False
+
+        def _on_seeded(fut: Any) -> None:
+            # Runs on the gateway loop thread. Any edit/send it schedules back
+            # onto that same loop MUST be non-blocking (block=False): a blocking
+            # future.result() here would wait on a coroutine that can only run
+            # once this callback returns -> self-deadlock of the gateway loop.
+            message_id = ""
+            success = False
+            try:
+                result = fut.result()
+                success = bool(getattr(result, "success", True))
+                message_id = str(getattr(result, "message_id", "") or "")
+            except Exception:
+                success = False
+                message_id = ""
+            if success and message_id:
+                with managed.lock:
+                    managed.progress_active = True
+                    managed.progress_message_id = message_id
+                    managed.progress_last_text = text
+                    managed.progress_last_edit_ts = time.monotonic()
+                    terminal = str(managed.record.get("status") or "") not in _RUNNING_STATES
+                if terminal:
+                    # The run finished while the seed send was still in flight
+                    # (the slow-seed-under-flood case): _notify_completion gave
+                    # up waiting for the id and suppressed its own completion
+                    # send, trusting this callback to finalize. Do it now so the
+                    # bubble is never left stuck on the launch render.
+                    try:
+                        _edit_progress_bubble(managed, config, completed=True, force=True, block=False)
+                    except Exception:
+                        pass
+            else:
+                # Seed send failed: there is no bubble to edit. Clear the pending
+                # flag so /workflows readers and completion logic stop expecting
+                # one.
+                with managed.lock:
+                    managed.progress_requested = False
+                    terminal = str(managed.record.get("status") or "") not in _RUNNING_STATES
+                if terminal:
+                    # The run already finished and _notify_completion suppressed
+                    # its completion send waiting on this seed. The seed failed,
+                    # so deliver the completion notification now (non-blocking)
+                    # — otherwise the run would be left with no terminal message.
+                    try:
+                        _send_gateway_text(
+                            managed.record,
+                            managed.session_context,
+                            _render_gateway_completion_message(managed.record, config),
+                            block=False,
+                        )
+                    except Exception:
+                        pass
+                else:
+                    # Still running: fall back to the launch marker so the run is
+                    # not left silent at launch.
+                    try:
+                        _notify_launch(managed.record, config, managed.session_context)
+                    except Exception:
+                        pass
+
+        try:
+            future.add_done_callback(_on_seeded)
+        except Exception:
+            with managed.lock:
+                managed.progress_requested = False
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _edit_progress_bubble(
+    managed: "ManagedRun",
+    config: PluginConfig,
+    *,
+    completed: bool,
+    force: bool = False,
+    block: bool = True,
+) -> None:
+    """Edit the live-progress bubble in place for a mid-run or final update.
+
+    Throttled by ``notify_progress_min_interval_seconds`` and skipped when the
+    rendered text is unchanged, so mid-run edits stay well under platform edit
+    limits. ``force=True`` (the final completion edit) bypasses the throttle.
+    Edits — not sends — so this never contributes to per-chat send flood
+    limits. Best-effort; never raises.
+
+    ``block`` only applies to the completion edit: the worker thread waits
+    briefly so the run record reflects the final visual. It MUST be False when
+    called from the gateway loop thread (the seed done-callback finalizing a
+    run that ended while its seed was in flight), because blocking on a future
+    scheduled onto that same loop would self-deadlock it.
+    """
+    with managed.lock:
+        if not managed.progress_active or not managed.progress_message_id:
+            return
+        message_id = managed.progress_message_id
+        text = _progress_bubble_text(managed.record, config, completed=completed)
+        now = time.monotonic()
+        if not force:
+            if text == managed.progress_last_text:
+                return
+            interval = max(0.0, float(config.notify_progress_min_interval_seconds))
+            if now - managed.progress_last_edit_ts < interval:
+                return
+        managed.progress_last_text = text
+        managed.progress_last_edit_ts = now
+        if completed:
+            # Stop further mid-run edits once finalized.
+            managed.progress_active = False
+    try:
+        from agent.async_utils import safe_schedule_threadsafe
+
+        target = _resolve_gateway_target(managed.session_context)
+        if target is None:
+            return
+        adapter, loop, chat_id, metadata = target
+        if not _adapter_can_edit(adapter):
+            return
+        kwargs: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "content": text,
+        }
+        if getattr(adapter, "REQUIRES_EDIT_FINALIZE", False) or completed:
+            kwargs["finalize"] = True
+        if _edit_accepts_metadata(adapter):
+            kwargs["metadata"] = metadata
+        future = safe_schedule_threadsafe(adapter.edit_message(**kwargs), loop)
+        if future is not None:
+            # Completion edit blocks briefly so the run record reflects the
+            # final visual; mid-run edits fire and forget to avoid latency.
+            # block=False forces fire-and-forget even on completion (used when
+            # finalizing from the gateway loop thread, where blocking would
+            # self-deadlock the loop).
+            if completed and block:
+                future.result(timeout=15)
+    except Exception:
+        pass
+
+
+def _progress_bubble_text(record: dict[str, Any], config: PluginConfig, *, completed: bool) -> str:
+    """Render the bubble body: a compact progress block, plus the result/error
+    on completion. Reuses ``render_run_progress`` so the chat shows the same
+    readable visual language as ``/workflows``.
+    """
+    block = render_run_progress(record)
+    if not completed:
+        return block
+    lines = [block, ""]
+    if record.get("error"):
+        lines.append(f"Error: {str(record.get('error') or '').strip()}")
+    else:
+        result_text = _completion_output_text(record).strip()
+        if result_text:
+            preview_chars = config.notify_result_preview_chars
+            if preview_chars > 0 and len(result_text) > preview_chars:
+                remaining = len(result_text) - preview_chars
+                result_text = result_text[:preview_chars] + f"\n... (truncated {remaining} chars)"
+            lines.append(f"Result:\n{result_text}")
+    output_file = str(record.get("outputFile") or "")
+    if output_file:
+        lines.append(f"Output: {output_file}")
+    return "\n".join(lines).rstrip()
 
 
 def _notify_launch(
