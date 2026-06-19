@@ -108,6 +108,13 @@ class PluginConfig:
     # are skipped when the rendered text is unchanged. The launch seed and the
     # final completion edit bypass this throttle.
     notify_progress_min_interval_seconds: float = 6.0
+    # Render a tappable "⏹ Stop" inline button on the live gateway progress
+    # bubble (Telegram) while the run is stoppable (queued/running/paused).
+    # Tapping it routes through the core `gateway_callback` hook to stop_task.
+    # Requires a Hermes core that supports the generic `buttons=` send/edit
+    # kwarg; on older cores the button is silently omitted (no error). The
+    # button is cleared automatically when the run reaches a terminal state.
+    notify_progress_stop_button: bool = True
     # --- Autoflow (ultracode-style auto-workflow steering) ---------------
     # A per-session mode toggled with `/autoflow on|off` in the gateway. While
     # ON for a session, each substantive inbound message (a) bumps reasoning
@@ -323,6 +330,13 @@ def load_config() -> PluginConfig:
             ),
             default.notify_progress_min_interval_seconds,
             minimum=0.0,
+        ),
+        notify_progress_stop_button=_as_bool(
+            os.getenv(
+                "HERMES_DYNAMIC_WORKFLOWS_NOTIFY_PROGRESS_STOP_BUTTON",
+                raw.get("notify_progress_stop_button"),
+            ),
+            default.notify_progress_stop_button,
         ),
         notify_result_preview_chars=_as_int(
             raw.get("notify_result_preview_chars"),

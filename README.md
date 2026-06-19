@@ -66,6 +66,7 @@ plugins:
         notify_on_complete: true      # Notify the originating CLI or gateway session on completion
         notify_on_launch: true        # Send a "workflow started" marker to the origin gateway chat at launch
         notify_result_preview_chars: 2000  # Truncation length (chars) for the result preview in notifications
+        notify_progress_stop_button: true  # Show a tappable ⏹ Stop button on the live progress bubble (Telegram; needs a core that supports inline buttons)
         auto_workflow_effort: xhigh    # Reasoning effort applied to steered messages while /autoflow is ON
         auto_workflow_default_on: false # When true, every session starts ON unless it runs /autoflow off (raises cost across all chats)
         auto_workflow_min_chars: 24    # Min message length to count as "substantive" (cheap prefilter, no LLM call)

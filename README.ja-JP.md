@@ -66,6 +66,7 @@ plugins:
         ask_fallback: smart           # "ask" で連絡先が誰もいない場合のフォールバック: smart|deny|approve
         notify_on_complete: true      # 完了時に起点となった CLI または gateway セッションへ通知する
         notify_result_preview_chars: 2000  # 通知での結果プレビューの切り詰め長（文字数）
+        notify_progress_stop_button: true  # ライブ進捗バブルにタップ可能な ⏹ 停止ボタンを表示（Telegram；インラインボタン対応のコアが必要）
         notify_on_launch: true        # 起動時に起点となった gateway チャットへ「workflow 開始」マーカーを送信
         auto_workflow_effort: xhigh    # /autoflow が ON のとき、誘導されたメッセージに適用する推論強度
         auto_workflow_default_on: false # true の場合、各セッションはデフォルトで ON（/autoflow off を実行するまで）。全チャットのコストが上がる

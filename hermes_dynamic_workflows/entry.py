@@ -6,6 +6,7 @@ import os
 
 from .adapters.hooks import pre_tool_call_handler
 from .adapters.autoflow_hook import pre_gateway_dispatch_handler
+from .adapters.gateway_callback import on_gateway_callback
 from .adapters.task_stop import TASK_STOP_SCHEMA, task_stop
 from .adapters.workflow import get_dynamic_workflow_schema, workflow
 from .adapters.commands import workflows_command
@@ -49,6 +50,12 @@ def register(ctx) -> None:
     # this gateway hook because a plugin slash-command handler is session-blind
     # at dispatch time (see adapters/autoflow_hook.py for the full rationale).
     ctx.register_hook("pre_gateway_dispatch", pre_gateway_dispatch_handler)
+
+    # Inline-button callbacks on the live progress bubble. The core gateway
+    # adapter fires this hook for any callback_data with no built-in prefix; we
+    # own the "wf:" namespace (the ⏹ Stop button -> stop_task). Returns a
+    # directive dict the adapter performs; returns None for clicks we don't own.
+    ctx.register_hook("gateway_callback", on_gateway_callback)
 
     def _workflows_handler(raw_args: str = "", **_kwargs):
         return workflows_command(raw_args, plugin_context=ctx)

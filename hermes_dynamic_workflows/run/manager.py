@@ -1678,6 +1678,46 @@ def _edit_accepts_metadata(adapter: Any) -> bool:
     return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
+def _accepts_buttons(method: Any) -> bool:
+    """Whether a send/edit_message method accepts a ``buttons`` kwarg.
+
+    Back-compat probe: a Hermes core that predates the generic inline-button
+    surface has no ``buttons`` param, so passing it would raise. Only pass
+    ``buttons`` when this returns True. Mirrors ``_edit_accepts_metadata``.
+    """
+    try:
+        params = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return False
+    if "buttons" in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+# Run states where a Stop button is meaningful. Excludes "stopping": stop_task
+# returns None for it, which would render a misleading "already finished" toast.
+_STOPPABLE_STATES = {"queued", "running", "paused"}
+
+
+def _stop_buttons_for(record: dict[str, Any], config: PluginConfig) -> list | None:
+    """Inline-button spec for the bubble's Stop control, or None.
+
+    Returns a one-button ``[{text, callback_data}]`` row when the run is
+    actively stoppable and the feature is enabled; otherwise None so the caller
+    omits the kwarg (mid-run, leaving any existing keyboard) — the completion
+    path passes ``[]`` explicitly to CLEAR the button.
+    """
+    if not getattr(config, "notify_progress_stop_button", True):
+        return None
+    status = str(record.get("status") or "")
+    if status not in _STOPPABLE_STATES:
+        return None
+    task_id = str(record.get("taskId") or "")
+    if not task_id:
+        return None
+    return [{"text": "⏹ Stop", "callback_data": f"wf:stop:{task_id}"}]
+
+
 def _seed_progress_bubble(managed: "ManagedRun", config: PluginConfig) -> bool:
     """Post the initial live-progress bubble for a gateway run.
 
@@ -1712,8 +1752,12 @@ def _seed_progress_bubble(managed: "ManagedRun", config: PluginConfig) -> bool:
             # knows a bubble is pending and waits for its id rather than racing
             # ahead and sending a separate completion message.
             managed.progress_requested = True
+            stop_buttons = _stop_buttons_for(managed.record, config)
+        send_kwargs: dict[str, Any] = {"metadata": metadata}
+        if stop_buttons is not None and _accepts_buttons(adapter.send):
+            send_kwargs["buttons"] = stop_buttons
         future = safe_schedule_threadsafe(
-            adapter.send(chat_id, text, metadata=metadata),
+            adapter.send(chat_id, text, **send_kwargs),
             loop,
         )
         if future is None:
@@ -1828,6 +1872,13 @@ def _edit_progress_bubble(
                 return
         managed.progress_last_text = text
         managed.progress_last_edit_ts = now
+        # Inline Stop button: while stoppable show it; on completion pass an
+        # explicit [] to CLEAR it. None mid-run when not stoppable leaves any
+        # existing keyboard untouched.
+        if completed:
+            stop_buttons: list | None = []
+        else:
+            stop_buttons = _stop_buttons_for(managed.record, config)
         if completed:
             # Stop further mid-run edits once finalized.
             managed.progress_active = False
@@ -1849,6 +1900,11 @@ def _edit_progress_bubble(
             kwargs["finalize"] = True
         if _edit_accepts_metadata(adapter):
             kwargs["metadata"] = metadata
+        # Only pass buttons when (a) the run wants to set/clear them and (b) the
+        # core adapter supports the generic buttons= kwarg. Mid-run not-stoppable
+        # -> None -> omit (leave keyboard as-is).
+        if stop_buttons is not None and _accepts_buttons(adapter.edit_message):
+            kwargs["buttons"] = stop_buttons
         future = safe_schedule_threadsafe(adapter.edit_message(**kwargs), loop)
         if future is not None:
             # Completion edit blocks briefly so the run record reflects the
