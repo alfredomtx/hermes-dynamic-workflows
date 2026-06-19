@@ -32,6 +32,7 @@ from ..view.render import (
     _RUNNING_STATES,
     render_agent_overview,
     render_run_progress,
+    render_run_summary,
     render_saved_markdown,
     render_workflow_text,
 )
@@ -1862,14 +1863,14 @@ def _edit_progress_bubble(
 
 
 def _progress_bubble_text(record: dict[str, Any], config: PluginConfig, *, completed: bool) -> str:
-    """Render the bubble body: a compact progress block, plus the result/error
-    on completion. Reuses ``render_run_progress`` so the chat shows the same
-    readable visual language as ``/workflows``.
+    """Render the bubble body. Mid-run reuses ``render_run_progress`` (the
+    detailed phase-checklist / per-agent-elapsed layout). On completion the
+    progress block COLLAPSES to a one-line summary (``render_run_summary``) so a
+    finished run does not leave a wall of done-agent rows above the result.
     """
-    block = render_run_progress(record)
     if not completed:
-        return block
-    lines = [block, ""]
+        return render_run_progress(record)
+    lines = [render_run_summary(record), ""]
     if record.get("error"):
         lines.append(f"Error: {str(record.get('error') or '').strip()}")
     else:

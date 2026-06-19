@@ -123,14 +123,17 @@ class DisplayTests(unittest.TestCase):
         }
 
         text = render_run_progress(run)
-        # Glanceable: name, phase, progress fraction, running count.
+        # Glanceable: name, phase progress, running count.
         self.assertIn("activix-standards-gate", text)
         self.assertIn("Verify", text)
         self.assertIn("1/2 done", text)
         self.assertIn("1 running", text)
-        # No raw telemetry leaks into the compact progress block.
+        # Single-phase fan-out: per-agent rows carry the running marker.
+        self.assertIn("▶", text)
+        # Aggregate tokens DO show in the detailed bubble header (~K tok), but
+        # raw per-agent telemetry must not leak.
+        self.assertIn("tok", text)
         self.assertNotIn("cached read", text)
-        self.assertNotIn("tok", text)
         self.assertNotIn("type:", text)
         # The long agent label is truncated, not dumped verbatim.
         self.assertNotIn(long_label, text)
@@ -157,6 +160,230 @@ class DisplayTests(unittest.TestCase):
         # itself omits the id line that /workflows shows.
         self.assertNotIn("wgnoids01", text)
         self.assertNotIn("wf_noids", text)
+
+    # --- Detailed bubble layout (Claude-Code-style progress UX) -------------
+
+    def _fanout_run(self):
+        return {
+            "runId": "wf_fan",
+            "status": "running",
+            "workflow": {
+                "meta": {"name": "audit"},
+                "phases": [{"title": "Audit"}],
+                "agents": [
+                    {"id": 1, "label": "structural", "status": "done", "phase": "Audit",
+                     "duration_seconds": 22.0, "tokens": 12000},
+                    {"id": 2, "label": "wireframe", "status": "running", "phase": "Audit",
+                     "duration_seconds": 72.0, "tokens": 9000},
+                    {"id": 3, "label": "code", "status": "running", "phase": "Audit",
+                     "duration_seconds": 69.0, "tokens": 8000},
+                ],
+                "errors": [],
+            },
+        }
+
+    def test_fanout_shows_per_agent_elapsed_and_header_tokens(self):
+        from hermes_dynamic_workflows.view.render import render_run_progress
+
+        text = render_run_progress(self._fanout_run())
+        # Header carries aggregate tokens.
+        self.assertIn("tok", text)
+        # Each agent row carries its own elapsed.
+        self.assertIn("1m 12s", text)  # 72s running agent
+        self.assertIn("1m 9s", text)   # 69s running agent
+        self.assertIn("22s", text)     # 22s done agent
+        # Running agents (marker ▶) sort before the done agent (✓) in the body.
+        self.assertIn("▶", text)
+        self.assertIn("✓", text)
+        body = text.split("\n", 1)[1]
+        self.assertLess(body.index("wireframe"), body.index("structural"))
+
+    def test_fanout_caps_rows_with_overflow_tail(self):
+        from hermes_dynamic_workflows.view.render import render_run_progress
+
+        agents = [
+            {"id": i, "label": f"a{i}", "status": "running", "phase": "Audit",
+             "duration_seconds": float(i)}
+            for i in range(15)
+        ]
+        run = {
+            "runId": "wf_big",
+            "status": "running",
+            "workflow": {"meta": {"name": "big"}, "phases": [{"title": "Audit"}],
+                         "agents": agents, "errors": []},
+        }
+        text = render_run_progress(run)
+        self.assertIn("… +5", text)  # 15 agents, max_rows=10 -> 5 hidden
+
+    def _pipeline_run(self, statuses):
+        """statuses: dict phase -> list of agent statuses."""
+        agents = []
+        aid = 0
+        for phase, sts in statuses.items():
+            for s in sts:
+                aid += 1
+                agents.append({"id": aid, "label": f"{phase}-{aid}", "status": s,
+                               "phase": phase, "duration_seconds": 5.0})
+        return {
+            "runId": "wf_pipe",
+            "status": "running",
+            "workflow": {
+                "meta": {"name": "review-changes"},
+                "phases": [
+                    {"title": "Review", "detail": "scan diff dimensions"},
+                    {"title": "Verify", "detail": "adversarially verify findings"},
+                    {"title": "Synthesize", "detail": "synthesize confirmed findings"},
+                ],
+                "agents": agents,
+                "errors": [],
+            },
+        }
+
+    def test_pipeline_phase_checklist_one_active(self):
+        from hermes_dynamic_workflows.view.render import render_run_progress
+
+        run = self._pipeline_run({
+            "Review": ["done", "done"],
+            "Verify": ["done", "running", "running"],
+            "Synthesize": ["queued"],
+        })
+        text = render_run_progress(run)
+        # One line per phase.
+        self.assertIn("Review", text)
+        self.assertIn("Verify", text)
+        self.assertIn("Synthesize", text)
+        # Exactly one active ▶ phase.
+        self.assertEqual(text.count("▶"), 1)
+        # Done phase marked ✓; pending phase marked ◦.
+        self.assertIn("✓ Review", text)
+        self.assertIn("◦ Synthesize", text)
+        # Active phase is bolded.
+        self.assertIn("**▶ Verify", text)
+
+    def test_pipeline_next_lookahead(self):
+        from hermes_dynamic_workflows.view.render import render_run_progress
+
+        run = self._pipeline_run({
+            "Review": ["done", "done"],
+            "Verify": ["running"],
+            "Synthesize": ["queued"],
+        })
+        text = render_run_progress(run)
+        # Active is Verify -> Next points at Synthesize's detail.
+        self.assertIn("Next: synthesize confirmed findings", text)
+
+    def test_pipeline_no_next_on_last_phase(self):
+        from hermes_dynamic_workflows.view.render import render_run_progress
+
+        run = self._pipeline_run({
+            "Review": ["done"],
+            "Verify": ["done"],
+            "Synthesize": ["running"],
+        })
+        text = render_run_progress(run)
+        self.assertNotIn("Next:", text)
+
+    def test_pipeline_all_done_has_no_active_marker(self):
+        from hermes_dynamic_workflows.view.render import render_run_progress
+
+        run = self._pipeline_run({
+            "Review": ["done"],
+            "Verify": ["done"],
+            "Synthesize": ["done"],
+        })
+        text = render_run_progress(run)
+        self.assertNotIn("▶", text)  # every phase ✓, none bolded active
+
+    def test_pipeline_unstarted_no_phantom_active(self):
+        from hermes_dynamic_workflows.view.render import render_run_progress
+
+        run = self._pipeline_run({
+            "Review": ["queued"],
+            "Verify": ["queued"],
+            "Synthesize": ["queued"],
+        })
+        text = render_run_progress(run)
+        # Nothing running -> no phase bolded active despite phases[-1] fallback.
+        self.assertNotIn("▶", text)
+
+    def test_pipeline_unphased_agents_bucketed(self):
+        from hermes_dynamic_workflows.view.render import render_run_progress
+
+        run = self._pipeline_run({
+            "Review": ["done"],
+            "Verify": ["running"],
+            "Synthesize": ["queued"],
+        })
+        run["workflow"]["agents"].append(
+            {"id": 99, "label": "loose", "status": "running", "phase": None,
+             "duration_seconds": 3.0})
+        text = render_run_progress(run)
+        self.assertIn("[Other]", text)
+
+    def test_completion_collapses_to_summary(self):
+        from hermes_dynamic_workflows.run.manager import _progress_bubble_text
+        from hermes_dynamic_workflows.core.config import PluginConfig
+
+        run = self._fanout_run()
+        run["status"] = "completed"
+        run["result"] = "4 confirmed blockers, 2 dismissed"
+        text = _progress_bubble_text(run, PluginConfig(), completed=True)
+        # Collapsed head: emoji + name + agent count, no per-agent rows.
+        self.assertIn("✅", text)
+        self.assertIn("audit", text)
+        self.assertIn("3 agents", text)
+        self.assertNotIn("wireframe", text)  # per-agent rows gone
+        # Result preserved.
+        self.assertIn("4 confirmed blockers", text)
+
+    def test_completion_summary_uses_status_emoji_for_stopped(self):
+        from hermes_dynamic_workflows.view.render import render_run_summary
+
+        run = self._fanout_run()
+        run["status"] = "stopped"
+        text = render_run_summary(run)
+        self.assertIn("⏹", text)
+
+    def test_completion_truncates_long_result(self):
+        from hermes_dynamic_workflows.run.manager import _progress_bubble_text
+        from hermes_dynamic_workflows.core.config import PluginConfig
+
+        run = self._fanout_run()
+        run["status"] = "completed"
+        run["result"] = "x" * 5000
+        cfg = PluginConfig()
+        text = _progress_bubble_text(run, cfg, completed=True)
+        self.assertIn("truncated", text)
+        self.assertLessEqual(len(text), cfg.notify_result_preview_chars + 300)
+
+    def test_overview_stays_compact_no_header_tokens(self):
+        run = self._fanout_run()
+        run["taskId"] = "wgfan0001"
+        overview = render_agent_overview([run])
+        # Overview (detailed=False) keeps the compact summary line, NOT the
+        # per-agent elapsed rows or the aggregate-token header.
+        self.assertIn("1/3 done", overview)
+        self.assertNotIn("tok", overview)
+        self.assertNotIn("1m 12s", overview)
+
+    def test_running_agent_without_ended_at_shows_elapsed(self):
+        from hermes_dynamic_workflows.view.render import render_run_progress
+
+        # Snapshot-cadence elapsed: an agent still running carries a nonzero
+        # duration_seconds computed at snapshot time.
+        run = {
+            "runId": "wf_live",
+            "status": "running",
+            "workflow": {
+                "meta": {"name": "live"},
+                "phases": [{"title": "Go"}],
+                "agents": [{"id": 1, "label": "worker", "status": "running",
+                            "phase": "Go", "duration_seconds": 41.0}],
+                "errors": [],
+            },
+        }
+        text = render_run_progress(run)
+        self.assertIn("41s", text)
 
 
 if __name__ == "__main__":

@@ -84,8 +84,35 @@ def render_run_progress(run: dict[str, Any], *, max_chips: int = 8, verbose: boo
     completion) so the chat shows the same readable visual language as
     ``/workflows`` instead of raw telemetry. No id line: the launch/completion
     markers around the bubble already carry the Task ID.
+
+    ``detailed=True`` selects the richer bubble layout (phase checklist for
+    pipelines, per-agent elapsed for fan-out, aggregate tokens in the header).
+    The ``/workflows`` multi-run overview keeps ``detailed=False`` so it stays
+    a compact, glanceable one-liner per run.
     """
-    return _render_run_block(run, max_chips=max_chips, verbose=verbose, include_ids=False)
+    return _render_run_block(run, max_chips=max_chips, verbose=verbose, include_ids=False, detailed=True)
+
+
+def render_run_summary(run: dict[str, Any]) -> str:
+    """One-line collapsed completion head: emoji, name, duration, agent count,
+    aggregate tokens. Used by the gateway bubble's final (completion) edit so a
+    finished run collapses to a single summary line instead of leaving a wall of
+    done-agent rows above the result.
+    """
+    snapshot = run.get("workflow") or {}
+    meta = snapshot.get("meta") or {}
+    name = meta.get("name") or run.get("source", {}).get("ref") or "workflow"
+    status = run.get("status")
+    totals = _totals(snapshot)
+    head = f"{status_emoji(status)} {name}"
+    duration = _duration(run, snapshot)
+    if duration:
+        head += f" · {_format_duration(duration)}"
+    if totals["agents"]:
+        head += f" · {totals['agents']} agent{'s' if totals['agents'] != 1 else ''}"
+    if totals.get("tokens"):
+        head += f" · ~{_format_tokens(totals['tokens'])} tok"
+    return head
 
 
 def render_saved_markdown(run: dict[str, Any]) -> str:
@@ -102,7 +129,14 @@ def render_saved_markdown(run: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _render_run_block(run: dict[str, Any], *, max_chips: int, verbose: bool, include_ids: bool = False) -> str:
+def _render_run_block(
+    run: dict[str, Any],
+    *,
+    max_chips: int,
+    verbose: bool,
+    include_ids: bool = False,
+    detailed: bool = False,
+) -> str:
     snapshot = run.get("workflow") or {}
     meta = snapshot.get("meta") or {}
     name = meta.get("name") or run.get("source", {}).get("ref") or "workflow"
@@ -115,27 +149,56 @@ def _render_run_block(run: dict[str, Any], *, max_chips: int, verbose: bool, inc
     duration = _duration(run, snapshot)
     if duration:
         head += f" · {_format_duration(duration)}"
+    # Aggregate tokens: bubble (detailed) only — keeps the /workflows overview
+    # a compact one-liner and out of the no-telemetry contract.
+    if detailed and totals.get("tokens"):
+        head += f" · ~{_format_tokens(totals['tokens'])} tok"
     if status and status not in {"running", "queued"}:
         head += f" · {status}"
     lines = [head]
 
-    # Line 2: phase + progress fraction + running + errors.
-    if totals["agents"]:
-        phase = _current_phase(snapshot)
-        progress = f"{totals['done']}/{totals['agents']} done"
-        bits = [progress]
-        if totals["running"]:
-            bits.append(f"{totals['running']} running")
-        if totals.get("errors"):
-            bits.append(f"{totals['errors']} err")
-        summary = " · ".join(bits)
-        lines.append(f"   {phase + ' · ' if phase else ''}{summary}")
-        # Line 3: agent chips (done/running/errored), truncated.
-        chips = _agent_chips(agents, max_chips=max_chips)
-        if chips:
-            lines.append(f"   {chips}")
-    else:
+    if not totals["agents"]:
         lines.append("   no agents started")
+        return _append_ids(lines, run, include_ids)
+
+    if detailed:
+        # Richer bubble layout: phase checklist for pipelines (>=2 phases),
+        # per-agent elapsed for single-phase fan-out. Cleanly REPLACES the
+        # legacy phase+progress line and chip row below.
+        phases = _phase_names(snapshot, recursive=False)
+        if len(phases) >= 2:
+            lines.extend(_phase_checklist(snapshot, agents))
+            next_line = _next_phase_line(snapshot, phases)
+            if next_line:
+                lines.append(f"   {next_line}")
+        else:
+            # Fan-out: keep the phase + progress summary line, then per-agent
+            # rows with their own elapsed.
+            phase = _current_phase(snapshot)
+            bits = [f"{totals['done']}/{totals['agents']} done"]
+            if totals["running"]:
+                bits.append(f"{totals['running']} running")
+            if totals.get("errors"):
+                bits.append(f"{totals['errors']} err")
+            lines.append(f"   {phase + ' · ' if phase else ''}{' · '.join(bits)}")
+            for line in _agent_lines(agents, max_rows=10):
+                lines.append(f"   {line}")
+        return _append_ids(lines, run, include_ids)
+
+    # Compact overview layout (the /workflows list): phase + progress summary
+    # line plus a single short chip row.
+    phase = _current_phase(snapshot)
+    progress = f"{totals['done']}/{totals['agents']} done"
+    bits = [progress]
+    if totals["running"]:
+        bits.append(f"{totals['running']} running")
+    if totals.get("errors"):
+        bits.append(f"{totals['errors']} err")
+    summary = " · ".join(bits)
+    lines.append(f"   {phase + ' · ' if phase else ''}{summary}")
+    chips = _agent_chips(agents, max_chips=max_chips)
+    if chips:
+        lines.append(f"   {chips}")
 
     if include_ids:
         task_id = str(run.get("taskId") or "")
@@ -143,10 +206,19 @@ def _render_run_block(run: dict[str, Any], *, max_chips: int, verbose: bool, inc
         id_bits = [bit for bit in (f"Task: {task_id}" if task_id else "", run_id) if bit]
         if id_bits:
             lines.append(f"   {' · '.join(id_bits)}")
-
     if verbose and agents:
         for agent in agents[: max(max_chips, len(agents))]:
             lines.append(f"   - {render_agent_row(agent)}")
+    return "\n".join(lines)
+
+
+def _append_ids(lines: list[str], run: dict[str, Any], include_ids: bool) -> str:
+    if include_ids:
+        task_id = str(run.get("taskId") or "")
+        run_id = str(run.get("runId") or "")
+        id_bits = [bit for bit in (f"Task: {task_id}" if task_id else "", run_id) if bit]
+        if id_bits:
+            lines.append(f"   {' · '.join(id_bits)}")
     return "\n".join(lines)
 
 
@@ -176,6 +248,141 @@ def _chip_label(agent: dict[str, Any]) -> str:
     if len(label) > _CHIP_LABEL_MAX:
         label = label[: _CHIP_LABEL_MAX - 1].rstrip() + "…"
     return label
+
+
+# Markers for the detailed bubble layout. Distinct from _agent_marker (which
+# uses ⏳ for running in the compact overview); the detailed view uses ▶ so the
+# active rows read like a checklist.
+_DETAIL_MARKER = {
+    "queued": "◦",
+    "running": "▶",
+    "paused": "⏸",
+    "done": "✓",
+    "completed": "✓",
+    "error": "✗",
+    "failed": "✗",
+    "skipped": "⏭",
+}
+
+
+def _detail_marker(status: Any) -> str:
+    return _DETAIL_MARKER.get(str(status or ""), "◦")
+
+
+def _agent_lines(agents: list[dict[str, Any]], *, max_rows: int = 10) -> list[str]:
+    """Per-agent rows for the single-phase fan-out bubble layout.
+
+    One row each: ``<marker> <label> · <elapsed>``. Running/errored agents come
+    first (that is what a watcher cares about), then the rest in order, capped
+    at ``max_rows`` with a ``… +K`` overflow tail. Elapsed reflects the agent's
+    ``duration_seconds`` at snapshot time (ticks at snapshot cadence, not a live
+    wall clock).
+    """
+    if not agents:
+        return []
+    active = [a for a in agents if a.get("status") in {"running", "error"}]
+    rest = [a for a in agents if a.get("status") not in {"running", "error"}]
+    ordered = active + rest
+    shown = ordered[:max_rows]
+    rows: list[str] = []
+    for agent in shown:
+        marker = _detail_marker(agent.get("status"))
+        label = _chip_label(agent)
+        duration = agent.get("duration_seconds")
+        if isinstance(duration, (int, float)) and duration > 0:
+            rows.append(f"{marker} {label} · {_format_duration(duration)}")
+        else:
+            rows.append(f"{marker} {label}")
+    hidden = len(agents) - len(shown)
+    if hidden > 0:
+        rows.append(f"… +{hidden}")
+    return rows
+
+
+def _phase_checklist(snapshot: dict[str, Any], agents: list[dict[str, Any]]) -> list[str]:
+    """Checklist of pipeline phases for the detailed bubble layout.
+
+    One line per ordered phase: ``<mark> <title>  <done>/<total> done[· R
+    running][· E err]``. Marker precedence is all-done ✓ wins over active ▶ wins
+    over pending ◦. The active phase reuses ``_current_phase`` so the bubble and
+    the rest of the renderer agree; the ``phases[-1]`` fallback inside it is
+    guarded here so an unstarted or fully-done pipeline never bolds a phantom
+    active phase. Unphased agents collapse into a trailing ``[Other]`` row so the
+    per-phase counts always reconcile with the header total.
+    """
+    phases = _phase_names(snapshot, recursive=False)
+    by_phase: dict[str, list[dict[str, Any]]] = {phase: [] for phase in phases}
+    unphased: list[dict[str, Any]] = []
+    for agent in agents:
+        phase = agent.get("phase")
+        if phase and phase in by_phase:
+            by_phase[phase].append(agent)
+        elif phase and phase not in by_phase:
+            # Agent-derived phase not in the declared list: keep it visible.
+            by_phase.setdefault(phase, []).append(agent)
+            if phase not in phases:
+                phases.append(phase)
+        else:
+            unphased.append(agent)
+
+    active = _current_phase(snapshot)
+    any_running = any(a.get("status") == "running" for a in agents)
+
+    def _phase_row(title: str, members: list[dict[str, Any]]) -> str:
+        total = len(members)
+        done = sum(1 for a in members if a.get("status") in {"done", "completed", "skipped"})
+        running = sum(1 for a in members if a.get("status") == "running")
+        errors = sum(1 for a in members if a.get("status") in {"error", "failed"})
+        all_done = total > 0 and done == total
+        phase_running = running > 0
+        # Active ▶ only when this phase genuinely has work in flight, or it is
+        # the resolved current phase AND something is actually running somewhere
+        # (guards the phases[-1] fallback for unstarted/all-done pipelines).
+        is_active = phase_running or (title == active and any_running and not all_done)
+        if all_done:
+            mark = "✓"
+        elif is_active:
+            mark = "▶"
+        else:
+            mark = "◦"
+        bits = [f"{done}/{total} done"]
+        if running:
+            bits.append(f"{running} running")
+        if errors:
+            bits.append(f"{errors} err")
+        body = f"{mark} {title}  {' · '.join(bits)}"
+        return f"**{body}**" if mark == "▶" else body
+
+    rows = [f"   {_phase_row(title, by_phase.get(title, []))}" for title in phases]
+    if unphased:
+        rows.append(f"   {_phase_row('[Other]', unphased)}")
+    return rows
+
+
+def _next_phase_line(snapshot: dict[str, Any], phases: list[str]) -> str:
+    """Lookahead line for the pipeline bubble: ``Next: <detail or title>`` of the
+    first not-yet-started phase after the active one. Empty when the active phase
+    is the last, or when nothing follows. Prefers the declared
+    ``snapshot["phases"][i].detail`` (top-level key), falling back to the title;
+    tolerates agent-derived phases that have no declared entry.
+    """
+    if not phases:
+        return ""
+    active = _current_phase(snapshot)
+    try:
+        active_idx = phases.index(active)
+    except ValueError:
+        active_idx = -1
+    if active_idx < 0 or active_idx >= len(phases) - 1:
+        return ""
+    next_title = phases[active_idx + 1]
+    declared = snapshot.get("phases") or []
+    detail = ""
+    for entry in declared:
+        if isinstance(entry, dict) and str(entry.get("title") or "").strip() == next_title:
+            detail = str(entry.get("detail") or "").strip()
+            break
+    return f"Next: {preview(detail, 80) if detail else next_title}"
 
 
 def render_agent_row(agent: dict[str, Any]) -> str:
