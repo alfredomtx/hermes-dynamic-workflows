@@ -350,7 +350,31 @@ class HermesChildAgentRunner(ChildAgentRunner):
             kwargs["reasoning_config"] = runtime["reasoning_config"]
         if runtime.get("service_tier") is not None:
             kwargs["service_tier"] = runtime["service_tier"]
-        return AIAgent(**kwargs)
+        child = AIAgent(**kwargs)
+        # Freeze this child's tool surface against the between-turns MCP refresh.
+        #
+        # run() assembles a deliberate surface AFTER construction via
+        # _configure_child_tools (agentType allow/deny filter + forced Tool
+        # Search) and, for schema agents, injects the synthetic structured_output
+        # tool onto child.tools / child.valid_tool_names. The core's per-turn
+        # prologue (agent/turn_context.py) otherwise calls
+        # refresh_agent_mcp_tools() on every turn when ANY MCP server is
+        # registered, doing a naive `agent.tools = get_tool_definitions(...)`
+        # rebuild that re-appends only the memory + context-engine families.
+        # That rebuild does NOT reproduce our post-build mutations, so on the
+        # child's very FIRST turn it would silently wipe structured_output (and
+        # re-leak skill_manage / drop Tool Search) — the exact cause of
+        # "structured_output does not exist" / "Failed to provide valid
+        # structured output after 5 attempts" in schema workflows.
+        #
+        # Safe to skip for these children: _prepare_mcp_tool_registry() runs
+        # before _configure_child_tools in run(), so the build-time surface
+        # already contains every registered MCP tool (reachable via Tool
+        # Search). The refresh only adds servers that connect AFTER build — not
+        # worth clobbering the whole assembled surface for in a short-lived,
+        # single-task child. turn_context.py honors this flag at its guard.
+        child._skip_mcp_refresh = True
+        return child
 
     def _make_tool_progress_callback(self, request: ChildAgentRequest, lease: WorkspaceLease):
         label = (request.label or "").strip() or lease.task_id

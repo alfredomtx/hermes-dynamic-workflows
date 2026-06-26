@@ -734,6 +734,63 @@ class ToolCallCountTests(unittest.TestCase):
         self.assertTrue(callable(seen_kwargs["tool_progress_callback"]))
         self.assertTrue(callable(seen_kwargs["thinking_callback"]))
         self.assertIsNone(seen_kwargs["thinking_callback"]("pondering..."))
+        # The child must freeze its tool surface: run() assembles a deliberate
+        # surface (filter + forced Tool Search + structured_output injection)
+        # AFTER construction, and the core's per-turn MCP refresh would wipe it
+        # unless _skip_mcp_refresh is set. Regression guard for schema workflows
+        # failing with "structured_output does not exist".
+        self.assertTrue(getattr(child, "_skip_mcp_refresh", False))
+
+    def test_skip_mcp_refresh_flag_suppresses_between_turns_rebuild(self):
+        # Contract test mirroring the core guard in agent/turn_context.py:
+        #     if not getattr(agent, "_skip_mcp_refresh", False):
+        #         if has_registered_mcp_tools():
+        #             refresh_agent_mcp_tools(agent, quiet_mode=True)
+        # Proves that with the flag set, the destructive rebuild that strips
+        # structured_output is never invoked — so the injected surface survives.
+        class FakeAIAgent:
+            def __init__(self, **kwargs):
+                self.model = kwargs.get("model")
+
+        run_agent_mod = types.ModuleType("run_agent")
+        run_agent_mod.AIAgent = FakeAIAgent
+        runner = HermesChildAgentRunner(PluginConfig())
+        request = ChildAgentRequest(
+            id=1,
+            prompt="work",
+            label="schema-agent",
+            phase=None,
+            toolsets=[],
+        )
+        lease = WorkspaceLease(task_id="workflow-def456", cwd="/tmp")
+        runtime = {"model": "test-model"}
+
+        with patch.dict(sys.modules, {"run_agent": run_agent_mod}):
+            child = runner._build_agent(request, runtime, [], lease, None)
+
+        # Emulate the core's per-turn prologue guard verbatim.
+        refresh_calls = []
+
+        def fake_refresh(agent, **kwargs):
+            refresh_calls.append(agent)
+            # The real refresh would do: agent.tools = get_tool_definitions(...)
+            # which strips structured_output. We assert it never runs.
+            agent.tools = [{"type": "function", "function": {"name": "read_file"}}]
+            agent.valid_tool_names = {"read_file"}
+            return set()
+
+        # Pre-seed the surface the way run() would (with structured_output).
+        child.tools = [
+            {"type": "function", "function": {"name": "structured_output"}},
+        ]
+        child.valid_tool_names = {"structured_output"}
+
+        # Guard logic copied from turn_context.py (has_registered_mcp_tools True).
+        if not getattr(child, "_skip_mcp_refresh", False):
+            fake_refresh(child, quiet_mode=True)
+
+        self.assertEqual(refresh_calls, [])
+        self.assertIn("structured_output", child.valid_tool_names)
 
     def test_tool_progress_callback_prints_one_started_line_on_tty(self):
         class TtyStringIO(io.StringIO):
