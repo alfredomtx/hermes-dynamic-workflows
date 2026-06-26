@@ -309,6 +309,61 @@ class ChildAgentTests(unittest.TestCase):
         self.assertNotIn("write_file", child.valid_tool_names)
         self.assertNotIn("patch", child.valid_tool_names)
 
+    def test_child_tool_surface_keeps_structured_output_despite_disallowed(self):
+        # A custom agentType that lists structured_output in disallowed_tools
+        # must NOT be able to strip it: the tool is injected on schema presence
+        # (runner.run L181-196) and specialize_structured_output_tool raises if
+        # it is missing. Symmetric with the allowed_tools whitelist guard.
+        definitions = [
+            _tool_definition("read_file"),
+            _tool_definition("structured_output"),
+            _tool_definition("write_file"),
+        ]
+
+        model_tools = types.ModuleType("model_tools")
+        model_tools.get_tool_definitions = lambda **kwargs: definitions
+        search_mod = types.ModuleType("tools.tool_search")
+
+        class ToolSearchConfig:
+            @staticmethod
+            def from_raw(raw):
+                return raw
+
+        def assemble_tool_defs(tool_defs, *, config):
+            return types.SimpleNamespace(tool_defs=tool_defs)
+
+        search_mod.ToolSearchConfig = ToolSearchConfig
+        search_mod.assemble_tool_defs = assemble_tool_defs
+        tools_pkg = types.ModuleType("tools")
+        tools_pkg.__path__ = []
+        tools_pkg.tool_search = search_mod
+
+        class Child:
+            tools = []
+            valid_tool_names = set()
+            enabled_toolsets = []
+
+        child = Child()
+        with patch.dict(
+            sys.modules,
+            {
+                "model_tools": model_tools,
+                "tools": tools_pkg,
+                "tools.tool_search": search_mod,
+            },
+        ):
+            _configure_child_tools(
+                child,
+                toolsets=["file", "workflow_structured"],
+                blocked_toolsets=PluginConfig().blocked_child_toolsets,
+                disallowed_tools=("structured_output", "write_file"),
+            )
+
+        # structured_output survives the denylist; the genuinely-denied tool does not.
+        self.assertIn("structured_output", child.valid_tool_names)
+        self.assertNotIn("write_file", child.valid_tool_names)
+        self.assertIn("read_file", child.valid_tool_names)
+
     def test_system_prompt_includes_agent_type_instructions(self):
         prompt = build_child_system_prompt(
             AgentTypeSpec(

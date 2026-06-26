@@ -779,6 +779,12 @@ def _filter_child_tool_definitions(
     disallowed = {name for item in disallowed_tools if (name := str(item).strip())}
     if allowed:
         allowed.add(STRUCTURED_OUTPUT_TOOL_NAME)
+    # structured_output is injected solely on schema presence (see runner.run
+    # L181-196) and must survive an agentType's allow/deny filter. The allowed
+    # guard above keeps it in a whitelist; this keeps it out of a denylist so a
+    # custom agentType that lists structured_output in disallowed_tools cannot
+    # strip it and make specialize_structured_output_tool raise.
+    disallowed.discard(STRUCTURED_OUTPUT_TOOL_NAME)
     filtered: list[dict[str, Any]] = []
     for definition in definitions:
         name = _tool_definition_name(definition)
