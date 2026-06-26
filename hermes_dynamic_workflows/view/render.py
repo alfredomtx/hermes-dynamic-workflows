@@ -77,7 +77,7 @@ def render_agent_overview(
     return "\n".join(lines).rstrip()
 
 
-def render_run_progress(run: dict[str, Any], *, max_chips: int = 8, verbose: bool = False) -> str:
+def render_run_progress(run: dict[str, Any], *, max_chips: int = 8, verbose: bool = False, show_cost: bool = True) -> str:
     """Compact single-run progress block.
 
     Reused by the gateway live-progress bubble (launch / mid-run edits /
@@ -86,18 +86,19 @@ def render_run_progress(run: dict[str, Any], *, max_chips: int = 8, verbose: boo
     markers around the bubble already carry the Task ID.
 
     ``detailed=True`` selects the richer bubble layout (phase checklist for
-    pipelines, per-agent elapsed for fan-out, aggregate tokens in the header).
-    The ``/workflows`` multi-run overview keeps ``detailed=False`` so it stays
-    a compact, glanceable one-liner per run.
+    pipelines, per-agent elapsed for fan-out, aggregate tokens + estimated
+    dollar cost in the header). ``show_cost`` gates the cost segment (config
+    knob ``notify_progress_cost``). The ``/workflows`` multi-run overview keeps
+    ``detailed=False`` so it stays a compact, glanceable one-liner per run.
     """
-    return _render_run_block(run, max_chips=max_chips, verbose=verbose, include_ids=False, detailed=True)
+    return _render_run_block(run, max_chips=max_chips, verbose=verbose, include_ids=False, detailed=True, show_cost=show_cost)
 
 
-def render_run_summary(run: dict[str, Any]) -> str:
+def render_run_summary(run: dict[str, Any], *, show_cost: bool = True) -> str:
     """One-line collapsed completion head: emoji, name, duration, agent count,
-    aggregate tokens. Used by the gateway bubble's final (completion) edit so a
-    finished run collapses to a single summary line instead of leaving a wall of
-    done-agent rows above the result.
+    estimated cost, aggregate tokens. Used by the gateway bubble's final
+    (completion) edit so a finished run collapses to a single summary line
+    instead of leaving a wall of done-agent rows above the result.
     """
     snapshot = run.get("workflow") or {}
     meta = snapshot.get("meta") or {}
@@ -110,6 +111,10 @@ def render_run_summary(run: dict[str, Any]) -> str:
         head += f" · {_format_duration(duration)}"
     if totals["agents"]:
         head += f" · {totals['agents']} agent{'s' if totals['agents'] != 1 else ''}"
+    if show_cost:
+        cost = _format_cost(_total_cost(_all_agents(snapshot)))
+        if cost:
+            head += f" · {cost}"
     if totals.get("tokens"):
         head += f" · ~{_format_tokens(totals['tokens'])} tok"
     return head
@@ -136,6 +141,7 @@ def _render_run_block(
     verbose: bool,
     include_ids: bool = False,
     detailed: bool = False,
+    show_cost: bool = True,
 ) -> str:
     snapshot = run.get("workflow") or {}
     meta = snapshot.get("meta") or {}
@@ -149,8 +155,13 @@ def _render_run_block(
     duration = _duration(run, snapshot)
     if duration:
         head += f" · {_format_duration(duration)}"
-    # Aggregate tokens: bubble (detailed) only — keeps the /workflows overview
-    # a compact one-liner and out of the no-telemetry contract.
+    # Estimated dollar cost + aggregate tokens: bubble (detailed) only — keeps
+    # the /workflows overview a compact one-liner and out of the no-telemetry
+    # contract. Cost goes BEFORE tokens and is omitted when nothing is priced.
+    if detailed and show_cost:
+        cost = _format_cost(_total_cost(agents))
+        if cost:
+            head += f" · {cost}"
     if detailed and totals.get("tokens"):
         head += f" · ~{_format_tokens(totals['tokens'])} tok"
     if status and status not in {"running", "queued"}:
@@ -270,13 +281,14 @@ def _detail_marker(status: Any) -> str:
 
 
 def _agent_lines(agents: list[dict[str, Any]], *, max_rows: int = 10) -> list[str]:
-    """Per-agent rows for the single-phase fan-out bubble layout.
+    """Per-agent rows for the detailed bubble layout (fan-out and pipeline).
 
-    One row each: ``<marker> <label> · <elapsed>``. Running/errored agents come
-    first (that is what a watcher cares about), then the rest in order, capped
-    at ``max_rows`` with a ``… +K`` overflow tail. Elapsed reflects the agent's
-    ``duration_seconds`` at snapshot time (ticks at snapshot cadence, not a live
-    wall clock).
+    One row each: ``<marker> <label> · <model>[ <effort>][ · <elapsed>][ · <N>
+    tools]``. Each segment is omitted when its datum is absent. Running/errored
+    agents come first (that is what a watcher cares about), then the rest in
+    order, capped at ``max_rows`` with a ``… +K`` overflow tail. Elapsed
+    reflects the agent's ``duration_seconds`` at snapshot time (ticks at
+    snapshot cadence, not a live wall clock).
     """
     if not agents:
         return []
@@ -288,15 +300,123 @@ def _agent_lines(agents: list[dict[str, Any]], *, max_rows: int = 10) -> list[st
     for agent in shown:
         marker = _detail_marker(agent.get("status"))
         label = _chip_label(agent)
+        segs = [f"{marker} {label}"]
+        model_seg = _model_segment(agent)
+        if model_seg:
+            segs.append(model_seg)
         duration = agent.get("duration_seconds")
         if isinstance(duration, (int, float)) and duration > 0:
-            rows.append(f"{marker} {label} · {_format_duration(duration)}")
-        else:
-            rows.append(f"{marker} {label}")
+            segs.append(_format_duration(duration))
+        tools = agent.get("tool_calls")
+        if isinstance(tools, int) and tools > 0:
+            segs.append(f"{tools} tool{'s' if tools != 1 else ''}")
+        rows.append(" · ".join(segs))
     hidden = len(agents) - len(shown)
     if hidden > 0:
         rows.append(f"… +{hidden}")
     return rows
+
+
+def _model_segment(agent: dict[str, Any]) -> str:
+    """``<short-model>[ <effort>]`` for a roster row, or "" when no model."""
+    model = _short_model(agent.get("model"))
+    if not model:
+        return ""
+    effort = str(agent.get("reasoning_effort") or "").strip()
+    return f"{model} {effort}" if effort else model
+
+
+def _short_model(model: Any) -> str:
+    """Strip a dotted region/vendor prefix from a model id for display.
+
+    Only strips when EVERY segment before the last dotted token is a bare alpha
+    word (region/vendor like ``us``/``anthropic``/``openai``) so a version dot
+    is never mistaken for a prefix:
+      us.anthropic.claude-opus-4-8 -> claude-opus-4-8
+      anthropic.claude-opus-4-8    -> claude-opus-4-8
+      gpt-5.5                      -> gpt-5.5   (5.5 has a non-alpha segment)
+      gpt-4.1-mini                 -> gpt-4.1-mini
+    """
+    text = str(model or "").strip()
+    if not text:
+        return ""
+    segs = text.split(".")
+    if len(segs) > 1 and all(s.isalpha() for s in segs[:-1]):
+        text = segs[-1]
+    return text
+
+
+def _agent_cost(agent: dict[str, Any]) -> "Any":
+    """Estimated dollar cost (Decimal) for one agent, or None when not priceable.
+
+    Builds CanonicalUsage from the per-agent input/output + cache buckets
+    (input_tokens is the UNCACHED bucket, so cache is not double-counted) and
+    routes through Hermes core's estimate_usage_cost. Returns the amount only
+    for an estimated/actual status; ``included`` (subscription, e.g. codex) and
+    ``unknown`` (no pricing route) return None so they neither show $0 nor an
+    n/a. Import is lazy + guarded so an older core without the API simply
+    yields no cost rather than crashing the renderer.
+    """
+    model = str(agent.get("model") or "").strip()
+    if not model:
+        return None
+    try:
+        from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+    except Exception:
+        return None
+    usage = CanonicalUsage(
+        input_tokens=_as_int(agent.get("input_tokens")),
+        output_tokens=_as_int(agent.get("output_tokens")),
+        cache_read_tokens=_as_int(agent.get("cache_read_tokens")),
+        cache_write_tokens=_as_int(agent.get("cache_write_tokens")),
+    )
+    if usage.total_tokens <= 0:
+        return None
+    try:
+        result = estimate_usage_cost(
+            model,
+            usage,
+            provider=agent.get("provider") or None,
+            base_url=agent.get("base_url") or None,
+        )
+    except Exception:
+        return None
+    if result.status in {"estimated", "actual"} and result.amount_usd is not None:
+        return result.amount_usd
+    return None
+
+
+def _total_cost(agents: list[dict[str, Any]]) -> "Any":
+    """Sum of per-agent estimated cost (Decimal), or None when nothing priced.
+
+    Each agent is priced by its OWN model, so a mixed run (e.g. codex
+    ``included`` + opus ``estimated``) sums correctly: codex contributes
+    nothing, opus contributes its amount. A pure-included or all-unknown run
+    yields None → the cost segment is omitted entirely.
+    """
+    total = None
+    for agent in agents:
+        amount = _agent_cost(agent)
+        if amount is None:
+            continue
+        total = amount if total is None else total + amount
+    return total
+
+
+def _format_cost(amount: "Any") -> str:
+    """``~$X.XX`` for a Decimal amount; "" when None/zero; ``<$0.01`` for a
+    genuinely-known sub-cent amount (never ``$0.00``)."""
+    if amount is None:
+        return ""
+    try:
+        value = float(amount)
+    except (TypeError, ValueError):
+        return ""
+    if value <= 0:
+        return ""
+    if value < 0.005:
+        return "<$0.01"
+    return f"~${value:.2f}"
 
 
 def _phase_checklist(snapshot: dict[str, Any], agents: list[dict[str, Any]]) -> list[str]:
@@ -353,7 +473,28 @@ def _phase_checklist(snapshot: dict[str, Any], agents: list[dict[str, Any]]) -> 
         body = f"{mark} {title}  {' · '.join(bits)}"
         return f"**{body}**" if mark == "▶" else body
 
-    rows = [f"   {_phase_row(title, by_phase.get(title, []))}" for title in phases]
+    # Per-phase rows, with the running/errored agents of EACH in-flight phase
+    # shown beneath their phase line. pipeline() is non-barrier, so more than
+    # one phase can have work in flight at once (B5) — show them all, not just
+    # the resolved "active" phase. A global budget caps total agent rows across
+    # phases so a wide multi-phase fan-out can't blow the Telegram length cap.
+    rows: list[str] = []
+    agent_row_budget = 12
+    for title in phases:
+        members = by_phase.get(title, [])
+        rows.append(f"   {_phase_row(title, members)}")
+        if agent_row_budget <= 0:
+            continue
+        in_flight = [a for a in members if a.get("status") in {"running", "error", "failed"}]
+        if not in_flight:
+            continue
+        shown = in_flight[:agent_row_budget]
+        for line in _agent_lines(shown, max_rows=len(shown)):
+            rows.append(f"      {line}")
+        agent_row_budget -= len(shown)
+        hidden = len(in_flight) - len(shown)
+        if hidden > 0:
+            rows.append(f"      … +{hidden}")
     if unphased:
         rows.append(f"   {_phase_row('[Other]', unphased)}")
     return rows

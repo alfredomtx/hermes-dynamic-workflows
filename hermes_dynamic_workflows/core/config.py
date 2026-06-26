@@ -115,6 +115,11 @@ class PluginConfig:
     # kwarg; on older cores the button is silently omitted (no error). The
     # button is cleared automatically when the run reaches a terminal state.
     notify_progress_stop_button: bool = True
+    # Show an ESTIMATED dollar cost segment (~$X.XX, before the token count) in
+    # the live/completed progress bubble header. Cost is estimated from per-agent
+    # token counts × official model pricing (status "estimated"), omitted when no
+    # agent has a known pricing route. config.yaml only (no env var).
+    notify_progress_cost: bool = True
     # --- Autoflow (ultracode-style auto-workflow steering) ---------------
     # A per-session mode toggled with `/autoflow on|off` in the gateway. While
     # ON for a session, each substantive inbound message (a) bumps reasoning
@@ -337,6 +342,10 @@ def load_config() -> PluginConfig:
                 raw.get("notify_progress_stop_button"),
             ),
             default.notify_progress_stop_button,
+        ),
+        notify_progress_cost=_as_bool(
+            raw.get("notify_progress_cost"),
+            default.notify_progress_cost,
         ),
         notify_result_preview_chars=_as_int(
             raw.get("notify_result_preview_chars"),

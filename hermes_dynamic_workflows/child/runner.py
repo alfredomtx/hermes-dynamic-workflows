@@ -1180,6 +1180,12 @@ def _child_metadata(
     prompt_tokens = _int_attr(child, "session_prompt_tokens")
     completion_tokens = _int_attr(child, "session_completion_tokens")
     reasoning_tokens = _int_attr(child, "session_reasoning_tokens")
+    # The UNCACHED input bucket. session_prompt_tokens (above) is
+    # input + cache_read + cache_write, so it must NOT be used as the priced
+    # input bucket or cache tokens get billed twice (once at the input rate,
+    # once at the cache rate). session_input_tokens is the clean uncached count.
+    input_tokens = _int_attr(child, "session_input_tokens")
+    output_tokens = _int_attr(child, "session_output_tokens") or completion_tokens
     metadata = {
         "runner": "standalone",
         "task_id": lease.task_id,
@@ -1192,9 +1198,13 @@ def _child_metadata(
         "agent_type": agent_type.name if agent_type else "general-purpose",
         "agent_type_source": agent_type.source if agent_type else None,
         "model": getattr(child, "model", None),
+        # provider + base_url route the dollar-cost lookup in the gateway bubble.
+        "provider": getattr(child, "provider", None),
+        "base_url": getattr(child, "base_url", None),
+        "reasoning_effort": _reasoning_effort_of(child),
         "toolsets": toolsets,
-        "input_tokens": prompt_tokens,
-        "output_tokens": completion_tokens,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
         "reasoning_tokens": reasoning_tokens,
         "tokens": prompt_tokens + completion_tokens + reasoning_tokens,
         # Prompt caching is auto-enabled for supported models
@@ -1210,6 +1220,22 @@ def _child_metadata(
 def _int_attr(obj: Any, name: str) -> int:
     value = getattr(obj, name, 0)
     return int(value) if isinstance(value, (int, float)) else 0
+
+
+def _reasoning_effort_of(child: Any) -> str | None:
+    """Best-effort reasoning effort label for the roster row.
+
+    AIAgent.reasoning_config is {"enabled": bool, "effort": str} | None.
+    Returns the effort string when reasoning is enabled, else None (so a
+    non-reasoning child simply omits the tag).
+    """
+    cfg = getattr(child, "reasoning_config", None)
+    if not isinstance(cfg, dict):
+        return None
+    if cfg.get("enabled") is False:
+        return None
+    effort = cfg.get("effort")
+    return str(effort).strip() or None if effort else None
 
 
 def _tool_call_count(result: dict[str, Any]) -> int:

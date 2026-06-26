@@ -615,6 +615,14 @@ def _apply_child_metadata(record: AgentRecord, metadata: dict[str, Any]) -> None
     record.tokens = _as_int_metadata(metadata.get("tokens"))
     record.cache_read_tokens = _as_int_metadata(metadata.get("cache_read_tokens"))
     record.cache_write_tokens = _as_int_metadata(metadata.get("cache_write_tokens"))
+    record.input_tokens = _as_int_metadata(metadata.get("input_tokens"))
+    record.output_tokens = _as_int_metadata(metadata.get("output_tokens"))
+    record.reasoning_tokens = _as_int_metadata(metadata.get("reasoning_tokens"))
+    record.provider = _optional_str(metadata.get("provider")) or record.provider
+    record.base_url = _optional_str(metadata.get("base_url")) or record.base_url
+    record.reasoning_effort = (
+        _optional_str(metadata.get("reasoning_effort")) or record.reasoning_effort
+    )
     record.tool_calls = _as_int_metadata(metadata.get("tool_calls"))
 
 

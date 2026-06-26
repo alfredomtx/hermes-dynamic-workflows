@@ -252,13 +252,17 @@ class DisplayTests(unittest.TestCase):
         self.assertIn("Review", text)
         self.assertIn("Verify", text)
         self.assertIn("Synthesize", text)
-        # Exactly one active ▶ phase.
-        self.assertEqual(text.count("▶"), 1)
+        # Exactly one active PHASE (bolded ▶ phase line). Agent rows under an
+        # in-flight phase also carry a ▶ marker (B5), so count the phase markers
+        # specifically, not every ▶ in the blob.
+        self.assertEqual(text.count("**▶"), 1)
         # Done phase marked ✓; pending phase marked ◦.
         self.assertIn("✓ Review", text)
         self.assertIn("◦ Synthesize", text)
         # Active phase is bolded.
         self.assertIn("**▶ Verify", text)
+        # B5: the running agents of the active phase are listed beneath it.
+        self.assertIn("Verify-", text)
 
     def test_pipeline_next_lookahead(self):
         from hermes_dynamic_workflows.view.render import render_run_progress
@@ -384,6 +388,183 @@ class DisplayTests(unittest.TestCase):
         }
         text = render_run_progress(run)
         self.assertIn("41s", text)
+
+
+class CostAndCompletionTests(unittest.TestCase):
+    """Cost-in-header, per-agent model/effort/tools rows, and the readable
+    completion message (fenced result, no temp-path line)."""
+
+    def _bedrock_agent(self, **over):
+        agent = {
+            "id": 1, "label": "scope: stack topology", "status": "running",
+            "phase": "Audit", "duration_seconds": 72.0,
+            "model": "us.anthropic.claude-opus-4-8", "provider": "bedrock",
+            "base_url": "https://bedrock-runtime.ca-central-1.amazonaws.com",
+            "input_tokens": 1_000_000, "output_tokens": 200_000,
+            "cache_read_tokens": 0, "cache_write_tokens": 0,
+            "tokens": 1_200_000, "tool_calls": 4, "reasoning_effort": "high",
+        }
+        agent.update(over)
+        return agent
+
+    def _run_with(self, agents, status="running", phases=None):
+        return {
+            "runId": "wf_cost", "status": status,
+            "workflow": {
+                "meta": {"name": "rebase-tooling-risk-audit"},
+                "phases": phases or [{"title": "Audit"}],
+                "agents": agents, "errors": [],
+            },
+        }
+
+    # --- C1/C2/C3 cost in header ---
+
+    def test_cost_in_header_before_tokens(self):
+        from hermes_dynamic_workflows.view.render import render_run_progress
+
+        text = render_run_progress(self._run_with([self._bedrock_agent()]))
+        # 1M in × $5/M + 200K out × $25/M = $5 + $5 = $10.00
+        self.assertIn("~$10.00", text)
+        head = text.split("\n", 1)[0]
+        # Cost segment comes BEFORE the token segment.
+        self.assertLess(head.index("~$10.00"), head.index("tok"))
+
+    def test_cost_omitted_when_no_priced_agent(self):
+        from hermes_dynamic_workflows.view.render import render_run_progress
+
+        # Unknown model -> unknown route -> no cost; tokens still show.
+        agent = self._bedrock_agent(model="us.meta.llama4-maverick", provider="bedrock")
+        text = render_run_progress(self._run_with([agent]))
+        self.assertNotIn("$", text)
+        self.assertIn("tok", text)
+
+    def test_cost_subcent_floor_never_zero(self):
+        from hermes_dynamic_workflows.view.render import render_run_progress
+
+        # Tiny but genuinely-known usage rounds below a cent -> "<$0.01", not $0.00.
+        agent = self._bedrock_agent(input_tokens=100, output_tokens=10,
+                                    cache_read_tokens=0, cache_write_tokens=0,
+                                    tokens=110)
+        text = render_run_progress(self._run_with([agent]))
+        self.assertIn("<$0.01", text)
+        self.assertNotIn("$0.00", text)
+
+    def test_cost_no_cache_double_count(self):
+        from hermes_dynamic_workflows.view.render import render_run_progress
+
+        # input 100K×$5 + output 20K×$25 + cacheR 500K×$0.50 + cacheW 40K×$6.25
+        # = 0.50 + 0.50 + 0.25 + 0.25 = $1.50  (cache NOT billed at input rate)
+        agent = self._bedrock_agent(
+            input_tokens=100_000, output_tokens=20_000,
+            cache_read_tokens=500_000, cache_write_tokens=40_000, tokens=660_000,
+        )
+        text = render_run_progress(self._run_with([agent]))
+        self.assertIn("~$1.50", text)
+
+    def test_mixed_model_sum_codex_included_plus_opus(self):
+        from hermes_dynamic_workflows.view.render import render_run_progress
+
+        opus = self._bedrock_agent(id=1, label="opus", status="done")
+        codex = self._bedrock_agent(
+            id=2, label="codex", status="done",
+            model="gpt-5.5", provider="openai-codex",
+            base_url="https://chatgpt.com/backend-api/codex",
+            input_tokens=500_000, output_tokens=100_000, tokens=600_000,
+        )
+        text = render_run_progress(self._run_with([opus, codex]))
+        # codex is subscription-included ($0) -> only opus's $10 counts.
+        self.assertIn("~$10.00", text)
+
+    def test_cost_hidden_when_show_cost_false(self):
+        from hermes_dynamic_workflows.view.render import render_run_progress
+
+        text = render_run_progress(self._run_with([self._bedrock_agent()]), show_cost=False)
+        self.assertNotIn("$", text)
+        self.assertIn("tok", text)  # tokens still present
+
+    # --- C4/C5 per-agent rows: model, effort, tools ---
+
+    def test_agent_row_shows_model_effort_tools(self):
+        from hermes_dynamic_workflows.view.render import render_run_progress
+
+        text = render_run_progress(self._run_with([self._bedrock_agent()]))
+        # Short model (region/vendor prefix stripped) + effort + tool count.
+        self.assertIn("claude-opus-4-8 high", text)
+        self.assertIn("4 tools", text)
+        self.assertNotIn("us.anthropic.claude-opus-4-8", text)  # prefix stripped
+
+    def test_agent_row_omits_effort_when_absent(self):
+        from hermes_dynamic_workflows.view.render import render_run_progress
+
+        agent = self._bedrock_agent(reasoning_effort=None)
+        text = render_run_progress(self._run_with([agent]))
+        self.assertIn("claude-opus-4-8", text)
+        self.assertNotIn("claude-opus-4-8 high", text)
+
+    def test_short_model_keeps_version_dot(self):
+        from hermes_dynamic_workflows.view.render import _short_model
+
+        # A version dot must NOT be mistaken for a region/vendor prefix.
+        self.assertEqual(_short_model("gpt-5.5"), "gpt-5.5")
+        self.assertEqual(_short_model("gpt-4.1-mini"), "gpt-4.1-mini")
+        self.assertEqual(_short_model("us.anthropic.claude-opus-4-8"), "claude-opus-4-8")
+        self.assertEqual(_short_model("anthropic.claude-opus-4-8"), "claude-opus-4-8")
+
+    def test_pipeline_lists_running_agents_across_concurrent_phases(self):
+        from hermes_dynamic_workflows.view.render import render_run_progress
+
+        # pipeline() is non-barrier: agents running in TWO phases at once must
+        # BOTH be listed (B5), not just the resolved "active" phase.
+        a1 = self._bedrock_agent(id=1, label="rev-A", status="running", phase="Review")
+        a2 = self._bedrock_agent(id=2, label="ver-B", status="running", phase="Verify")
+        run = self._run_with(
+            [a1, a2], phases=[{"title": "Review"}, {"title": "Verify"}, {"title": "Synthesize"}],
+        )
+        text = render_run_progress(run)
+        self.assertIn("rev-A", text)
+        self.assertIn("ver-B", text)
+
+    # --- C7 readable completion ---
+
+    def test_completion_dict_result_is_fenced_no_temp_path(self):
+        from hermes_dynamic_workflows.run.manager import _progress_bubble_text
+        from hermes_dynamic_workflows.core.config import PluginConfig
+
+        run = self._run_with([self._bedrock_agent(status="done")], status="completed")
+        run["result"] = {"audit_scopes": [], "total_findings": 0, "register": []}
+        run["outputFile"] = "/var/folders/mp/abc/tasks/wg432juun.output"
+        text = _progress_bubble_text(run, PluginConfig(), completed=True)
+        # Structured result rendered in a fenced code block.
+        self.assertIn("```", text)
+        self.assertIn("total_findings", text)
+        # The internal temp output-file path is NOT shown in chat.
+        self.assertNotIn("/var/folders", text)
+        self.assertNotIn("Output:", text)
+
+    def test_completion_string_result_is_plain_not_fenced(self):
+        from hermes_dynamic_workflows.run.manager import _progress_bubble_text
+        from hermes_dynamic_workflows.core.config import PluginConfig
+
+        run = self._run_with([self._bedrock_agent(status="done")], status="completed")
+        run["result"] = "4 confirmed blockers, 2 dismissed"
+        text = _progress_bubble_text(run, PluginConfig(), completed=True)
+        self.assertIn("4 confirmed blockers", text)
+        self.assertNotIn("```", text)
+        self.assertNotIn("/var/folders", text)
+
+    def test_bubble_under_telegram_cap_pathological_labels(self):
+        from hermes_dynamic_workflows.view.render import render_run_progress
+
+        # A wide multi-phase fan-out with long labels must stay under the cap.
+        agents = []
+        for i in range(40):
+            agents.append(self._bedrock_agent(
+                id=i, label="x" * 300, status="running",
+                phase="Audit" if i % 2 == 0 else "Verify",
+            ))
+        run = self._run_with(agents, phases=[{"title": "Audit"}, {"title": "Verify"}])
+        text = render_run_progress(run)
+        self.assertLess(len(text), 4000)
 
 
 if __name__ == "__main__":

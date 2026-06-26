@@ -33,6 +33,17 @@ class AgentRecord:
     tokens: int = 0
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    # Input/output split + routing — carried so the live bubble can ESTIMATE a
+    # dollar cost per agent. input_tokens is the UNCACHED prompt bucket (cache
+    # read/write are accounted separately above); pricing them together would
+    # double-count cache. provider/base_url route the cost lookup;
+    # reasoning_effort is display-only on the roster row.
+    input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    provider: str | None = None
+    base_url: str | None = None
+    reasoning_effort: str | None = None
     attempts: int = 0
     structured: dict[str, Any] = field(default_factory=dict)
 
@@ -66,6 +77,12 @@ class AgentRecord:
             "tokens": self.tokens,
             "cache_read_tokens": self.cache_read_tokens,
             "cache_write_tokens": self.cache_write_tokens,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "provider": self.provider,
+            "base_url": self.base_url,
+            "reasoning_effort": self.reasoning_effort,
             "attempts": self.attempts,
             "structured": dict(self.structured),
         }
