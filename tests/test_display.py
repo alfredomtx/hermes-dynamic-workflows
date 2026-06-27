@@ -241,6 +241,94 @@ class DisplayTests(unittest.TestCase):
         self.assertIn("… +", text)       # backstop trimmed a tail
         self.assertLess(len(text), 4096)  # stays under Telegram's message cap
 
+    # --- Per-subtask cost breakdown (Alfredo: "how much did each verify cost") -
+
+    def _priced_agents(self):
+        # opus on bedrock with real-ish token buckets -> a non-None per-agent cost
+        return [
+            {"id": i, "label": f"verify:AC-{i}", "status": "running", "phase": "Verify",
+             "duration_seconds": 300.0, "model": "us.anthropic.claude-opus-4-8",
+             "provider": "bedrock", "reasoning_effort": "xhigh", "tool_calls": 4,
+             "input_tokens": 100000 + i * 15000, "output_tokens": 8000,
+             "cache_read_tokens": 400000, "cache_write_tokens": 120000}
+            for i in range(1, 4)
+        ]
+
+    def test_fanout_rows_carry_per_agent_cost_when_show_cost(self):
+        from hermes_dynamic_workflows.view.render import render_run_progress
+
+        run = {"runId": "wf_cost", "status": "running",
+               "workflow": {"meta": {"name": "verify-matrix"},
+                            "phases": [{"title": "Verify"}],
+                            "agents": self._priced_agents(), "errors": []}}
+        text = render_run_progress(run, show_cost=True)
+        # Each priced row carries its OWN dollar amount (not just the header sum).
+        self.assertGreaterEqual(text.count("~$"), 3 + 1)  # 3 rows + header total
+
+    def test_fanout_rows_omit_cost_when_show_cost_false(self):
+        from hermes_dynamic_workflows.view.render import render_run_progress
+
+        run = {"runId": "wf_nocost", "status": "running",
+               "workflow": {"meta": {"name": "verify-matrix"},
+                            "phases": [{"title": "Verify"}],
+                            "agents": self._priced_agents(), "errors": []}}
+        text = render_run_progress(run, show_cost=False)
+        self.assertNotIn("~$", text)
+
+    def test_pipeline_phase_rows_carry_cost_subtotal(self):
+        from hermes_dynamic_workflows.view.render import render_run_progress
+
+        agents = self._priced_agents()
+        for a in agents[:1]:
+            a["phase"] = "Review"
+        run = {"runId": "wf_pcost", "status": "running",
+               "workflow": {"meta": {"name": "review-matrix"},
+                            "phases": [{"title": "Review"}, {"title": "Verify"}],
+                            "agents": agents, "errors": []}}
+        text = render_run_progress(run, show_cost=True)
+        # Both phase header lines carry a ~$ subtotal segment.
+        review_line = next(l for l in text.splitlines() if "Review" in l)
+        verify_line = next(l for l in text.splitlines() if "Verify" in l and "verify:" not in l)
+        self.assertIn("~$", review_line)
+        self.assertIn("~$", verify_line)
+
+    def test_cost_breakdown_block_groups_and_subtotals(self):
+        from hermes_dynamic_workflows.view.render import render_cost_breakdown
+
+        agents = []
+        for i in range(1, 4):
+            a = self._priced_agents()[i - 1]
+            a["phase"] = "Review" if i <= 2 else "Verify"
+            a["status"] = "done"
+            agents.append(a)
+        run = {"status": "completed",
+               "workflow": {"meta": {"name": "m"},
+                            "phases": [{"title": "Review"}, {"title": "Verify"}],
+                            "agents": agents, "errors": []}}
+        text = render_cost_breakdown(run)
+        self.assertIn("Cost by subtask", text)
+        self.assertIn("Review", text)
+        self.assertIn("Verify", text)
+        for i in range(1, 4):
+            self.assertIn(f"verify:AC-{i}", text)
+        self.assertGreaterEqual(text.count("~$"), 3)  # at least one per agent
+
+    def test_cost_breakdown_empty_when_nothing_priceable(self):
+        from hermes_dynamic_workflows.view.render import render_cost_breakdown
+
+        # codex/included model -> no pricing route -> no fake $0 block
+        agents = [
+            {"id": i, "label": f"verify:x{i}", "status": "done", "phase": "Verify",
+             "model": "openai/gpt-5-codex", "provider": "openai",
+             "input_tokens": 100000, "output_tokens": 5000}
+            for i in range(3)
+        ]
+        run = {"status": "completed",
+               "workflow": {"meta": {"name": "c"}, "phases": [{"title": "Verify"}],
+                            "agents": agents, "errors": []}}
+        self.assertEqual(render_cost_breakdown(run), "")
+
+
     def _pipeline_run(self, statuses):
         """statuses: dict phase -> list of agent statuses."""
         agents = []

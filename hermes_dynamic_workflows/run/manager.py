@@ -31,6 +31,7 @@ from ..storage.control import ControlListener, new_control_owner
 from ..view.render import (
     _RUNNING_STATES,
     render_agent_overview,
+    render_cost_breakdown,
     render_run_progress,
     render_run_summary,
     render_saved_markdown,
@@ -1931,6 +1932,15 @@ def _progress_bubble_text(record: dict[str, Any], config: PluginConfig, *, compl
     if not completed:
         return render_run_progress(record, show_cost=show_cost)
     lines = [render_run_summary(record, show_cost=show_cost), ""]
+    # Per-subtask cost breakdown: the live roster (with its per-agent cost) is
+    # gone once the bubble collapses to the one-line summary, so re-surface how
+    # much each verify/review subtask cost here, where the final figures are
+    # known. Omitted when cost display is off or nothing is priceable.
+    if show_cost:
+        breakdown = render_cost_breakdown(record)
+        if breakdown:
+            lines.append(breakdown)
+            lines.append("")
     if record.get("error"):
         lines.append(f"Error: {str(record.get('error') or '').strip()}")
     else:

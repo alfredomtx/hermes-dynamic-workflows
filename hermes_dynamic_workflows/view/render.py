@@ -133,6 +133,104 @@ def render_run_summary(run: dict[str, Any], *, show_cost: bool = True) -> str:
     return head
 
 
+def render_cost_breakdown(
+    run: dict[str, Any],
+    *,
+    char_budget: int = _ROSTER_CHAR_BUDGET,
+    max_rows: int = _ROSTER_MAX_ROWS,
+) -> str:
+    """Per-subtask cost breakdown for a COMPLETED run's bubble.
+
+    Alfredo wants to see how much each verify/review subtask cost, but the
+    completion bubble collapses the live roster to a one-line summary — losing
+    the per-agent detail exactly when the final cost is known. This block brings
+    it back: one line per priceable agent (``<label> · <model> · ~$cost``),
+    grouped under their phase when the run has phases, sorted most-expensive
+    first within each group, with a phase subtotal. Agents with no pricing route
+    (subscription/included models, e.g. codex) or zero usage are omitted. Returns
+    "" when nothing is priceable (so the caller adds no empty section).
+
+    Same char/row backstop as the live roster so a huge run can't blow the
+    Telegram message cap; a trimmed tail is summarised as ``… +K more``.
+    """
+    snapshot = run.get("workflow") or {}
+    agents = _all_agents(snapshot)
+    priced = [(a, _agent_cost(a)) for a in agents]
+    priced = [(a, c) for a, c in priced if c is not None]
+    if not priced:
+        return ""
+
+    total = _total_cost(agents)
+    lines = [f"Cost by subtask ({_format_cost(total)} total):"]
+    phases = _phase_names(snapshot, recursive=False)
+
+    def _agent_cost_line(agent: dict[str, Any], amount: "Any") -> str:
+        label = _chip_label(agent)
+        segs = [label]
+        model = _short_model(agent.get("model"))
+        if model:
+            segs.append(model)
+        segs.append(_format_cost(amount))
+        return "   • " + " · ".join(segs)
+
+    used = len(lines[0]) + 1
+    shown = 0
+    rendered_ids: set[Any] = set()
+
+    def _emit(group_agents: list[tuple[dict[str, Any], "Any"]], header: str | None) -> bool:
+        """Render one phase group; return False when the backstop is hit."""
+        nonlocal used, shown
+        group = sorted(group_agents, key=lambda pair: float(pair[1]), reverse=True)
+        if not group:
+            return True
+        subtotal = None
+        for _a, amt in group:
+            subtotal = amt if subtotal is None else subtotal + amt
+        if header is not None:
+            head_line = f"   {header}  {_format_cost(subtotal)}"
+            if used + len(head_line) + 1 > char_budget:
+                return False
+            lines.append(head_line)
+            used += len(head_line) + 1
+        for agent, amount in group:
+            if shown >= max_rows:
+                return False
+            line = _agent_cost_line(agent, amount)
+            if used + len(line) + 1 > char_budget:
+                return False
+            lines.append(line)
+            used += len(line) + 1
+            shown += 1
+            rendered_ids.add(agent.get("id"))
+        return True
+
+    priced_by_id = {a.get("id"): (a, c) for a, c in priced}
+    backstopped = False
+    if len(phases) >= 2:
+        for title in phases:
+            members = [
+                priced_by_id[a.get("id")]
+                for a in agents
+                if a.get("phase") == title and a.get("id") in priced_by_id
+            ]
+            if not _emit(members, title):
+                backstopped = True
+                break
+        if not backstopped:
+            leftover = [
+                pair for aid, pair in priced_by_id.items() if aid not in rendered_ids
+            ]
+            if not _emit(leftover, "[Other]"):
+                backstopped = True
+    else:
+        backstopped = not _emit(priced, None)
+
+    hidden = len(priced) - shown
+    if hidden > 0:
+        lines.append(f"   … +{hidden} more")
+    return "\n".join(lines)
+
+
 def render_saved_markdown(run: dict[str, Any]) -> str:
     snapshot = run.get("workflow") or {}
     completed = run.get("status") not in _RUNNING_STATES
@@ -191,7 +289,7 @@ def _render_run_block(
         # legacy phase+progress line and chip row below.
         phases = _phase_names(snapshot, recursive=False)
         if len(phases) >= 2:
-            lines.extend(_phase_checklist(snapshot, agents))
+            lines.extend(_phase_checklist(snapshot, agents, show_cost=show_cost))
             next_line = _next_phase_line(snapshot, phases)
             if next_line:
                 lines.append(f"   {next_line}")
@@ -205,7 +303,7 @@ def _render_run_block(
             if totals.get("errors"):
                 bits.append(f"{totals['errors']} err")
             lines.append(f"   {phase + ' · ' if phase else ''}{' · '.join(bits)}")
-            for line in _agent_lines(agents):
+            for line in _agent_lines(agents, show_cost=show_cost):
                 lines.append(f"   {line}")
         return _append_ids(lines, run, include_ids)
 
@@ -293,9 +391,15 @@ def _detail_marker(status: Any) -> str:
     return _DETAIL_MARKER.get(str(status or ""), "◦")
 
 
-def _agent_row_text(agent: dict[str, Any]) -> str:
+def _agent_row_text(agent: dict[str, Any], *, show_cost: bool = False) -> str:
     """One roster row: ``<marker> <label>[ · <model> <effort>][ · <elapsed>][ ·
-    <N> tools]``. Each segment omitted when its datum is absent."""
+    <N> tools][ · ~$cost]``. Each segment omitted when its datum is absent.
+
+    ``show_cost`` appends this agent's OWN estimated dollar cost (so Alfredo can
+    see how much each verify/review subtask cost, not just the run total). The
+    cost segment is omitted when the agent has no priceable usage yet (running
+    with zero tokens) or no pricing route (e.g. a subscription/included model).
+    """
     marker = _detail_marker(agent.get("status"))
     label = _chip_label(agent)
     segs = [f"{marker} {label}"]
@@ -308,6 +412,10 @@ def _agent_row_text(agent: dict[str, Any]) -> str:
     tools = agent.get("tool_calls")
     if isinstance(tools, int) and tools > 0:
         segs.append(f"{tools} tool{'s' if tools != 1 else ''}")
+    if show_cost:
+        cost = _format_cost(_agent_cost(agent))
+        if cost:
+            segs.append(cost)
     return " · ".join(segs)
 
 
@@ -316,6 +424,7 @@ def _agent_lines(
     *,
     char_budget: int = _ROSTER_CHAR_BUDGET,
     max_rows: int = _ROSTER_MAX_ROWS,
+    show_cost: bool = False,
 ) -> list[str]:
     """Per-agent rows for the detailed bubble layout (fan-out and pipeline).
 
@@ -326,7 +435,8 @@ def _agent_lines(
     row text would push the bubble past Telegram's 4096-char limit
     (``char_budget``) or a runaway ceiling (``max_rows``) is hit. Elapsed
     reflects the agent's ``duration_seconds`` at snapshot time (ticks at
-    snapshot cadence, not a live wall clock).
+    snapshot cadence, not a live wall clock). ``show_cost`` appends each agent's
+    own estimated dollar cost.
     """
     if not agents:
         return []
@@ -337,7 +447,7 @@ def _agent_lines(
     used = 0
     shown = 0
     for agent in ordered:
-        row = _agent_row_text(agent)
+        row = _agent_row_text(agent, show_cost=show_cost)
         # +1 for the newline joining this row to the bubble.
         if shown >= max_rows or (rows and used + len(row) + 1 > char_budget):
             break
@@ -452,16 +562,24 @@ def _format_cost(amount: "Any") -> str:
     return f"~${value:.2f}"
 
 
-def _phase_checklist(snapshot: dict[str, Any], agents: list[dict[str, Any]]) -> list[str]:
+def _phase_checklist(
+    snapshot: dict[str, Any],
+    agents: list[dict[str, Any]],
+    *,
+    show_cost: bool = False,
+) -> list[str]:
     """Checklist of pipeline phases for the detailed bubble layout.
 
     One line per ordered phase: ``<mark> <title>  <done>/<total> done[· R
-    running][· E err]``. Marker precedence is all-done ✓ wins over active ▶ wins
-    over pending ◦. The active phase reuses ``_current_phase`` so the bubble and
-    the rest of the renderer agree; the ``phases[-1]`` fallback inside it is
-    guarded here so an unstarted or fully-done pipeline never bolds a phantom
-    active phase. Unphased agents collapse into a trailing ``[Other]`` row so the
-    per-phase counts always reconcile with the header total.
+    running][· E err][· ~$cost]``. Marker precedence is all-done ✓ wins over
+    active ▶ wins over pending ◦. The active phase reuses ``_current_phase`` so
+    the bubble and the rest of the renderer agree; the ``phases[-1]`` fallback
+    inside it is guarded here so an unstarted or fully-done pipeline never bolds
+    a phantom active phase. Unphased agents collapse into a trailing ``[Other]``
+    row so the per-phase counts always reconcile with the header total.
+    ``show_cost`` adds a per-phase cost subtotal AND a per-agent cost on each
+    in-flight row, so Alfredo can see how much each phase (and each subtask)
+    cost.
     """
     phases = _phase_names(snapshot, recursive=False)
     by_phase: dict[str, list[dict[str, Any]]] = {phase: [] for phase in phases}
@@ -503,6 +621,10 @@ def _phase_checklist(snapshot: dict[str, Any], agents: list[dict[str, Any]]) -> 
             bits.append(f"{running} running")
         if errors:
             bits.append(f"{errors} err")
+        if show_cost:
+            phase_cost = _format_cost(_total_cost(members))
+            if phase_cost:
+                bits.append(phase_cost)
         body = f"{mark} {title}  {' · '.join(bits)}"
         return f"**{body}**" if mark == "▶" else body
 
@@ -523,7 +645,7 @@ def _phase_checklist(snapshot: dict[str, Any], agents: list[dict[str, Any]]) -> 
         in_flight = [a for a in members if a.get("status") in {"running", "error", "failed"}]
         if not in_flight:
             continue
-        agent_rows = _agent_lines(in_flight, char_budget=char_budget)
+        agent_rows = _agent_lines(in_flight, char_budget=char_budget, show_cost=show_cost)
         for line in agent_rows:
             rows.append(f"      {line}")
             char_budget -= len(line) + 6  # 6-space indent + newline accounting
