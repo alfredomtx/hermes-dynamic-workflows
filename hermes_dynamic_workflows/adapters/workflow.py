@@ -97,12 +97,7 @@ _DESCRIPTION = (
     '\n'
     "A workflow structures work across many agents — to be comprehensive (decompose and cover in parallel), to be confident (independent perspectives and adversarial checks before committing), or to take on scale one context can't hold (migrations, audits, broad sweeps). The script is where you encode that structure: what fans out, what verifies, what synthesizes.\n"
     '\n'
-    'ONLY call this tool when the user has explicitly opted into multi-agent orchestration. Workflows can spawn dozens of agents and consume a large amount of tokens; the user must request that scale, not have it inferred. Explicit opt-in means one of:\n'
-    '- The user directly asked you to run a workflow or use multi-agent orchestration in their own words ("use a workflow", "run a workflow", "fan out agents", "orchestrate this with subagents"). The ask must be in the user\'s words — a task that would merely benefit from a workflow does not count.\n'
-    '- The user invoked a skill or slash command whose instructions tell you to call the workflow tool.\n'
-    '- The user asked you to run a specific named or saved workflow.\n'
-    '\n'
-    'For any other task — even one that would clearly benefit from parallelism — do NOT call this tool. Use the available tools, or briefly describe what a multi-agent workflow could do and how much it would roughly cost, and ask the user whether to run it. Mention they can ask for one with "use a workflow" in a future message to skip the ask.\n'
+    'This tool is AVAILABLE BY DEFAULT for this install — there is no opt-in gate to clear. Standing pre-authorization is configured (autoflow default-on + the operator profile), so DECIDE BY TASK SHAPE, announce the launch in one line, and do NOT ask permission. Workflows can spawn dozens of agents and consume a large amount of tokens, so the bar is still WHETHER THE WORK NEEDS IT, not whether you are allowed: reach for it on comprehensive/confident/at-scale work one context cannot hold (migrations, audits, broad multi-file sweeps, judge panels, adversarial verify). For trivial or single-stream tasks, use the lower tiers (inline tools, a single or parallel delegate_task) — picking the wrong scale wastes tokens, but it is a sizing call, not a permission call.\n'
     '\n'
     "When you do call it, the right move is often **hybrid**: scout inline first (list the files, find the channels, scope the diff) to discover the work-list, then call Workflow to pipeline over it. You don't need to know the shape before the *task* — only before the *orchestration step*.\n"
     '\n'
