@@ -24,6 +24,19 @@ from ..core.text import preview
 _CHIP_LABEL_MAX = 32
 _RUNNING_STATES = {"queued", "running", "paused", "stopping"}
 
+# Char budget for the per-agent roster rows in the DETAILED progress bubble.
+# Alfredo asked the roster to show ALL items, not collapse a tail into "… +N".
+# So the detailed view (_agent_lines, _phase_checklist) no longer caps by a
+# fixed row count — it shows every agent until this character budget would push
+# the bubble past Telegram's 4096-char message limit (header + any result body
+# share that ceiling, so we leave generous headroom). For any realistic run
+# (a few to a few dozen agents) every row shows; only a pathological fan-out of
+# hundreds of agents trims a tail with "… +N" as a safety backstop.
+_ROSTER_CHAR_BUDGET = 3500
+# Secondary backstop ceiling so a runaway 1000-agent run can't build a giant
+# list before the char budget trims it. Far above any real concurrent roster.
+_ROSTER_MAX_ROWS = 250
+
 
 def render_workflow_text(snapshot: dict[str, Any], *, completed: bool = True, max_agents: int = 12) -> str:
     meta = snapshot.get("meta") or {}
@@ -192,7 +205,7 @@ def _render_run_block(
             if totals.get("errors"):
                 bits.append(f"{totals['errors']} err")
             lines.append(f"   {phase + ' · ' if phase else ''}{' · '.join(bits)}")
-            for line in _agent_lines(agents, max_rows=10):
+            for line in _agent_lines(agents):
                 lines.append(f"   {line}")
         return _append_ids(lines, run, include_ids)
 
@@ -280,13 +293,38 @@ def _detail_marker(status: Any) -> str:
     return _DETAIL_MARKER.get(str(status or ""), "◦")
 
 
-def _agent_lines(agents: list[dict[str, Any]], *, max_rows: int = 10) -> list[str]:
+def _agent_row_text(agent: dict[str, Any]) -> str:
+    """One roster row: ``<marker> <label>[ · <model> <effort>][ · <elapsed>][ ·
+    <N> tools]``. Each segment omitted when its datum is absent."""
+    marker = _detail_marker(agent.get("status"))
+    label = _chip_label(agent)
+    segs = [f"{marker} {label}"]
+    model_seg = _model_segment(agent)
+    if model_seg:
+        segs.append(model_seg)
+    duration = agent.get("duration_seconds")
+    if isinstance(duration, (int, float)) and duration > 0:
+        segs.append(_format_duration(duration))
+    tools = agent.get("tool_calls")
+    if isinstance(tools, int) and tools > 0:
+        segs.append(f"{tools} tool{'s' if tools != 1 else ''}")
+    return " · ".join(segs)
+
+
+def _agent_lines(
+    agents: list[dict[str, Any]],
+    *,
+    char_budget: int = _ROSTER_CHAR_BUDGET,
+    max_rows: int = _ROSTER_MAX_ROWS,
+) -> list[str]:
     """Per-agent rows for the detailed bubble layout (fan-out and pipeline).
 
-    One row each: ``<marker> <label> · <model>[ <effort>][ · <elapsed>][ · <N>
-    tools]``. Each segment is omitted when its datum is absent. Running/errored
-    agents come first (that is what a watcher cares about), then the rest in
-    order, capped at ``max_rows`` with a ``… +K`` overflow tail. Elapsed
+    Shows ALL agents (Alfredo's request: no ``… +N`` collapse on a normal run).
+    Running/errored agents come first (that is what a watcher cares about), then
+    the rest in first-seen order. The list is uncapped for any realistic run and
+    only trims a tail with ``… +K`` as a SAFETY BACKSTOP — when the accumulated
+    row text would push the bubble past Telegram's 4096-char limit
+    (``char_budget``) or a runaway ceiling (``max_rows``) is hit. Elapsed
     reflects the agent's ``duration_seconds`` at snapshot time (ticks at
     snapshot cadence, not a live wall clock).
     """
@@ -295,23 +333,18 @@ def _agent_lines(agents: list[dict[str, Any]], *, max_rows: int = 10) -> list[st
     active = [a for a in agents if a.get("status") in {"running", "error"}]
     rest = [a for a in agents if a.get("status") not in {"running", "error"}]
     ordered = active + rest
-    shown = ordered[:max_rows]
     rows: list[str] = []
-    for agent in shown:
-        marker = _detail_marker(agent.get("status"))
-        label = _chip_label(agent)
-        segs = [f"{marker} {label}"]
-        model_seg = _model_segment(agent)
-        if model_seg:
-            segs.append(model_seg)
-        duration = agent.get("duration_seconds")
-        if isinstance(duration, (int, float)) and duration > 0:
-            segs.append(_format_duration(duration))
-        tools = agent.get("tool_calls")
-        if isinstance(tools, int) and tools > 0:
-            segs.append(f"{tools} tool{'s' if tools != 1 else ''}")
-        rows.append(" · ".join(segs))
-    hidden = len(agents) - len(shown)
+    used = 0
+    shown = 0
+    for agent in ordered:
+        row = _agent_row_text(agent)
+        # +1 for the newline joining this row to the bubble.
+        if shown >= max_rows or (rows and used + len(row) + 1 > char_budget):
+            break
+        rows.append(row)
+        used += len(row) + 1
+        shown += 1
+    hidden = len(agents) - shown
     if hidden > 0:
         rows.append(f"… +{hidden}")
     return rows
@@ -476,25 +509,24 @@ def _phase_checklist(snapshot: dict[str, Any], agents: list[dict[str, Any]]) -> 
     # Per-phase rows, with the running/errored agents of EACH in-flight phase
     # shown beneath their phase line. pipeline() is non-barrier, so more than
     # one phase can have work in flight at once (B5) — show them all, not just
-    # the resolved "active" phase. A global budget caps total agent rows across
-    # phases so a wide multi-phase fan-out can't blow the Telegram length cap.
+    # the resolved "active" phase. By default ALL in-flight agents show (Alfredo
+    # asked for no "… +N" collapse); a shared CHAR budget across phases is only a
+    # safety backstop so a pathological multi-hundred-agent fan-out can't blow
+    # the Telegram length cap.
     rows: list[str] = []
-    agent_row_budget = 12
+    char_budget = _ROSTER_CHAR_BUDGET
     for title in phases:
         members = by_phase.get(title, [])
         rows.append(f"   {_phase_row(title, members)}")
-        if agent_row_budget <= 0:
+        if char_budget <= 0:
             continue
         in_flight = [a for a in members if a.get("status") in {"running", "error", "failed"}]
         if not in_flight:
             continue
-        shown = in_flight[:agent_row_budget]
-        for line in _agent_lines(shown, max_rows=len(shown)):
+        agent_rows = _agent_lines(in_flight, char_budget=char_budget)
+        for line in agent_rows:
             rows.append(f"      {line}")
-        agent_row_budget -= len(shown)
-        hidden = len(in_flight) - len(shown)
-        if hidden > 0:
-            rows.append(f"      … +{hidden}")
+            char_budget -= len(line) + 6  # 6-space indent + newline accounting
     if unphased:
         rows.append(f"   {_phase_row('[Other]', unphased)}")
     return rows

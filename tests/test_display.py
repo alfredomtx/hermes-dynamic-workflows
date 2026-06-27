@@ -198,7 +198,9 @@ class DisplayTests(unittest.TestCase):
         body = text.split("\n", 1)[1]
         self.assertLess(body.index("wireframe"), body.index("structural"))
 
-    def test_fanout_caps_rows_with_overflow_tail(self):
+    def test_fanout_shows_all_rows_no_overflow_tail(self):
+        """Alfredo's request: the detailed roster shows ALL agents, no '… +N'
+        collapse on a normal run (15 agents used to trim to 10 + '… +5')."""
         from hermes_dynamic_workflows.view.render import render_run_progress
 
         agents = [
@@ -213,7 +215,31 @@ class DisplayTests(unittest.TestCase):
                          "agents": agents, "errors": []},
         }
         text = render_run_progress(run)
-        self.assertIn("… +5", text)  # 15 agents, max_rows=10 -> 5 hidden
+        self.assertNotIn("… +", text)  # no collapse — every agent shows
+        for i in range(15):
+            self.assertIn(f"a{i}", text)
+
+    def test_fanout_char_budget_backstop_trims_pathological_run(self):
+        """A pathological multi-hundred-agent fan-out still trims a tail via the
+        char-budget backstop so the bubble stays under Telegram's 4096 limit."""
+        from hermes_dynamic_workflows.view.render import render_run_progress
+
+        agents = [
+            {"id": i, "label": f"agent-task-{i:03d}-doing-some-work",
+             "status": "running", "phase": "Sweep", "duration_seconds": 100.0,
+             "model": "us.anthropic.claude-opus-4-8", "reasoning_effort": "xhigh",
+             "tool_calls": 5}
+            for i in range(300)
+        ]
+        run = {
+            "runId": "wf_mega",
+            "status": "running",
+            "workflow": {"meta": {"name": "mega"}, "phases": [{"title": "Sweep"}],
+                         "agents": agents, "errors": []},
+        }
+        text = render_run_progress(run)
+        self.assertIn("… +", text)       # backstop trimmed a tail
+        self.assertLess(len(text), 4096)  # stays under Telegram's message cap
 
     def _pipeline_run(self, statuses):
         """statuses: dict phase -> list of agent statuses."""
