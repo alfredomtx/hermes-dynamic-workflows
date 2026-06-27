@@ -741,57 +741,6 @@ class ToolCallCountTests(unittest.TestCase):
         # failing with "structured_output does not exist".
         self.assertTrue(getattr(child, "_skip_mcp_refresh", False))
 
-    def test_skip_mcp_refresh_flag_suppresses_between_turns_rebuild(self):
-        # Contract test mirroring the core guard in agent/turn_context.py:
-        #     if not getattr(agent, "_skip_mcp_refresh", False):
-        #         if has_registered_mcp_tools():
-        #             refresh_agent_mcp_tools(agent, quiet_mode=True)
-        # Proves that with the flag set, the destructive rebuild that strips
-        # structured_output is never invoked — so the injected surface survives.
-        class FakeAIAgent:
-            def __init__(self, **kwargs):
-                self.model = kwargs.get("model")
-
-        run_agent_mod = types.ModuleType("run_agent")
-        run_agent_mod.AIAgent = FakeAIAgent
-        runner = HermesChildAgentRunner(PluginConfig())
-        request = ChildAgentRequest(
-            id=1,
-            prompt="work",
-            label="schema-agent",
-            phase=None,
-            toolsets=[],
-        )
-        lease = WorkspaceLease(task_id="workflow-def456", cwd="/tmp")
-        runtime = {"model": "test-model"}
-
-        with patch.dict(sys.modules, {"run_agent": run_agent_mod}):
-            child = runner._build_agent(request, runtime, [], lease, None)
-
-        # Emulate the core's per-turn prologue guard verbatim.
-        refresh_calls = []
-
-        def fake_refresh(agent, **kwargs):
-            refresh_calls.append(agent)
-            # The real refresh would do: agent.tools = get_tool_definitions(...)
-            # which strips structured_output. We assert it never runs.
-            agent.tools = [{"type": "function", "function": {"name": "read_file"}}]
-            agent.valid_tool_names = {"read_file"}
-            return set()
-
-        # Pre-seed the surface the way run() would (with structured_output).
-        child.tools = [
-            {"type": "function", "function": {"name": "structured_output"}},
-        ]
-        child.valid_tool_names = {"structured_output"}
-
-        # Guard logic copied from turn_context.py (has_registered_mcp_tools True).
-        if not getattr(child, "_skip_mcp_refresh", False):
-            fake_refresh(child, quiet_mode=True)
-
-        self.assertEqual(refresh_calls, [])
-        self.assertIn("structured_output", child.valid_tool_names)
-
     def test_tool_progress_callback_prints_one_started_line_on_tty(self):
         class TtyStringIO(io.StringIO):
             def isatty(self):
@@ -1222,6 +1171,158 @@ class ChildApprovalPolicyTests(unittest.TestCase):
         with patch.dict(sys.modules, {"tools": tools_pkg, "tools.approval": approval_mod}):
             cb = _make_child_approval_callback("inherit")
             self.assertEqual(cb("rm -rf build", "recursive delete"), "once")
+
+
+def _core_refresh_importable() -> bool:
+    """True iff the host Hermes core exposes the between-turns MCP refresh.
+
+    The integration test below drives the REAL core refresh, so it only runs
+    when the plugin is installed against a Hermes checkout (the normal case).
+    Standalone plugin checkouts without the core on sys.path skip it cleanly.
+    """
+    try:
+        from tools.mcp_tool import (  # noqa: F401
+            has_registered_mcp_tools,
+            refresh_agent_mcp_tools,
+        )
+        from tools.registry import registry  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+@unittest.skipUnless(
+    _core_refresh_importable(),
+    "host Hermes core (tools.mcp_tool / tools.registry) not importable",
+)
+class StructuredOutputSurvivesRealMcpRefreshTests(unittest.TestCase):
+    """E2E guard against the regression that mocks could not catch.
+
+    Schema workflow children died with "structured_output does not exist"
+    because the core's per-turn between-turns refresh
+    (agent/turn_context.py -> tools.mcp_tool.refresh_agent_mcp_tools) rebuilt
+    the child's tool surface from get_tool_definitions(enabled_toolsets=...)
+    and re-appended only the memory + context-engine families, silently
+    dropping the post-build structured_output injection. Unit tests passed
+    because they mutated a mock object and never ran the REAL refresh against
+    a child built by _build_agent. These tests close that gap: they register a
+    real MCP tool (so has_registered_mcp_tools() is True — the trigger), build
+    a real child, and run the REAL refresh, asserting the fix
+    (_skip_mcp_refresh) preserves structured_output while the absence of the
+    fix reproduces the wipe.
+    """
+
+    MCP_TOOL = "mcp_test_probe_tool"
+
+    def _register_probe_mcp_tool(self):
+        from tools import mcp_tool
+        from tools.registry import registry
+
+        schema = {
+            "name": self.MCP_TOOL,
+            "description": "probe",
+            "parameters": {"type": "object", "properties": {}},
+        }
+        # Register into the real registry AND mark it as MCP-sourced so
+        # has_registered_mcp_tools() reports True (the per-turn trigger).
+        if registry.get_entry(self.MCP_TOOL) is None:
+            registry.register(
+                name=self.MCP_TOOL,
+                toolset="mcp-probe",
+                schema=schema,
+                handler=lambda **kw: "ok",
+                description="probe",
+            )
+        with mcp_tool._lock:
+            mcp_tool._mcp_tool_server_names[self.MCP_TOOL] = "probe-server"
+
+    def _cleanup_probe_mcp_tool(self):
+        from tools import mcp_tool
+        from tools.registry import registry
+
+        with mcp_tool._lock:
+            mcp_tool._mcp_tool_server_names.pop(self.MCP_TOOL, None)
+        try:
+            registry.deregister(self.MCP_TOOL)
+        except Exception:
+            pass
+
+    def _build_child(self):
+        class FakeAIAgent:
+            def __init__(self, **kwargs):
+                self.model = kwargs.get("model")
+                self.enabled_toolsets = kwargs.get("enabled_toolsets")
+                self.disabled_toolsets = kwargs.get("disabled_toolsets")
+                self.quiet_mode = kwargs.get("quiet_mode", True)
+                self.tools = []
+                self.valid_tool_names = set()
+                self._tool_snapshot_generation = 0
+
+        run_agent_mod = types.ModuleType("run_agent")
+        run_agent_mod.AIAgent = FakeAIAgent
+        runner = HermesChildAgentRunner(PluginConfig())
+        request = ChildAgentRequest(
+            id=1,
+            prompt="work",
+            label="schema-agent",
+            phase=None,
+            toolsets=["file"],
+        )
+        lease = WorkspaceLease(task_id="workflow-int001", cwd="/tmp")
+        runtime = {"model": "test-model"}
+        with patch.dict(sys.modules, {"run_agent": run_agent_mod}):
+            child = runner._build_agent(request, runtime, ["file"], lease, None)
+        # Seed the deliberately-assembled surface run() would publish for a
+        # schema child: structured_output injected on top of the toolset.
+        child.tools = [
+            {"type": "function", "function": {"name": "read_file", "parameters": {}}},
+            {"type": "function", "function": {"name": "structured_output", "parameters": {}}},
+        ]
+        child.valid_tool_names = {"read_file", "structured_output"}
+        return child
+
+    def _run_core_guard(self, child):
+        """Replicate agent/turn_context.py's between-turns refresh guard exactly."""
+        from tools.mcp_tool import has_registered_mcp_tools, refresh_agent_mcp_tools
+
+        self.assertTrue(
+            has_registered_mcp_tools(),
+            "probe MCP tool should make has_registered_mcp_tools() True",
+        )
+        if not getattr(child, "_skip_mcp_refresh", False):
+            refresh_agent_mcp_tools(child, quiet_mode=True)
+
+    def test_real_refresh_preserves_structured_output_with_flag(self):
+        self._register_probe_mcp_tool()
+        try:
+            child = self._build_child()
+            self.assertTrue(getattr(child, "_skip_mcp_refresh", False))
+            self._run_core_guard(child)
+            # Fix holds: the real refresh was skipped, surface intact.
+            self.assertIn("structured_output", child.valid_tool_names)
+        finally:
+            self._cleanup_probe_mcp_tool()
+
+    def test_real_refresh_wipes_structured_output_without_flag(self):
+        # Characterizes the bug: with the flag cleared, the REAL refresh runs
+        # and strips structured_output (it is not in the re-appended families).
+        # This is the failure the fix prevents; if this assertion ever flips,
+        # the core refresh started preserving the tool and the guard could be
+        # revisited.
+        self._register_probe_mcp_tool()
+        try:
+            child = self._build_child()
+            child._skip_mcp_refresh = False  # simulate pre-fix behavior
+            self._run_core_guard(child)
+            self.assertNotIn(
+                "structured_output",
+                child.valid_tool_names,
+                "real refresh unexpectedly preserved structured_output; "
+                "the _skip_mcp_refresh guard's premise may have changed",
+            )
+        finally:
+            self._cleanup_probe_mcp_tool()
 
 
 if __name__ == "__main__":
