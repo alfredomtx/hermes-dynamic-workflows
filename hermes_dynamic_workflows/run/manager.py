@@ -1504,10 +1504,16 @@ def _notify_completion(
     in-conversation <task-notification> injection still happens so the parent
     model can act on the result. The bubble is finalized regardless of
     notify_on_complete (a seeded bubble must never be left stuck on "running").
+    If that finalize edit fails to deliver (e.g. a long Telegram flood wait
+    returns SendResult(success=False)), the agreed completion channel broke, so
+    a FRESH completion send fires as recovery EVEN WHEN notify_on_complete is
+    False — otherwise the verdict would be silently lost, which is the exact
+    bug this guards against.
     Best effort: any failure is swallowed so it never affects the run.
     """
     bubble_finalized = False
     bubble_pending = False
+    bubble_finalize_failed = False
     if config.notify_progress:
         # A bubble may have been requested at launch but its message id might not
         # have resolved yet (async seed send). For a fast run that finishes
@@ -1536,8 +1542,10 @@ def _notify_completion(
                 bubble_finalized = _edit_progress_bubble(
                     managed, config, completed=True, force=True
                 )
+                bubble_finalize_failed = not bubble_finalized
             except Exception:
                 bubble_finalized = False
+                bubble_finalize_failed = True
         elif requested:
             # The seed send is still in flight at the deadline (the slow-seed /
             # sustained-flood case). Do NOT race ahead with a separate
@@ -1546,7 +1554,7 @@ def _notify_completion(
             # succeeded, or sends the completion message itself if it failed.
             # Either way the run gets exactly one terminal message.
             bubble_pending = True
-    if not config.notify_on_complete:
+    if not config.notify_on_complete and not bubble_finalize_failed:
         return
     notification = _render_task_notification(record, config.notify_result_preview_chars)
     injected = False

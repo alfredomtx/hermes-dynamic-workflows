@@ -1153,6 +1153,203 @@ return await agent("do it", {"label": "worker"})
         self.assertIn("Result:", completion_sends[0][1])
         self.assertIn("worker", completion_sends[0][1])
 
+    def test_completion_edit_flood_recovers_even_when_notify_on_complete_false(self):
+        # Regression for WARN-1 (flagged independently by all 3 dual-review lanes):
+        # a seeded live bubble IS the agreed completion channel and is finalized
+        # regardless of notify_on_complete. So if the FINAL edit floods (returns
+        # success=False without raising), the verdict must still be recovered via
+        # a FRESH send EVEN WHEN notify_on_complete=False — otherwise a user who
+        # set "live bubble, no trailing completion msgs" silently loses the
+        # verdict, which is the exact bug class this fix exists to kill. The
+        # notify_on_complete gate must be bypassed in the finalize-failed case.
+        script = """
+meta = {"name": "flood-no-notify", "description": "Flood + notify_on_complete=False"}
+
+return await agent("do it", {"label": "worker"})
+"""
+
+        class FloodOnFinalizeAdapter:
+            def __init__(self):
+                self.sent = []
+                self.edited = []
+
+            async def send(self, chat_id, content, metadata=None):
+                self.sent.append((chat_id, content, metadata))
+                return SimpleNamespace(success=True, message_id="msg-200")
+
+            async def edit_message(self, chat_id, message_id, content, *, finalize=False, metadata=None):
+                self.edited.append((chat_id, message_id, content, finalize, metadata))
+                if finalize:
+                    return SimpleNamespace(success=False, error="flood_control:30")
+                return SimpleNamespace(success=True, message_id=message_id)
+
+        adapter = FloodOnFinalizeAdapter()
+        runner = SimpleNamespace(
+            adapters={"telegram": adapter},
+            _gateway_loop=object(),
+            _session_sources={
+                "agent:main:telegram:dm:chat-1": SimpleNamespace(
+                    platform="telegram",
+                    chat_id="chat-1",
+                    thread_id=None,
+                    message_id="message-1",
+                )
+            },
+            _thread_metadata_for_source=lambda source, reply_to_message_id=None: {"reply": reply_to_message_id},
+        )
+
+        def schedule(coro, loop, **kwargs):
+            result = asyncio.run(coro)
+            future = Future()
+            future.set_result(result)
+            return future
+
+        agent_pkg = ModuleType("agent")
+        async_utils = ModuleType("agent.async_utils")
+        async_utils.safe_schedule_threadsafe = schedule
+        agent_pkg.async_utils = async_utils
+        session_context = {
+            "platform": "telegram",
+            "chat_id": "chat-1",
+            "session_key": "agent:main:telegram:dm:chat-1",
+            "message_id": "message-1",
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(
+                store=WorkflowStore(Path(tmp)),
+                # notify_progress on (bubble seeds), notify_on_complete OFF.
+                config=PluginConfig(
+                    require_launch_approval=False,
+                    notify_on_complete=False,
+                ),
+            )
+            with (
+                patch(
+                    "hermes_dynamic_workflows.child.runner.HermesChildAgentRunner",
+                    return_value=CountingRunner(),
+                ),
+                patch(
+                    "hermes_dynamic_workflows.host.gateway.gateway_runner_ref",
+                    return_value=runner,
+                ),
+                patch.dict(sys.modules, {"agent": agent_pkg, "agent.async_utils": async_utils}),
+            ):
+                rec = manager.start_from_params(
+                    {"script": script},
+                    cwd=tmp,
+                    host_session_id="gateway-test-session",
+                    session_context_override=session_context,
+                )
+                final = manager.wait(rec["runId"], timeout=2)
+
+        self.assertEqual(final["status"], "completed")
+        self.assertTrue(any(e[3] for e in adapter.edited))  # a finalize edit happened
+        # CRITICAL: notify_on_complete=False normally suppresses the trailing
+        # send, but the finalize edit FLOODED, so the recovery send must still
+        # fire carrying the full result.
+        completion_sends = [s for s in adapter.sent if "Workflow completed" in s[1]]
+        self.assertEqual(
+            len(completion_sends),
+            1,
+            f"expected one recovery send despite notify_on_complete=False, got sends={adapter.sent}",
+        )
+        self.assertIn("Result:", completion_sends[0][1])
+
+    def test_completion_edit_success_with_notify_on_complete_false_no_send(self):
+        # Guard the other side of WARN-1: when the finalize edit SUCCEEDS and
+        # notify_on_complete=False, the bubble carried the result, so NO fresh
+        # send must fire. The recovery bypass must trigger ONLY on finalize
+        # failure, never on the happy path.
+        script = """
+meta = {"name": "ok-no-notify", "description": "Edit OK + notify_on_complete=False"}
+
+return await agent("do it", {"label": "worker"})
+"""
+
+        class OkFinalizeAdapter:
+            def __init__(self):
+                self.sent = []
+                self.edited = []
+
+            async def send(self, chat_id, content, metadata=None):
+                self.sent.append((chat_id, content, metadata))
+                return SimpleNamespace(success=True, message_id="msg-300")
+
+            async def edit_message(self, chat_id, message_id, content, *, finalize=False, metadata=None):
+                self.edited.append((chat_id, message_id, content, finalize, metadata))
+                return SimpleNamespace(success=True, message_id=message_id)
+
+        adapter = OkFinalizeAdapter()
+        runner = SimpleNamespace(
+            adapters={"telegram": adapter},
+            _gateway_loop=object(),
+            _session_sources={
+                "agent:main:telegram:dm:chat-1": SimpleNamespace(
+                    platform="telegram",
+                    chat_id="chat-1",
+                    thread_id=None,
+                    message_id="message-1",
+                )
+            },
+            _thread_metadata_for_source=lambda source, reply_to_message_id=None: {"reply": reply_to_message_id},
+        )
+
+        def schedule(coro, loop, **kwargs):
+            result = asyncio.run(coro)
+            future = Future()
+            future.set_result(result)
+            return future
+
+        agent_pkg = ModuleType("agent")
+        async_utils = ModuleType("agent.async_utils")
+        async_utils.safe_schedule_threadsafe = schedule
+        agent_pkg.async_utils = async_utils
+        session_context = {
+            "platform": "telegram",
+            "chat_id": "chat-1",
+            "session_key": "agent:main:telegram:dm:chat-1",
+            "message_id": "message-1",
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(
+                store=WorkflowStore(Path(tmp)),
+                config=PluginConfig(
+                    require_launch_approval=False,
+                    notify_on_complete=False,
+                ),
+            )
+            with (
+                patch(
+                    "hermes_dynamic_workflows.child.runner.HermesChildAgentRunner",
+                    return_value=CountingRunner(),
+                ),
+                patch(
+                    "hermes_dynamic_workflows.host.gateway.gateway_runner_ref",
+                    return_value=runner,
+                ),
+                patch.dict(sys.modules, {"agent": agent_pkg, "agent.async_utils": async_utils}),
+            ):
+                rec = manager.start_from_params(
+                    {"script": script},
+                    cwd=tmp,
+                    host_session_id="gateway-test-session",
+                    session_context_override=session_context,
+                )
+                final = manager.wait(rec["runId"], timeout=2)
+
+        self.assertEqual(final["status"], "completed")
+        self.assertTrue(any(e[3] for e in adapter.edited))  # finalize edit happened
+        # Happy path + notify_on_complete=False: bubble carried the result, so
+        # NO separate completion send.
+        completion_sends = [s for s in adapter.sent if "Workflow completed" in s[1]]
+        self.assertEqual(
+            len(completion_sends),
+            0,
+            f"expected no fresh send on successful finalize, got sends={adapter.sent}",
+        )
+
     def test_live_progress_bubble_slow_seed_finalizes_via_callback_no_duplicate(self):
         # Regression for the slow-seed-under-flood path (review finding M1):
         # the seed send's message id resolves only AFTER the run has already
