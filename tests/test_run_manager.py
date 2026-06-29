@@ -1049,6 +1049,110 @@ return await agent("do it", {"label": "worker"})
         self.assertIn("worker", final_edit[2])
         self.assertIn("Result:", final_edit[2])
 
+    def test_completion_edit_flood_failure_falls_back_to_fresh_send(self):
+        # Regression for the verdict-never-posted bug: when the FINAL completion
+        # edit of a live bubble hits Telegram flood control, the adapter returns
+        # SendResult(success=False, error="flood_control:N") instead of raising.
+        # The old code ignored that return, set bubble_finalized=True, and
+        # suppressed the fallback — so the bubble froze on its last mid-run text
+        # (summary+cost, NO result) and the verdict was silently lost. The fix:
+        # _edit_progress_bubble reports the unconfirmed edit, so _notify_completion
+        # falls through to a FRESH completion send carrying the full Result.
+        script = """
+meta = {"name": "flood-bubble", "description": "Flood completion test"}
+
+return await agent("do it", {"label": "worker"})
+"""
+
+        class FloodOnFinalizeAdapter:
+            def __init__(self):
+                self.sent = []
+                self.edited = []
+
+            async def send(self, chat_id, content, metadata=None):
+                self.sent.append((chat_id, content, metadata))
+                return SimpleNamespace(success=True, message_id="msg-100")
+
+            async def edit_message(self, chat_id, message_id, content, *, finalize=False, metadata=None):
+                self.edited.append((chat_id, message_id, content, finalize, metadata))
+                # Mid-run edits succeed; the FINAL (finalize) edit hits a long
+                # flood wait and the adapter reports failure WITHOUT raising —
+                # exactly the live Telegram behavior (wait > 5s path).
+                if finalize:
+                    return SimpleNamespace(success=False, error="flood_control:30")
+                return SimpleNamespace(success=True, message_id=message_id)
+
+        adapter = FloodOnFinalizeAdapter()
+        runner = SimpleNamespace(
+            adapters={"telegram": adapter},
+            _gateway_loop=object(),
+            _session_sources={
+                "agent:main:telegram:dm:chat-1": SimpleNamespace(
+                    platform="telegram",
+                    chat_id="chat-1",
+                    thread_id=None,
+                    message_id="message-1",
+                )
+            },
+            _thread_metadata_for_source=lambda source, reply_to_message_id=None: {"reply": reply_to_message_id},
+        )
+
+        def schedule(coro, loop, **kwargs):
+            result = asyncio.run(coro)
+            future = Future()
+            future.set_result(result)
+            return future
+
+        agent_pkg = ModuleType("agent")
+        async_utils = ModuleType("agent.async_utils")
+        async_utils.safe_schedule_threadsafe = schedule
+        agent_pkg.async_utils = async_utils
+        session_context = {
+            "platform": "telegram",
+            "chat_id": "chat-1",
+            "session_key": "agent:main:telegram:dm:chat-1",
+            "message_id": "message-1",
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(
+                store=WorkflowStore(Path(tmp)),
+                config=PluginConfig(require_launch_approval=False),
+            )
+            with (
+                patch(
+                    "hermes_dynamic_workflows.child.runner.HermesChildAgentRunner",
+                    return_value=CountingRunner(),
+                ),
+                patch(
+                    "hermes_dynamic_workflows.host.gateway.gateway_runner_ref",
+                    return_value=runner,
+                ),
+                patch.dict(sys.modules, {"agent": agent_pkg, "agent.async_utils": async_utils}),
+            ):
+                rec = manager.start_from_params(
+                    {"script": script},
+                    cwd=tmp,
+                    host_session_id="gateway-test-session",
+                    session_context_override=session_context,
+                )
+                final = manager.wait(rec["runId"], timeout=2)
+
+        self.assertEqual(final["status"], "completed")
+        # The finalize edit was ATTEMPTED (flood-failed).
+        self.assertTrue(any(e[3] for e in adapter.edited))  # a finalize edit happened
+        # CRITICAL: because the finalize edit was not confirmed delivered, a
+        # FRESH completion send must have fired carrying the full result, so the
+        # verdict is never silently lost.
+        completion_sends = [s for s in adapter.sent if "Workflow completed" in s[1]]
+        self.assertEqual(
+            len(completion_sends),
+            1,
+            f"expected exactly one fresh completion send after flood, got sends={adapter.sent}",
+        )
+        self.assertIn("Result:", completion_sends[0][1])
+        self.assertIn("worker", completion_sends[0][1])
+
     def test_live_progress_bubble_slow_seed_finalizes_via_callback_no_duplicate(self):
         # Regression for the slow-seed-under-flood path (review finding M1):
         # the seed send's message id resolves only AFTER the run has already

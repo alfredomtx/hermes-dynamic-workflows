@@ -1526,8 +1526,16 @@ def _notify_completion(
             time.sleep(0.05)
         if active:
             try:
-                _edit_progress_bubble(managed, config, completed=True, force=True)
-                bubble_finalized = True
+                # Returns True only when the completion edit was CONFIRMED
+                # delivered. On a long Telegram flood wait the adapter returns
+                # SendResult(success=False) instead of raising, so a bubble that
+                # froze on its last mid-run text (summary+cost, no result) leaves
+                # bubble_finalized False here — and the code below falls through
+                # to a FRESH completion send carrying the full result, instead
+                # of silently dropping the verdict (the verdict-never-posted bug).
+                bubble_finalized = _edit_progress_bubble(
+                    managed, config, completed=True, force=True
+                )
             except Exception:
                 bubble_finalized = False
         elif requested:
@@ -1844,7 +1852,7 @@ def _edit_progress_bubble(
     completed: bool,
     force: bool = False,
     block: bool = True,
-) -> None:
+) -> bool:
     """Edit the live-progress bubble in place for a mid-run or final update.
 
     Throttled by ``notify_progress_min_interval_seconds`` and skipped when the
@@ -1858,19 +1866,30 @@ def _edit_progress_bubble(
     called from the gateway loop thread (the seed done-callback finalizing a
     run that ended while its seed was in flight), because blocking on a future
     scheduled onto that same loop would self-deadlock it.
+
+    Returns True ONLY when a blocking completion edit was CONFIRMED delivered
+    (the adapter returned a truthy/`success` result). Returns False when the
+    edit could not be confirmed delivered — no active bubble, no gateway
+    target, an exception, or (the bug this guards) the adapter reporting
+    failure such as ``SendResult(success=False, error="flood_control:N")`` on a
+    long Telegram flood wait. The completion caller uses this to decide whether
+    to fall back to a fresh completion SEND so the result is never silently
+    lost. A non-blocking call (``block=False``, fire-and-forget) returns False
+    because delivery cannot be confirmed synchronously; the seed done-callback
+    owns that path's fallback instead.
     """
     with managed.lock:
         if not managed.progress_active or not managed.progress_message_id:
-            return
+            return False
         message_id = managed.progress_message_id
         text = _progress_bubble_text(managed.record, config, completed=completed)
         now = time.monotonic()
         if not force:
             if text == managed.progress_last_text:
-                return
+                return False
             interval = max(0.0, float(config.notify_progress_min_interval_seconds))
             if now - managed.progress_last_edit_ts < interval:
-                return
+                return False
         managed.progress_last_text = text
         managed.progress_last_edit_ts = now
         # Inline Stop button: while stoppable show it; on completion pass an
@@ -1888,10 +1907,10 @@ def _edit_progress_bubble(
 
         target = _resolve_gateway_target(managed.session_context)
         if target is None:
-            return
+            return False
         adapter, loop, chat_id, metadata = target
         if not _adapter_can_edit(adapter):
-            return
+            return False
         kwargs: dict[str, Any] = {
             "chat_id": chat_id,
             "message_id": message_id,
@@ -1907,16 +1926,41 @@ def _edit_progress_bubble(
         if stop_buttons is not None and _accepts_buttons(adapter.edit_message):
             kwargs["buttons"] = stop_buttons
         future = safe_schedule_threadsafe(adapter.edit_message(**kwargs), loop)
-        if future is not None:
-            # Completion edit blocks briefly so the run record reflects the
-            # final visual; mid-run edits fire and forget to avoid latency.
-            # block=False forces fire-and-forget even on completion (used when
-            # finalizing from the gateway loop thread, where blocking would
-            # self-deadlock the loop).
-            if completed and block:
-                future.result(timeout=15)
+        if future is None:
+            return False
+        # Completion edit blocks briefly so the run record reflects the final
+        # visual; mid-run edits fire and forget to avoid latency. block=False
+        # forces fire-and-forget even on completion (used when finalizing from
+        # the gateway loop thread, where blocking would self-deadlock the loop).
+        if completed and block:
+            result = future.result(timeout=15)
+            return _edit_result_ok(result)
+        # Mid-run / fire-and-forget completion: delivery not confirmable here.
+        return False
     except Exception:
-        pass
+        return False
+
+
+def _edit_result_ok(result: Any) -> bool:
+    """Interpret an adapter ``edit_message`` return as confirmed-delivered.
+
+    The Telegram adapter returns a ``SendResult`` whose ``success`` is False on
+    a long flood-control wait (``error="flood_control:N"``) instead of raising,
+    so a caller that ignores the return mistakes a dropped edit for a delivered
+    one (the verdict-never-posted bug). Treat an explicit ``success=False`` as
+    NOT delivered. A result with no ``success`` attribute (a minimal adapter or
+    a test stub returning None/True) is treated as delivered to preserve prior
+    best-effort behavior for non-Telegram adapters.
+    """
+    if result is None:
+        # No structured result. A None return from a real edit is ambiguous;
+        # historically the call was fire-and-forget and assumed delivered, so
+        # keep that for adapters that return nothing.
+        return True
+    success = getattr(result, "success", None)
+    if success is None:
+        return True
+    return bool(success)
 
 
 def _progress_bubble_text(record: dict[str, Any], config: PluginConfig, *, completed: bool) -> str:
