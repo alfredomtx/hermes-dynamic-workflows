@@ -2167,5 +2167,114 @@ return await agent("do it", {"label": "worker"})
         self.assertEqual(final["result"], "1:worker")
 
 
+class WorkflowGatewayWakeEventTests(unittest.TestCase):
+    """The fix for: a finished workflow does not WAKE the agent loop in gateway
+    mode (unlike delegate_task). _enqueue_gateway_wake_event puts an
+    async_delegation-shaped event on process_registry.completion_queue so the
+    gateway's _async_delegation_watcher injects it as a new turn.
+    """
+
+    def _managed(self, session_context):
+        from hermes_dynamic_workflows.run.manager import ManagedRun, PauseGate
+
+        record = {
+            "runId": "wf_test_123",
+            "taskId": "wf_test_123",
+            "status": "completed",
+            "workflow": {"meta": {"name": "research-panel"}},
+        }
+        return ManagedRun(
+            run_id="wf_test_123",
+            stop_event=threading.Event(),
+            pause_gate=PauseGate(),
+            record=record,
+            session_context=session_context,
+        )
+
+    def _drain_queue(self):
+        from tools.process_registry import process_registry as pr  # type: ignore
+
+        evts = []
+        while not pr.completion_queue.empty():
+            try:
+                evts.append(pr.completion_queue.get_nowait())
+            except Exception:
+                break
+        return evts
+
+    def _patched_pr(self):
+        """Provide a fake tools.process_registry so the helper's late import
+        resolves to a queue we can inspect, regardless of host availability."""
+        import queue as _queue
+
+        pr = SimpleNamespace(completion_queue=_queue.Queue())
+        pr_mod = ModuleType("tools.process_registry")
+        pr_mod.process_registry = pr
+        tools_pkg = sys.modules.get("tools") or ModuleType("tools")
+        return pr, patch.dict(
+            sys.modules, {"tools": tools_pkg, "tools.process_registry": pr_mod}
+        )
+
+    def test_wake_event_enqueued_with_workflow_shape(self):
+        from hermes_dynamic_workflows.run.manager import _enqueue_gateway_wake_event
+
+        session_context = {
+            "platform": "telegram",
+            "chat_id": "-100123",
+            "thread_id": "53252",
+            "session_key": "agent:main:telegram:supergroup:-100123:53252",
+            "message_id": "m-1",
+        }
+        managed = self._managed(session_context)
+        pr, ctx = self._patched_pr()
+        with ctx:
+            _enqueue_gateway_wake_event(
+                managed, managed.record, "<task-notification>RESULT</task-notification>", session_context
+            )
+            evts = []
+            while not pr.completion_queue.empty():
+                evts.append(pr.completion_queue.get_nowait())
+
+        self.assertEqual(len(evts), 1, "exactly one wake event must be enqueued")
+        evt = evts[0]
+        # Rides the proven async_delegation rail so the watcher/drain/formatter own it.
+        self.assertEqual(evt["type"], "async_delegation")
+        # Honest origin flag so the formatter labels it [WORKFLOW COMPLETE].
+        self.assertEqual(evt["origin"], "workflow")
+        # Unique delegation_id (the runId) => no TUI ("", type) dedup collision.
+        self.assertEqual(evt["delegation_id"], "wf_test_123")
+        # NOT a batch => _finalize_async_delegation_roster + batch formatter no-op.
+        self.assertNotIn("is_batch", evt)
+        self.assertNotIn("results", evt)
+        # Carries the actionable result + routing so the injected turn lands right.
+        self.assertIn("RESULT", evt["summary"])
+        self.assertEqual(evt["session_key"], session_context["session_key"])
+        self.assertEqual(evt["routing"]["thread_id"], "53252")
+        self.assertEqual(evt["status"], "completed")
+
+    def test_wake_event_enqueued_at_most_once(self):
+        from hermes_dynamic_workflows.run.manager import _enqueue_gateway_wake_event
+
+        session_context = {"platform": "telegram", "chat_id": "c", "session_key": "k"}
+        managed = self._managed(session_context)
+        pr, ctx = self._patched_pr()
+        with ctx:
+            _enqueue_gateway_wake_event(managed, managed.record, "n1", session_context)
+            _enqueue_gateway_wake_event(managed, managed.record, "n2", session_context)
+            count = pr.completion_queue.qsize()
+        self.assertEqual(count, 1, "the per-run guard must block a second enqueue")
+
+    def test_no_wake_event_without_gateway_origin(self):
+        # A CLI/headless run (no platform, no session_key) has no loop to wake.
+        from hermes_dynamic_workflows.run.manager import _enqueue_gateway_wake_event
+
+        managed = self._managed(None)
+        pr, ctx = self._patched_pr()
+        with ctx:
+            _enqueue_gateway_wake_event(managed, managed.record, "n", None)
+            count = pr.completion_queue.qsize()
+        self.assertEqual(count, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

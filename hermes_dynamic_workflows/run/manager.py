@@ -90,6 +90,9 @@ class ManagedRun:
     progress_message_id: str | None = None
     progress_last_edit_ts: float = 0.0
     progress_last_text: str | None = field(default=None, repr=False)
+    # Guard: the gateway agent-loop wake event (completion_queue) must be
+    # enqueued at most once per run. Set under ``lock`` by _enqueue_gateway_wake_event.
+    _wake_event_enqueued: bool = field(default=False, repr=False)
     lock: threading.RLock = field(default_factory=threading.RLock)
 
 
@@ -1557,15 +1560,32 @@ def _notify_completion(
     if not config.notify_on_complete and not bubble_finalize_failed:
         return
     notification = _render_task_notification(record, config.notify_result_preview_chars)
-    injected = False
+    # WAKE THE AGENT LOOP. Independent of the user-facing bubble/chat send.
+    # inject_message() returns False in gateway mode (no CLI ref), so the parent
+    # model never re-enters the loop on its own — unlike delegate_task, which
+    # rides process_registry.completion_queue and is injected as a new turn by
+    # the gateway's _async_delegation_watcher. We enqueue an equivalent wake
+    # event so a finished workflow re-enters the conversation the same way.
+    # This sits INSIDE the notify gate above (so a notify_on_complete=False run
+    # stays fully quiet — no inject, no wake, no send), but is a SEPARATE channel
+    # from the bubble: it must NOT be suppressed by bubble_finalized/bubble_pending
+    # (delegate_task delivers a bubble AND an injected turn). Exactly-once is
+    # structural: _notify_completion runs once per run (the finally at the end of
+    # _execute), plus a per-run guard flag blocks any double-fire.
     inject = getattr(plugin_context, "inject_message", None) if plugin_context is not None else None
+    injected = False
     try:
         if callable(inject):
             injected = bool(inject(notification))
     except Exception:
         pass
     if injected:
+        # CLI mode: inject_message already re-entered the conversation (it IS the
+        # wake). No queue event needed (the watcher is gateway-only).
         return
+    # Gateway mode (inject returned False): enqueue the wake event so the
+    # async-delegation watcher injects the result as a new turn and the loop wakes.
+    _enqueue_gateway_wake_event(managed, record, notification, session_context)
     # The bubble's final edit already delivered the completion text to the
     # origin chat (bubble_finalized), or the still-pending seed callback will
     # deliver it (bubble_pending); either way, don't also send a separate
@@ -1573,6 +1593,94 @@ def _notify_completion(
     if bubble_finalized or bubble_pending:
         return
     _send_gateway_completion_notification(record, config, session_context)
+
+
+def _enqueue_gateway_wake_event(
+    managed: "ManagedRun",
+    record: dict[str, Any],
+    notification: str,
+    session_context: dict[str, str] | None,
+) -> None:
+    """Enqueue a completion_queue event so the gateway's async-delegation
+    watcher injects the finished workflow as a NEW TURN (waking the agent loop).
+
+    Rides the EXISTING, proven async_delegation rail rather than a new event
+    type, because the gateway watcher + post-turn drain + both notification
+    formatters already own ``type:"async_delegation"`` end to end. The event is
+    shaped as a SINGLE (non-batch) delegation completion — exactly the shape
+    ``async_delegation._dispatch`` already emits and the watcher already handles:
+      - ``is_batch`` / ``results`` omitted, so ``_finalize_async_delegation_roster``
+        and the batch formatter branch both no-op (verified against gateway/run.py
+        and tools/process_registry.py).
+      - ``delegation_id`` = the workflow runId (UNIQUE), so the TUI dedup key
+        ``(delegation_id, type)`` never collides on ``("", ...)``.
+      - the run id is NOT registered in list_async_delegations(), so the live
+        roster tick ignores it.
+      - ``origin:"workflow"`` flags the event so the shared formatter can label
+        it ``[WORKFLOW COMPLETE]`` instead of ``[ASYNC DELEGATION COMPLETE]``.
+      - ``session_key`` + a ``routing`` dict carry the origin so the injected
+        turn lands in the right chat/topic.
+    Best effort: any failure is swallowed so it never affects the run.
+    """
+    # Per-run guard: never enqueue twice (e.g. a future second completion path).
+    try:
+        with managed.lock:
+            if getattr(managed, "_wake_event_enqueued", False):
+                return
+            managed._wake_event_enqueued = True
+    except Exception:
+        # If the guard itself fails, fall through — a missing wake is worse than
+        # a (structurally near-impossible) duplicate on this single-call path.
+        pass
+
+    context = dict(session_context or {})
+    session_key = str(context.get("session_key") or "").strip()
+    platform = str(context.get("platform") or "").strip()
+    # No gateway origin -> nothing to wake (CLI/headless run). Leave it; the
+    # inject_message path (CLI) already handled, or there is no loop to wake.
+    if not session_key and not platform:
+        return
+
+    run_id = str(record.get("runId") or record.get("taskId") or "").strip()
+    if not run_id:
+        return
+    status = str(record.get("status") or "completed")
+    name = ((record.get("workflow") or {}).get("meta") or {}).get("name") or "workflow"
+
+    routing = {
+        "platform": platform,
+        "chat_id": str(context.get("chat_id") or "").strip(),
+        "thread_id": str(context.get("thread_id") or "").strip(),
+        "message_id": str(context.get("message_id") or "").strip(),
+        "user_id": str(context.get("user_id") or "").strip(),
+        "user_name": str(context.get("user_name") or "").strip(),
+    }
+    evt = {
+        "type": "async_delegation",
+        "origin": "workflow",
+        "delegation_id": run_id,
+        "session_key": session_key,
+        "routing": routing,
+        "goal": f'Dynamic workflow "{name}"',
+        "status": status,
+        # The injected turn must carry the ACTIONABLE result so the agent can act
+        # without reading /workflows. The rendered task-notification block (with
+        # <result>, usage, recovery) IS that content.
+        "summary": notification,
+        "model": "workflow",
+        "role": "workflow",
+        # Both formatter timestamp lines are cosmetic; the run record stores
+        # startedAt as an ISO string (not an epoch float), so use now() for the
+        # epoch fields the formatter expects. The result content is what matters.
+        "dispatched_at": time.time(),
+        "completed_at": time.time(),
+    }
+    try:
+        from tools.process_registry import process_registry as _pr
+
+        _pr.completion_queue.put(evt)
+    except Exception:
+        pass
 
 
 def _send_gateway_completion_notification(
