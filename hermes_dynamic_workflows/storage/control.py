@@ -12,7 +12,7 @@ from typing import Any, Callable
 from .store import WorkflowStore, sanitize_filename, utc_now_iso
 
 
-CONTROL_ACTIONS = frozenset({"stop", "pause", "resume", "restart"})
+CONTROL_ACTIONS = frozenset({"stop", "pause", "resume", "restart", "rerun"})
 DEFAULT_REQUEST_TTL_SECONDS = 15.0
 
 

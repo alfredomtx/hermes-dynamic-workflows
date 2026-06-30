@@ -605,6 +605,10 @@ class WorkflowRunManager:
             managed.record["status"] = "paused"
             managed.record["pausedAt"] = utc_now_iso()
             self.store.save_run(managed.record)
+        try:
+            _edit_progress_bubble(managed, self.config, completed=False, force=True)
+        except Exception:
+            pass
         return True
 
     def resume(self, run_id: str) -> bool:
@@ -619,6 +623,10 @@ class WorkflowRunManager:
             managed.record["status"] = "running"
             managed.record["resumedAt"] = utc_now_iso()
             self.store.save_run(managed.record)
+        try:
+            _edit_progress_bubble(managed, self.config, completed=False, force=True)
+        except Exception:
+            pass
         return True
 
     def restart(self, run_id: str) -> dict[str, Any] | None:
@@ -681,7 +689,7 @@ class WorkflowRunManager:
             ok = self.resume(run_id)
             message = f"Resumed {run_id}." if ok else f"Workflow {run_id} is not paused."
             return {"ok": ok, "action": action, "runId": run_id, "status": "running" if ok else record.get("status"), "message": message}
-        if action == "restart":
+        if action in {"restart", "rerun"}:
             restarted = self.restart(run_id)
             if restarted is None:
                 return {"ok": False, "action": action, "runId": run_id, "message": f"Workflow run not found: {run_id}"}
@@ -1836,19 +1844,68 @@ def _accepts_buttons(method: Any) -> bool:
     return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
-# Run states where a Stop button is meaningful. Excludes "stopping": stop_task
-# returns None for it, which would render a misleading "already finished" toast.
+# Run states where workflow controls are meaningful. Excludes "stopping": stop
+# has already been requested, so buttons would render misleading duplicate taps.
 _STOPPABLE_STATES = {"queued", "running", "paused"}
+_ACTIVE_CONTROL_STATES = {"queued", "running", "paused"}
+_TERMINAL_RERUN_STATES = {"completed", "failed", "error", "stopped", "interrupted"}
+
+
+def _https_url(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if text.startswith(("https://", "http://")):
+        return text
+    return None
+
+
+def _log_url_for(record: dict[str, Any]) -> str | None:
+    for key in ("logUrl", "logURL", "outputUrl", "outputURL", "journalUrl", "journalURL"):
+        url = _https_url(record.get(key))
+        if url:
+            return url
+    return None
+
+
+def _control_buttons_for(record: dict[str, Any], config: PluginConfig) -> list | None:
+    """Inline button spec for live workflow controls.
+
+    Uses the existing ``notify_progress_stop_button`` flag as the master kill
+    switch for gateway progress controls. Buttons are callback_data except an
+    optional HTTP(S) log URL.
+    """
+    if not getattr(config, "notify_progress_stop_button", True):
+        return None
+    status = str(record.get("status") or "")
+    run_id = str(record.get("runId") or "")
+    task_id = str(record.get("taskId") or "")
+    rows: list[list[dict[str, str]]] = []
+    controls: list[dict[str, str]] = []
+
+    if status in {"queued", "running"} and run_id:
+        controls.append({"text": "⏸ Pause", "callback_data": f"wf:pause:{run_id}"})
+    if status == "paused" and run_id:
+        controls.append({"text": "▶️ Resume", "callback_data": f"wf:resume:{run_id}"})
+    if status in _STOPPABLE_STATES and task_id:
+        controls.append({"text": "⏹ Stop", "callback_data": f"wf:stop:{task_id}"})
+    if status in _ACTIVE_CONTROL_STATES and run_id:
+        controls.append({"text": "🔄 Restart", "callback_data": f"wf:restart:{run_id}"})
+    if status in _TERMINAL_RERUN_STATES and run_id and record.get("scriptPath"):
+        controls.append({"text": "🔁 Rerun", "callback_data": f"wf:rerun:{run_id}"})
+
+    if controls:
+        rows.append(controls)
+
+    log_url = _log_url_for(record)
+    if log_url:
+        rows.append([{"text": "📄 Open log", "url": log_url}])
+
+    if not rows:
+        return None
+    return rows[0] if len(rows) == 1 else rows
 
 
 def _stop_buttons_for(record: dict[str, Any], config: PluginConfig) -> list | None:
-    """Inline-button spec for the bubble's Stop control, or None.
-
-    Returns a one-button ``[{text, callback_data}]`` row when the run is
-    actively stoppable and the feature is enabled; otherwise None so the caller
-    omits the kwarg (mid-run, leaving any existing keyboard) — the completion
-    path passes ``[]`` explicitly to CLEAR the button.
-    """
+    """Backward-compatible Stop-only helper."""
     if not getattr(config, "notify_progress_stop_button", True):
         return None
     status = str(record.get("status") or "")
@@ -1894,10 +1951,10 @@ def _seed_progress_bubble(managed: "ManagedRun", config: PluginConfig) -> bool:
             # knows a bubble is pending and waits for its id rather than racing
             # ahead and sending a separate completion message.
             managed.progress_requested = True
-            stop_buttons = _stop_buttons_for(managed.record, config)
+            control_buttons = _control_buttons_for(managed.record, config)
         send_kwargs: dict[str, Any] = {"metadata": metadata}
-        if stop_buttons is not None and _accepts_buttons(adapter.send):
-            send_kwargs["buttons"] = stop_buttons
+        if control_buttons is not None and _accepts_buttons(adapter.send):
+            send_kwargs["buttons"] = control_buttons
         future = safe_schedule_threadsafe(
             adapter.send(chat_id, text, **send_kwargs),
             loop,
@@ -2025,13 +2082,15 @@ def _edit_progress_bubble(
                 return False
         managed.progress_last_text = text
         managed.progress_last_edit_ts = now
-        # Inline Stop button: while stoppable show it; on completion pass an
-        # explicit [] to CLEAR it. None mid-run when not stoppable leaves any
-        # existing keyboard untouched.
+        # Inline workflow controls: while active show status-appropriate buttons;
+        # on completion show terminal controls (for example Rerun) when possible,
+        # otherwise pass [] to CLEAR active controls. None mid-run when no
+        # controls are valid leaves any existing keyboard untouched.
+        control_buttons = _control_buttons_for(managed.record, config)
         if completed:
-            stop_buttons: list | None = []
+            edit_buttons: list | None = control_buttons if control_buttons is not None else []
         else:
-            stop_buttons = _stop_buttons_for(managed.record, config)
+            edit_buttons = control_buttons
         if completed:
             # Stop further mid-run edits once finalized.
             managed.progress_active = False
@@ -2056,8 +2115,8 @@ def _edit_progress_bubble(
         # Only pass buttons when (a) the run wants to set/clear them and (b) the
         # core adapter supports the generic buttons= kwarg. Mid-run not-stoppable
         # -> None -> omit (leave keyboard as-is).
-        if stop_buttons is not None and _accepts_buttons(adapter.edit_message):
-            kwargs["buttons"] = stop_buttons
+        if edit_buttons is not None and _accepts_buttons(adapter.edit_message):
+            kwargs["buttons"] = edit_buttons
         future = safe_schedule_threadsafe(adapter.edit_message(**kwargs), loop)
         if future is None:
             return False

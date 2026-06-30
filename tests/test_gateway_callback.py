@@ -9,6 +9,7 @@ from hermes_dynamic_workflows.core.config import PluginConfig
 from hermes_dynamic_workflows.run import manager as manager_module
 from hermes_dynamic_workflows.run.manager import (
     _accepts_buttons,
+    _control_buttons_for,
     _stop_buttons_for,
 )
 
@@ -73,10 +74,63 @@ class GatewayCallbackHandlerTests(unittest.TestCase):
         self.assertTrue(directive["handled"])
         self.assertTrue(directive["strip_buttons"])
 
+    def test_authorized_pause_calls_manager_pause(self):
+        class FakeManager:
+            def __init__(self):
+                self.called_with = None
+
+            def pause(self, run_id):
+                self.called_with = run_id
+                return True
+
+        fake = FakeManager()
+        with patch.object(gc_module, "get_run_manager", return_value=fake):
+            directive = on_gateway_callback(data="wf:pause:wf_abc123", authorized=True)
+        self.assertEqual(fake.called_with, "wf_abc123")
+        self.assertIn("Paused", directive["answer"])
+        self.assertFalse(directive["strip_buttons"])
+
+    def test_authorized_resume_calls_manager_resume(self):
+        class FakeManager:
+            def resume(self, run_id):
+                self.called_with = run_id
+                return True
+
+        fake = FakeManager()
+        with patch.object(gc_module, "get_run_manager", return_value=fake):
+            directive = on_gateway_callback(data="wf:resume:wf_abc123", authorized=True)
+        self.assertEqual(fake.called_with, "wf_abc123")
+        self.assertIn("Resumed", directive["answer"])
+
+    def test_authorized_restart_calls_manager_restart_and_strips(self):
+        class FakeManager:
+            def restart(self, run_id):
+                self.called_with = run_id
+                return {"runId": "wf_new123"}
+
+        fake = FakeManager()
+        with patch.object(gc_module, "get_run_manager", return_value=fake):
+            directive = on_gateway_callback(data="wf:restart:wf_old123", authorized=True)
+        self.assertEqual(fake.called_with, "wf_old123")
+        self.assertIn("wf_new123", directive["answer"])
+        self.assertTrue(directive["strip_buttons"])
+
+    def test_authorized_rerun_maps_to_restart(self):
+        class FakeManager:
+            def restart(self, run_id):
+                self.called_with = run_id
+                return {"runId": "wf_new123"}
+
+        fake = FakeManager()
+        with patch.object(gc_module, "get_run_manager", return_value=fake):
+            directive = on_gateway_callback(data="wf:rerun:wf_old123", authorized=True)
+        self.assertEqual(fake.called_with, "wf_old123")
+        self.assertIn("Rerun", directive["answer"])
+
 
 class StopButtonHelperTests(unittest.TestCase):
     def _record(self, status="running", task_id="wg123"):
-        return {"status": status, "taskId": task_id}
+        return {"status": status, "taskId": task_id, "runId": "wf_abc123", "scriptPath": "/tmp/workflow.py"}
 
     def test_stoppable_states_render_button(self):
         cfg = PluginConfig()
@@ -105,6 +159,32 @@ class StopButtonHelperTests(unittest.TestCase):
     def test_callback_data_under_telegram_cap(self):
         buttons = _stop_buttons_for(self._record(task_id="wg8nxqxzq"), PluginConfig())
         self.assertLessEqual(len(buttons[0]["callback_data"].encode("utf-8")), 64)
+
+    def test_running_control_buttons_include_pause_stop_restart(self):
+        buttons = _control_buttons_for(self._record(status="running"), PluginConfig())
+        callbacks = [button["callback_data"] for button in buttons]
+        self.assertIn("wf:pause:wf_abc123", callbacks)
+        self.assertIn("wf:stop:wg123", callbacks)
+        self.assertIn("wf:restart:wf_abc123", callbacks)
+
+    def test_paused_control_buttons_include_resume_stop_restart(self):
+        buttons = _control_buttons_for(self._record(status="paused"), PluginConfig())
+        callbacks = [button["callback_data"] for button in buttons]
+        self.assertIn("wf:resume:wf_abc123", callbacks)
+        self.assertIn("wf:stop:wg123", callbacks)
+        self.assertIn("wf:restart:wf_abc123", callbacks)
+
+    def test_terminal_control_buttons_include_rerun(self):
+        buttons = _control_buttons_for(self._record(status="completed"), PluginConfig())
+        self.assertEqual(buttons[0]["callback_data"], "wf:rerun:wf_abc123")
+        self.assertIn("Rerun", buttons[0]["text"])
+
+    def test_open_log_url_button_when_http_url_exists(self):
+        record = self._record(status="running")
+        record["logUrl"] = "https://example.com/log"
+        buttons = _control_buttons_for(record, PluginConfig())
+        self.assertEqual(buttons[1][0]["text"], "📄 Open log")
+        self.assertEqual(buttons[1][0]["url"], "https://example.com/log")
 
 
 class AcceptsButtonsProbeTests(unittest.TestCase):
