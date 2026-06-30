@@ -6,3 +6,14 @@ kind: standalone
 provides_tools:
   - workflow
   - task_stop
+
+failmode:
+  hook.gateway_callback: open
+  hook.pre_gateway_dispatch: open
+  hook.pre_tool_call: open
+failmode_intent: >-
+  open by design — workflow infrastructure and gateway steering should not
+  strand gateway dispatch, callback handling, or ordinary tool calls if a hook
+  errors. Normal child_approval_policy can still block dangerous workflow-child
+  terminal commands when evaluation succeeds; plugin failures fall back to core
+  fail-open behavior.
