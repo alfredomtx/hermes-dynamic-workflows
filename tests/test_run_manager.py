@@ -2167,6 +2167,59 @@ return await agent("do it", {"label": "worker"})
         self.assertEqual(final["result"], "1:worker")
 
 
+class StoppedWorkflowRenderTests(unittest.TestCase):
+    def _stopped_record(self) -> dict:
+        return {
+            "runId": "wf_stop_123",
+            "taskId": "wgstop123",
+            "status": "stopped",
+            "summary": "Read-only audit",
+            "error": (
+                "WorkflowStopped: workflow was stopped\n"
+                "  File \"/repo/manager.py\", line 777, in _run_thread\n"
+                "    result = run_workflow(...)\n"
+                "  File \"/repo/api.py\", line 310, in parallel\n"
+                "    self._check_deadline()"
+            ),
+            "transcriptDir": "/tmp/transcripts",
+            "workflow": {
+                "meta": {"name": "telegram-button-opportunity-audit"},
+                "totals": {"agents": 4, "tokens": 123, "tool_calls": 9},
+                "duration_seconds": 557.0,
+            },
+        }
+
+    def test_progress_bubble_formats_intentional_stop_without_error_trace(self):
+        text = manager_module._progress_bubble_text(
+            self._stopped_record(), PluginConfig(notify_progress_cost=False), completed=True,
+        )
+
+        self.assertIn("Workflow stopped", text)
+        self.assertIn("Stopped intentionally.", text)
+        self.assertNotIn("Error:", text)
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("manager.py", text)
+        self.assertNotIn("api.py", text)
+
+    def test_gateway_completion_formats_intentional_stop_without_error_trace(self):
+        text = manager_module._render_gateway_completion_message(
+            self._stopped_record(), PluginConfig(notify_progress_cost=False),
+        )
+
+        self.assertIn("Workflow stopped", text)
+        self.assertIn("Stopped intentionally.", text)
+        self.assertNotIn("Error:", text)
+        self.assertNotIn("manager.py", text)
+
+    def test_task_notification_formats_intentional_stop_without_trace(self):
+        text = manager_module._render_task_notification(self._stopped_record(), 2000)
+
+        self.assertIn("stopped intentionally", text.lower())
+        self.assertNotIn("WorkflowStopped:", text)
+        self.assertNotIn("manager.py", text)
+        self.assertNotIn("<recovery>", text)
+
+
 class WorkflowGatewayWakeEventTests(unittest.TestCase):
     """The fix for: a finished workflow does not WAKE the agent loop in gateway
     mode (unlike delegate_task). _enqueue_gateway_wake_event puts an

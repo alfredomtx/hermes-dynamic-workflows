@@ -16,7 +16,12 @@ from typing import Any
 from ..engine.cache import ResumeCache
 from ..core.config import PluginConfig, load_config
 from ..engine.context import PauseGate
-from ..core.errors import WorkflowLaunchDenied, WorkflowRuntimeError, WorkflowToolUseError
+from ..core.errors import (
+    WorkflowLaunchDenied,
+    WorkflowRuntimeError,
+    WorkflowStopped,
+    WorkflowToolUseError,
+)
 from ..engine.sandbox import extract_meta, parse_script
 from ..core.token_budget import parse_token_budget
 from ..storage.store import (
@@ -950,8 +955,20 @@ def _completion_output_text(record: dict[str, Any]) -> str:
     return ""
 
 
+def _is_intentional_stop_record(record: dict[str, Any]) -> bool:
+    """True for a user-requested workflow stop, not an execution failure."""
+    if str(record.get("status") or "").lower() != "stopped":
+        return False
+    error = str(record.get("error") or "").strip()
+    if not error:
+        return True
+    return error.splitlines()[0].startswith("WorkflowStopped:")
+
+
 def _runtime_error_text(exc: BaseException) -> str:
     message = f"{type(exc).__name__}: {exc}"
+    if isinstance(exc, WorkflowStopped):
+        return message
     frames = traceback.format_tb(exc.__traceback__, limit=8)
     if frames:
         return message + "\n" + "".join(frames).rstrip()
@@ -2101,7 +2118,9 @@ def _progress_bubble_text(record: dict[str, Any], config: PluginConfig, *, compl
         if breakdown:
             lines.append(breakdown)
             lines.append("")
-    if record.get("error"):
+    if _is_intentional_stop_record(record):
+        lines.append("Workflow stopped. Stopped intentionally.")
+    elif record.get("error"):
         lines.append(f"Error: {str(record.get('error') or '').strip()}")
     else:
         result_body = _completion_result_block(record, config.notify_result_preview_chars)
@@ -2229,7 +2248,9 @@ def _render_gateway_completion_message(record: dict[str, Any], config: PluginCon
         f"{icon} Workflow {status}: {summary}",
         f"Task: {task_id}",
     ]
-    if record.get("error"):
+    if _is_intentional_stop_record(record):
+        lines.append("Stopped intentionally.")
+    elif record.get("error"):
         lines.append(f"Error: {str(record.get('error') or '').strip()}")
     else:
         result_text = _completion_output_text(record).strip()
@@ -2256,7 +2277,10 @@ def _render_task_notification(record: dict[str, Any], preview_chars: int) -> str
     name = meta.get("name") or "workflow"
     totals = snapshot.get("totals") or {}
 
-    if record.get("error"):
+    intentional_stop = _is_intentional_stop_record(record)
+    if intentional_stop:
+        summary = f'Dynamic workflow "{name}" stopped intentionally'
+    elif record.get("error"):
         if status == "failed":
             summary = f'Dynamic workflow "{name}" failed: {record["error"]}'
         else:
@@ -2301,7 +2325,7 @@ def _render_task_notification(record: dict[str, Any], preview_chars: int) -> str
     if result_text:
         lines.append(f"<result>{result_text}</result>")
     recovery = str(record.get("transcriptDir") or "")
-    if record.get("error") and recovery:
+    if record.get("error") and not intentional_stop and recovery:
         lines.append(f"<recovery>Agent transcripts: {recovery}</recovery>")
     lines.append(
         f"<usage><agent_count>{agents}</agent_count>"
