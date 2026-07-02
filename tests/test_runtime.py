@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 import unittest
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 from hermes_dynamic_workflows.engine.cache import ResumeCache, agent_fingerprint, is_cache_miss
-from hermes_dynamic_workflows.core.config import PluginConfig
+from hermes_dynamic_workflows.core.config import PluginConfig, load_config
 from hermes_dynamic_workflows.core.errors import (
     ChildAgentError,
     ChildAgentSkipped,
@@ -101,7 +103,11 @@ phase("scan")
 return await agent("inspect repo", {"label": "scan-agent"})
 """
         runner = FakeRunner()
-        result = run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+        with patch(
+            "hermes_dynamic_workflows.child.runner._discoverable_child_toolsets",
+            return_value=[],
+        ):
+            result = run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
 
         self.assertEqual(result.value, "scan-agent:inspect repo")
         self.assertEqual(result.agent_count, 1)
@@ -252,9 +258,216 @@ return await agent("go", {"label": "r", "toolsets": ["web"], "retries": 2})
 """
         with self.assertRaises(Exception) as ctx:
             run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=FakeRunner()))
-        self.assertIn("unsupported agent() option", str(ctx.exception))
+        self.assertIn("unsupported agent() option(s): retries", str(ctx.exception))
         self.assertIn("toolsets", str(ctx.exception))
-        self.assertIn("retries", str(ctx.exception))
+
+    def test_agent_accepts_inline_runtime_agent_options(self):
+        script = """
+meta = {"name": "inline-agent", "description": "Test workflow"}
+
+return await agent(
+    "go",
+    {
+        "label": "inline",
+        "instructions": "INLINE ROLE",
+        "toolsets": ["file"],
+        "allowedTools": ["read_file", "search_files"],
+        "disallowedTools": ["write_file"],
+    },
+)
+"""
+        runner = FakeRunner()
+        result = run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+
+        self.assertEqual(result.value, "inline:go")
+        request = runner.requests[0]
+        self.assertEqual(request.toolsets, ["file"])
+        self.assertIsNotNone(request.resolved)
+        assert request.resolved is not None
+        self.assertIn("INLINE ROLE", request.resolved.agent_type_spec.instructions)
+        self.assertEqual(request.resolved.allowed_tools, ("read_file", "search_files"))
+        self.assertTrue(request.resolved.allowed_tools_explicit)
+        self.assertEqual(request.resolved.disallowed_tools, ("write_file",))
+        self.assertTrue(request.resolved.toolsets_explicit)
+
+    def test_inline_toolsets_empty_is_explicit_no_tools(self):
+        script = """
+meta = {"name": "inline-empty-tools", "description": "Test workflow"}
+
+return await agent("go", {"label": "empty", "toolsets": []})
+"""
+        runner = FakeRunner()
+        run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+
+        self.assertEqual(runner.requests[0].toolsets, [])
+        self.assertIsNotNone(runner.requests[0].resolved)
+        assert runner.requests[0].resolved is not None
+        self.assertTrue(runner.requests[0].resolved.toolsets_explicit)
+
+    def test_inline_toolsets_none_inherits_default_toolsets(self):
+        script = """
+meta = {"name": "inline-none-tools", "description": "Test workflow"}
+
+return await agent("go", {"label": "none", "toolsets": None})
+"""
+        runner = FakeRunner()
+        with patch(
+            "hermes_dynamic_workflows.child.runner._discoverable_child_toolsets",
+            return_value=[],
+        ):
+            run_workflow(
+                script,
+                WorkflowOptions(
+                    config=PluginConfig(default_child_toolsets=("file", "terminal")),
+                    child_runner=runner,
+                ),
+            )
+
+        self.assertEqual(runner.requests[0].toolsets, ["file", "terminal"])
+        self.assertIsNotNone(runner.requests[0].resolved)
+        assert runner.requests[0].resolved is not None
+        self.assertTrue(runner.requests[0].resolved.toolsets_explicit)
+
+    def test_inline_allowed_tools_none_inherits_preset_allowlist(self):
+        script = """
+meta = {
+    "name": "inline-none-allow",
+    "description": "Test workflow",
+    "agents": {
+        "reader": {
+            "instructions": "RUNTIME READER",
+            "toolsets": ["file"],
+            "allowedTools": ["read_file"],
+        }
+    },
+}
+
+return await agent("go", {"agentType": "reader", "label": "reader", "allowedTools": None})
+"""
+        runner = FakeRunner()
+        run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+
+        self.assertIsNotNone(runner.requests[0].resolved)
+        assert runner.requests[0].resolved is not None
+        self.assertEqual(runner.requests[0].resolved.allowed_tools, ("read_file",))
+        self.assertTrue(runner.requests[0].resolved.allowed_tools_explicit)
+
+    def test_runtime_meta_agent_definition_resolves_agent_type(self):
+        script = """
+meta = {
+    "name": "runtime-agent",
+    "description": "Test workflow",
+    "agents": {
+        "reader": {
+            "instructions": "RUNTIME READER",
+            "toolsets": ["file"],
+            "allowedTools": ["read_file"],
+            "model": "inherit",
+        }
+    },
+}
+
+return await agent("go", {"agentType": "reader", "label": "reader"})
+"""
+        runner = FakeRunner()
+        run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+
+        request = runner.requests[0]
+        self.assertEqual(request.agent_type, "reader")
+        self.assertEqual(request.toolsets, ["file"])
+        self.assertIsNone(request.model)
+        self.assertIsNotNone(request.resolved)
+        assert request.resolved is not None
+        self.assertEqual(request.resolved.agent_type_spec.source, "meta.agents.reader")
+        self.assertIn("RUNTIME READER", request.resolved.agent_type_spec.instructions)
+        self.assertEqual(request.resolved.allowed_tools, ("read_file",))
+        self.assertTrue(request.resolved.allowed_tools_explicit)
+
+    def test_runtime_meta_agent_precedes_project_file_agent(self):
+        script = """
+meta = {
+    "name": "runtime-precedence",
+    "description": "Test workflow",
+    "agents": {
+        "reader": {"instructions": "META WINS", "toolsets": ["file"]}
+    },
+}
+
+return await agent("go", {"agentType": "reader", "label": "reader"})
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            agent_dir = Path(tmp) / ".hermes" / "dynamic-workflows" / "agents"
+            agent_dir.mkdir(parents=True)
+            (agent_dir / "reader.md").write_text("FILE LOSES", encoding="utf-8")
+            runner = FakeRunner()
+            run_workflow(script, WorkflowOptions(cwd=tmp, config=PluginConfig(), child_runner=runner))
+
+        self.assertIn("META WINS", runner.requests[0].resolved.agent_type_spec.instructions)
+        self.assertNotIn("FILE LOSES", runner.requests[0].resolved.agent_type_spec.instructions)
+
+    def test_missing_agent_type_policy_loads_from_env(self):
+        with patch.dict(
+            os.environ,
+            {"HERMES_DYNAMIC_WORKFLOWS_MISSING_AGENT_TYPE_POLICY": "fallback_warn"},
+        ):
+            self.assertEqual(load_config().missing_agent_type_policy, "fallback_warn")
+        with patch.dict(
+            os.environ,
+            {"HERMES_DYNAMIC_WORKFLOWS_MISSING_AGENT_TYPE_POLICY": "bogus"},
+        ):
+            self.assertEqual(load_config().missing_agent_type_policy, "error")
+
+    def test_missing_agent_type_fallback_warn_uses_generic_and_logs(self):
+        script = """
+meta = {"name": "missing-fallback", "description": "Test workflow"}
+
+return await agent("go", {"agentType": "missing-reader", "label": "fallback"})
+"""
+        runner = FakeRunner()
+        result = run_workflow(
+            script,
+            WorkflowOptions(
+                config=PluginConfig(missing_agent_type_policy="fallback_warn"),
+                child_runner=runner,
+            ),
+        )
+
+        self.assertEqual(result.value, "fallback:go")
+        self.assertEqual(runner.requests[0].agent_type, "general-purpose")
+        self.assertTrue(any("missing-reader" in item and "falling back" in item for item in result.state.logs))
+
+    def test_malformed_runtime_meta_agent_definitions_raise_before_launch(self):
+        cases = [
+            ("""meta = {"name":"bad","description":"bad","agents": []}
+return await agent("x")""", "meta.agents must be an object"),
+            ("""meta = {"name":"bad","description":"bad","agents": {"../bad": {"instructions":"x"}}}
+return await agent("x")""", "invalid runtime agent name"),
+            ("""meta = {"name":"bad","description":"bad","agents": {"reader": []}}
+return await agent("x", {"agentType":"reader"})""", "meta.agents.reader must be an object"),
+            ("""meta = {"name":"bad","description":"bad","agents": {"reader": {"instructions":"x", "toolsets": 12}}}
+return await agent("x", {"agentType":"reader"})""", "toolsets must be"),
+            ("""meta = {"name":"bad","description":"bad","agents": {"reader": {"instructions":"x", "isolation": "bad"}}}
+return await agent("x", {"agentType":"reader"})""", "isolation must be"),
+        ]
+        for script, message in cases:
+            runner = FakeRunner()
+            with self.subTest(message=message):
+                with self.assertRaises(Exception) as ctx:
+                    run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+                self.assertIn(message, str(ctx.exception))
+                self.assertEqual(runner.requests, [])
+
+    def test_inline_allowed_tools_empty_is_explicit_deny_all(self):
+        script = """
+meta = {"name": "empty-allow", "description": "Test workflow"}
+
+return await agent("go", {"label": "deny", "allowedTools": []})
+"""
+        runner = FakeRunner()
+        run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+
+        self.assertEqual(runner.requests[0].resolved.allowed_tools, ())
+        self.assertTrue(runner.requests[0].resolved.allowed_tools_explicit)
 
     def test_workflow_may_return_without_agent_call(self):
         script = """

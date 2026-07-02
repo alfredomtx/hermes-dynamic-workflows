@@ -60,6 +60,7 @@ plugins:
                                       # Default toolsets for child agents (used when no agentType is given)
         keep_worktrees: false         # Whether to keep each agent's git worktree (auto-cleaned by default)
         allow_model_override: true    # Whether agent(model=...) may override the model
+        missing_agent_type_policy: error # error|fallback_warn for explicit missing agentType
         require_launch_approval: true # Require confirmation before a top-level workflow launches (denied if nobody is online)
         child_approval_policy: inherit # Child agent approval policy: inherit|smart|deny|approve|ask
         ask_fallback: smart           # Fallback when "ask" has no one to reach: smart|deny|approve
@@ -171,15 +172,57 @@ return await agent("Synthesize the verified findings:\n" + json.dumps(findings))
 ```
 
 - `agent(prompt, opts)` spawns a child agent; `opts` may include `schema` (enforce
-  structured output), `model`, `agentType`, and `isolation="worktree"`.
+  structured output), `model`, `agentType`, `isolation="worktree"`, inline
+  `instructions`/`systemPrompt`, `toolsets`, `allowedTools`, and `disallowedTools`.
 - `pipeline` (default, no barrier) / `parallel` (with barrier) handle concurrency;
   `phase`/`log` report progress; `workflow()` runs a named workflow inline; `args` /
   `budget` access the input arguments and the token budget.
 
-### Agent Type
+### Agent Type and inline/runtime agents
 
-Specify a child agent's type via `agentType` in the script; if omitted, it defaults to
-`general-purpose` (full toolset):
+You can choose a child agent role three ways:
+
+1. **Inline per call** — pass role/tool options directly to `agent()`.
+2. **Runtime presets** — define reusable presets in the workflow literal under `meta["agents"]`.
+3. **Library presets** — reference `.md` / `.yaml` / `.json` files with `agentType`.
+
+Inline example:
+
+```python
+await agent(
+    "Review this diff for authorization bugs only.",
+    {
+        "instructions": "You are a read-only security reviewer. Return blockers only.",
+        "toolsets": ["file", "terminal"],
+        "allowedTools": ["read_file", "search_files", "terminal", "process"],
+    },
+)
+```
+
+Runtime preset example:
+
+```python
+meta = {
+    "name": "review-matrix",
+    "description": "Review and verify changes",
+    "agents": {
+        "read-only-reviewer": {
+            "instructions": "Review for correctness and regression risk. Do not edit files.",
+            "toolsets": ["file", "terminal"],
+            "allowedTools": ["read_file", "search_files", "terminal", "process"],
+        },
+        "synthesizer": {
+            "instructions": "Synthesize findings into a concise verdict.",
+            "toolsets": [],
+        },
+    },
+}
+
+findings = await agent("Review diff", {"agentType": "read-only-reviewer"})
+return await agent("Synthesize: " + json.dumps(findings), {"agentType": "synthesizer"})
+```
+
+Built-in library presets:
 
 | Type | Toolset | Description |
 |------|---------|-------------|
@@ -188,14 +231,28 @@ Specify a child agent's type via `agentType` in the script; if omitted, it defau
 | `plan` | Read-only (read_file, search_files, terminal) | Software architecture design; outputs a step-by-step implementation plan |
 | `verification` | web + file + terminal + browser | Verifies implementation correctness; runs build/test/lint to emit PASS/FAIL |
 
-Agent types are resolved from three locations in priority order (on a name collision,
-earlier locations override later ones):
+Named `agentType` resolution order:
 
-1. `<project>/.hermes/dynamic-workflows/agents/*.md`  — project level, applies only to the current project
-2. `~/.hermes/dynamic-workflows/agents/*.md`          — user level, applies globally
-3. `<plugin>/hermes_dynamic_workflows/agents/*.md`    — built-in defaults (general-purpose/explore/plan/verification)
+1. `meta["agents"]` runtime presets in the current script
+2. `<project>/.hermes/dynamic-workflows/agents/*.md`  — project level
+3. `~/.hermes/dynamic-workflows/agents/*.md`          — user level
+4. `<plugin>/hermes_dynamic_workflows/agents/*.md`    — built-in defaults
 
-To add a custom type, create a new `.md` file under directory 1 or 2 in the following format:
+Explicit missing `agentType` errors before launch by default. Set
+`missing_agent_type_policy: fallback_warn` to log a warning and fall back to
+`general-purpose`.
+
+Tool-surface semantics:
+
+- Omitted `toolsets` inherits the preset/default surface.
+- `toolsets: []` is intentional no tools.
+- Inline/runtime `toolsets` are exact and are not widened by discoverable MCP/plugin toolsets.
+- If both a preset and inline call specify `allowedTools`, the effective allowlist is their intersection.
+- `allowedTools: []` denies all normal tools; schema emission still keeps `structured_output` available.
+- `disallowedTools` are additive: preset denylist union inline denylist.
+- Stable role text belongs in `meta["agents"]`; per-item facts belong in the normal `prompt` so resume-cache and prompt-cache reuse stay strong.
+
+To add a reusable file-backed preset, create a new `.md` file under the project-level or user-level agent directory above:
 
 ```markdown
 ---

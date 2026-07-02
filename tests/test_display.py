@@ -537,11 +537,12 @@ class CostAndCompletionTests(unittest.TestCase):
         from hermes_dynamic_workflows.view.render import render_run_progress
 
         text = render_run_progress(self._run_with([self._bedrock_agent()]))
-        # 1M in × $5/M + 200K out × $25/M = $5 + $5 = $10.00
-        self.assertIn("~$10.00", text)
+        # 1M in × $5/M + 200K out × $25/M = $5 + $5 = $10.00,
+        # with the Bedrock geo-profile correction applied by the shared pricer.
+        self.assertIn("~$11.00", text)
         head = text.split("\n", 1)[0]
         # Cost segment comes BEFORE the token segment.
-        self.assertLess(head.index("~$10.00"), head.index("tok"))
+        self.assertLess(head.index("~$11.00"), head.index("tok"))
 
     def test_cost_omitted_when_no_priced_agent(self):
         from hermes_dynamic_workflows.view.render import render_run_progress
@@ -567,13 +568,14 @@ class CostAndCompletionTests(unittest.TestCase):
         from hermes_dynamic_workflows.view.render import render_run_progress
 
         # input 100K×$5 + output 20K×$25 + cacheR 500K×$0.50 + cacheW 40K×$6.25
-        # = 0.50 + 0.50 + 0.25 + 0.25 = $1.50  (cache NOT billed at input rate)
+        # = 0.50 + 0.50 + 0.25 + 0.25 = $1.50 before Bedrock geo-profile correction
+        # (cache is not billed at the input rate).
         agent = self._bedrock_agent(
             input_tokens=100_000, output_tokens=20_000,
             cache_read_tokens=500_000, cache_write_tokens=40_000, tokens=660_000,
         )
         text = render_run_progress(self._run_with([agent]))
-        self.assertIn("~$1.50", text)
+        self.assertIn("~$1.65", text)
 
     def test_mixed_model_sum_codex_included_plus_opus(self):
         from hermes_dynamic_workflows.view.render import render_run_progress
@@ -586,8 +588,8 @@ class CostAndCompletionTests(unittest.TestCase):
             input_tokens=500_000, output_tokens=100_000, tokens=600_000,
         )
         text = render_run_progress(self._run_with([opus, codex]))
-        # codex is subscription-included ($0) -> only opus's $10 counts.
-        self.assertIn("~$10.00", text)
+        # Codex company OAuth is real API-priced; sum includes Bedrock-corrected opus + Codex.
+        self.assertIn("~$24.75", text)
 
     def test_cost_hidden_when_show_cost_false(self):
         from hermes_dynamic_workflows.view.render import render_run_progress

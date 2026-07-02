@@ -21,6 +21,67 @@ class AgentTypeSpec:
     disallowed_tools: tuple[str, ...] = ()
     model: str | None = None
     isolation: str | None = None
+    toolsets_explicit: bool = False
+    allowed_tools_explicit: bool = False
+
+
+def build_runtime_agent_type(name: str, data: Any, *, source: str) -> AgentTypeSpec:
+    """Build an in-memory agent type from meta["agents"] or structured files."""
+    clean_name = _validate_runtime_agent_name(str(name or ""), source=source)
+    if not isinstance(data, dict):
+        raise ValueError(f"{source} must be an object")
+    spec_name = _validate_runtime_agent_name(
+        str(data.get("name") or clean_name), source=source
+    )
+    instructions_value = (
+        data.get("instructions")
+        or data.get("systemPrompt")
+        or data.get("system_prompt")
+        or data.get("prompt")
+        or data.get("content")
+        or ""
+    )
+    instructions = str(instructions_value).strip()
+    if not instructions:
+        raise ValueError(f"{source} is missing instructions")
+    toolsets, toolsets_explicit = _as_tuple_strict(
+        _first_present(data, "toolsets", "tools"), "toolsets"
+    )
+    allowed_tools, allowed_tools_explicit = _as_tuple_strict(
+        _first_present(data, "allowedTools", "allowed_tools"), "allowedTools"
+    )
+    disallowed_tools, _ = _as_tuple_strict(
+        _first_present(data, "disallowedTools", "disallowed_tools"),
+        "disallowedTools",
+    )
+    return AgentTypeSpec(
+        name=spec_name,
+        instructions=instructions,
+        source=source,
+        description=_description_from(data),
+        toolsets=toolsets,
+        allowed_tools=allowed_tools,
+        disallowed_tools=disallowed_tools,
+        model=_as_optional_str(data.get("model")),
+        isolation=_as_runtime_isolation(data.get("isolation"), source=source),
+        toolsets_explicit=toolsets_explicit,
+        allowed_tools_explicit=allowed_tools_explicit,
+    )
+
+
+def generic_agent_type() -> AgentTypeSpec:
+    return AgentTypeSpec(
+        name="general-purpose",
+        instructions=(
+            "You are an agent. Use the available tools to complete the task fully. "
+            "Return concise task results to the calling workflow script."
+        ),
+        source="builtin:generic-fallback",
+        description="Generic workflow child agent fallback.",
+        toolsets=("*",),
+        model="inherit",
+        toolsets_explicit=True,
+    )
 
 
 def resolve_agent_type(name: str | None, *, cwd: str | None = None) -> AgentTypeSpec | None:
@@ -115,38 +176,25 @@ def _load_markdown_agent_type(name: str, path: Path) -> AgentTypeSpec:
         instructions=body,
         source=str(path),
         description=_description_from(frontmatter),
-        toolsets=_as_tuple(frontmatter.get("toolsets") or frontmatter.get("tools")),
-        allowed_tools=_as_tuple(frontmatter.get("allowed_tools")),
-        disallowed_tools=_as_tuple(frontmatter.get("disallowed_tools")),
+        toolsets=_as_tuple(_first_present(frontmatter, "toolsets", "tools")),
+        allowed_tools=_as_tuple(_first_present(frontmatter, "allowed_tools", "allowedTools")),
+        disallowed_tools=_as_tuple(_first_present(frontmatter, "disallowed_tools", "disallowedTools")),
         model=_as_optional_str(frontmatter.get("model")),
         isolation=_as_optional_str(frontmatter.get("isolation")),
+        toolsets_explicit=("toolsets" in frontmatter or "tools" in frontmatter),
+        allowed_tools_explicit=("allowed_tools" in frontmatter or "allowedTools" in frontmatter),
     )
 
 
 def _load_structured_agent_type(name: str, path: Path, data: Any) -> AgentTypeSpec:
     if not isinstance(data, dict):
         raise ValueError(f"agentType file must contain an object: {path}")
-    instructions = (
-        data.get("instructions")
-        or data.get("system_prompt")
-        or data.get("prompt")
-        or data.get("content")
-        or ""
-    )
-    instructions = str(instructions).strip()
-    if not instructions:
-        raise ValueError(f"agentType file is missing instructions: {path}")
-    return AgentTypeSpec(
-        name=str(data.get("name") or Path(name).stem),
-        instructions=instructions,
-        source=str(path),
-        description=_description_from(data),
-        toolsets=_as_tuple(data.get("toolsets") or data.get("tools")),
-        allowed_tools=_as_tuple(data.get("allowed_tools")),
-        disallowed_tools=_as_tuple(data.get("disallowed_tools")),
-        model=_as_optional_str(data.get("model")),
-        isolation=_as_optional_str(data.get("isolation")),
-    )
+    data = dict(data)
+    data.setdefault("name", Path(name).stem)
+    try:
+        return build_runtime_agent_type(str(data.get("name") or name), data, source=str(path))
+    except ValueError as exc:
+        raise ValueError(f"invalid agentType file {path}: {exc}") from exc
 
 
 def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
@@ -214,6 +262,57 @@ def _as_tuple(value: Any) -> tuple[str, ...]:
     else:
         return ()
     return tuple(str(item).strip() for item in raw if str(item).strip())
+
+
+def _first_present(data: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in data:
+            return data.get(key)
+    return None
+
+
+def _validate_runtime_agent_name(name: str, *, source: str) -> str:
+    clean = str(name or "").strip()
+    try:
+        rel = _safe_agent_type_relative_path(clean)
+    except Exception as exc:
+        raise ValueError(f"invalid runtime agent name: {clean!r}") from exc
+    if len(rel.parts) != 1 or rel.name != clean:
+        raise ValueError(f"invalid runtime agent name: {clean!r}")
+    return clean
+
+
+def _as_tuple_strict(value: Any, field_name: str) -> tuple[tuple[str, ...], bool]:
+    if value is None:
+        return (), False
+    if isinstance(value, str):
+        raw = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        raw = value
+    else:
+        raise ValueError(f"{field_name} must be a string or list of strings")
+    cleaned: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            raise ValueError(f"{field_name} must contain only strings")
+        clean = item.strip()
+        if not clean:
+            if isinstance(value, str) and not value.strip():
+                continue
+            raise ValueError(f"{field_name} must contain non-empty strings")
+        cleaned.append(clean)
+    return tuple(cleaned), True
+
+
+def _as_runtime_isolation(value: Any, *, source: str) -> str | None:
+    if value in (None, ""):
+        return None
+    clean = str(value).strip()
+    if clean in {"shared", "none"}:
+        return None
+    if clean == "worktree":
+        return clean
+    raise ValueError(f"{source} isolation must be 'worktree', 'shared', or 'none'")
 
 
 def _description_from(data: dict[str, Any]) -> str:

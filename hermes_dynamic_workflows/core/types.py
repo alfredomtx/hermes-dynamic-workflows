@@ -223,10 +223,13 @@ class ResolvedAgentSpec:
     model: str | None = None
     isolation: str | None = None
     toolsets: tuple[str, ...] = ()
+    toolsets_explicit: bool = False
     allowed_tools: tuple[str, ...] = ()
+    allowed_tools_explicit: bool = False
     disallowed_tools: tuple[str, ...] = ()
     system_prompt_hash: str = ""
     workspace: str = ""
+    warnings: tuple[str, ...] = ()
 
     @property
     def agent_type_name(self) -> str | None:
@@ -238,7 +241,9 @@ class ResolvedAgentSpec:
             "model": self.model,
             "isolation": self.isolation,
             "toolsets": list(self.toolsets),
+            "toolsetsExplicit": self.toolsets_explicit,
             "allowedTools": list(self.allowed_tools),
+            "allowedToolsExplicit": self.allowed_tools_explicit,
             "disallowedTools": list(self.disallowed_tools),
             "agentType": self.agent_type_name,
             "systemPromptHash": self.system_prompt_hash,

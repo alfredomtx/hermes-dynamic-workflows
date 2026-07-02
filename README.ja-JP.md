@@ -61,6 +61,7 @@ plugins:
                                       # 子エージェントのデフォルトツールセット（agentType が指定されていない場合に使用）
         keep_worktrees: false         # 各エージェントの git worktree を残すかどうか（デフォルトでは自動クリーンアップ）
         allow_model_override: true    # agent(model=...) によるモデルの上書きを許可するかどうか
+        missing_agent_type_policy: error # 明示的な agentType が見つからない場合: error|fallback_warn
         require_launch_approval: true # トップレベルのワークフロー起動前に確認を要求する（オンラインの人がいない場合は拒否）
         child_approval_policy: inherit # 子エージェントの承認ポリシー: inherit|smart|deny|approve|ask
         ask_fallback: smart           # "ask" で連絡先が誰もいない場合のフォールバック: smart|deny|approve
@@ -130,7 +131,7 @@ return await agent("検証済みの結果を統合する:\n" + json.dumps(findin
 ```
 
 - `agent(prompt, opts)` は子エージェントを起動します。`opts` には `schema`（構造化出力を強制）、
-  `model`、`agentType`、`isolation="worktree"` を含めることができます。
+  `model`、`agentType`、`isolation="worktree"`、インライン `instructions`/`systemPrompt`、`toolsets`、`allowedTools`、`disallowedTools` を含めることができます。
 - `pipeline`（デフォルト、バリアなし）／`parallel`（バリアあり）が並行処理を扱います。
   `phase`／`log` は進捗を報告し、`workflow()` は名前付きワークフローをインラインで実行し、`args` /
   `budget` は入力引数とトークン予算にアクセスします。
@@ -147,7 +148,29 @@ return await agent("検証済みの結果を統合する:\n" + json.dumps(findin
 | `plan` | 読み取り専用（read_file, search_files, terminal） | ソフトウェアアーキテクチャ設計。ステップバイステップの実装計画を出力する |
 | `verification` | web + file + terminal + browser | 実装の正しさを検証。build/test/lint を実行して PASS/FAIL を出力する |
 
-エージェントタイプは優先順位順に 3 つの場所から解決されます（名前が衝突した場合は、
+Claude Code 風に、workflow 内の `meta["agents"]` で runtime agents も定義できます。外部 `.md` agent ファイルは必須ではありません。
+
+```python
+meta = {
+    "name": "review-matrix",
+    "description": "Review and verify",
+    "agents": {
+        "read-only-reviewer": {
+            "instructions": "読み取り専用でコードをレビューし、編集しない。",
+            "toolsets": ["file", "terminal"],
+            "allowedTools": ["read_file", "search_files", "terminal", "process"],
+        },
+        "synthesizer": {"instructions": "結果を統合する。", "toolsets": []},
+    },
+}
+
+findings = await agent("Review diff", {"agentType": "read-only-reviewer"})
+return await agent("Synthesize: " + json.dumps(findings), {"agentType": "synthesizer"})
+```
+
+解決順序は `meta["agents"]` → project `.hermes/dynamic-workflows/agents` → user `~/.hermes/dynamic-workflows/agents` → plugin built-ins です。明示された `agentType` が見つからない場合はデフォルトでエラーです。`missing_agent_type_policy: fallback_warn` なら警告を記録して `general-purpose` にフォールバックします。`toolsets` 省略は継承、`toolsets: []` はツールなし、inline/runtime の `toolsets` は discoverable MCP/plugin toolsets で拡張されません。`allowedTools` は preset と交差し、空リストは通常ツールを拒否します。
+
+ファイル型のエージェントタイプは優先順位順に 3 つの場所から解決されます（名前が衝突した場合は、
 前方の場所が後方の場所を上書きします）。
 
 1. `<project>/.hermes/dynamic-workflows/agents/*.md`  — プロジェクトレベル。現在のプロジェクトにのみ適用

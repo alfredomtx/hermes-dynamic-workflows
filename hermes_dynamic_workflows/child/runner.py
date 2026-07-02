@@ -168,16 +168,32 @@ class HermesChildAgentRunner(ChildAgentRunner):
         )
         runtime = self._resolve_runtime(request)
         _prepare_mcp_tool_registry(self.config)
-        toolsets = _resolve_child_toolsets(
-            self.config,
-            request.toolsets,
-            agent_type.toolsets if agent_type else (),
-            include_discoverable=(
-                resolved is None
-                and agent_type is None
-                and not request.toolsets
-            ),
-        )
+        if resolved is not None:
+            toolsets = list(resolved.toolsets)
+            allowed_tools = resolved.allowed_tools
+            allowed_tools_explicit = resolved.allowed_tools_explicit
+            disallowed_tools = resolved.disallowed_tools
+        else:
+            toolsets = _resolve_child_toolsets(
+                self.config,
+                request.toolsets,
+                agent_type.toolsets if agent_type else (),
+                requested_explicit=bool(request.toolsets),
+                agent_type_toolsets_explicit=bool(
+                    getattr(agent_type, "toolsets_explicit", False)
+                    or (agent_type.toolsets if agent_type else ())
+                ),
+                include_discoverable=(
+                    agent_type is None
+                    and not request.toolsets
+                ),
+            )
+            allowed_tools = agent_type.allowed_tools if agent_type else ()
+            allowed_tools_explicit = bool(
+                getattr(agent_type, "allowed_tools_explicit", False)
+                or (agent_type.allowed_tools if agent_type else ())
+            )
+            disallowed_tools = agent_type.disallowed_tools if agent_type else ()
         structured_tool = bool(request.structured_tool and request.schema)
         if structured_tool and STRUCTURED_OUTPUT_TOOLSET not in toolsets:
             toolsets = toolsets + [STRUCTURED_OUTPUT_TOOLSET]
@@ -188,8 +204,9 @@ class HermesChildAgentRunner(ChildAgentRunner):
                 child,
                 toolsets=toolsets,
                 blocked_toolsets=self.config.blocked_child_toolsets,
-                allowed_tools=agent_type.allowed_tools if agent_type else (),
-                disallowed_tools=agent_type.disallowed_tools if agent_type else (),
+                allowed_tools=allowed_tools,
+                allowed_tools_explicit=allowed_tools_explicit,
+                disallowed_tools=disallowed_tools,
             )
             if structured_tool:
                 child.tools = specialize_structured_output_tool(child.tools, request.schema)
@@ -676,9 +693,16 @@ def _resolve_child_toolsets(
     requested: list[str],
     agent_type_toolsets: tuple[str, ...] = (),
     *,
+    requested_explicit: bool = False,
+    agent_type_toolsets_explicit: bool = False,
     include_discoverable: bool = False,
 ) -> list[str]:
-    raw = requested or list(agent_type_toolsets) or list(config.default_child_toolsets)
+    if requested_explicit:
+        raw = list(requested)
+    elif agent_type_toolsets_explicit:
+        raw = list(agent_type_toolsets)
+    else:
+        raw = requested or list(agent_type_toolsets) or list(config.default_child_toolsets)
     # "*" expands to all default child toolsets (like general-purpose)
     if "*" in raw:
         wildcard = [ts for ts in config.default_child_toolsets if ts not in raw]
@@ -732,6 +756,7 @@ def _configure_child_tools(
     toolsets: list[str],
     blocked_toolsets: tuple[str, ...],
     allowed_tools: tuple[str, ...] = (),
+    allowed_tools_explicit: bool = False,
     disallowed_tools: tuple[str, ...] = (),
 ) -> None:
     """Apply the workflow-child tool surface and force native Tool Search."""
@@ -748,6 +773,7 @@ def _configure_child_tools(
         definitions = _filter_child_tool_definitions(
             definitions,
             allowed_tools=allowed_tools,
+            allowed_tools_explicit=allowed_tools_explicit,
             disallowed_tools=disallowed_tools,
         )
         direct: list[dict[str, Any]] = []
@@ -775,6 +801,7 @@ def _configure_child_tools(
                 if _tool_definition_name(definition) not in _CHILD_EXCLUDED_TOOL_NAMES
             ],
             allowed_tools=allowed_tools,
+            allowed_tools_explicit=allowed_tools_explicit,
             disallowed_tools=disallowed_tools,
         )
 
@@ -797,11 +824,12 @@ def _filter_child_tool_definitions(
     definitions: list[dict[str, Any]],
     *,
     allowed_tools: tuple[str, ...] = (),
+    allowed_tools_explicit: bool = False,
     disallowed_tools: tuple[str, ...] = (),
 ) -> list[dict[str, Any]]:
     allowed = {name for item in allowed_tools if (name := str(item).strip())}
     disallowed = {name for item in disallowed_tools if (name := str(item).strip())}
-    if allowed:
+    if allowed or allowed_tools_explicit:
         allowed.add(STRUCTURED_OUTPUT_TOOL_NAME)
     # structured_output is injected solely on schema presence (see runner.run
     # L181-196) and must survive an agentType's allow/deny filter. The allowed
@@ -814,7 +842,7 @@ def _filter_child_tool_definitions(
         name = _tool_definition_name(definition)
         if not name:
             continue
-        if allowed and name not in allowed:
+        if (allowed or allowed_tools_explicit) and name not in allowed:
             continue
         if name in disallowed:
             continue

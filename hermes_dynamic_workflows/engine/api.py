@@ -102,7 +102,10 @@ class WorkflowAPI:
             config=self.config,
             structured_output=schema is not None,
             phase_model=_phase_model(self.frame, phase_name),
+            runtime_agents=_runtime_agent_specs(self.frame.meta),
         )
+        for warning in resolved.warnings:
+            self.log(f"⚠️ {warning}")
 
         with self._lock:
             agent_id = self.context.reserve_agent()
@@ -428,8 +431,35 @@ _PUBLIC_AGENT_OPT_KEYS = frozenset(
         "model",
         "isolation",
         "agentType",
+        "toolsets",
+        "allowedTools",
+        "allowed_tools",
+        "disallowedTools",
+        "disallowed_tools",
+        "instructions",
+        "systemPrompt",
+        "system_prompt",
+        "description",
     }
 )
+
+_INLINE_AGENT_OPT_KEYS = frozenset(
+    {
+        "toolsets",
+        "allowedTools",
+        "allowed_tools",
+        "disallowedTools",
+        "disallowed_tools",
+        "instructions",
+        "systemPrompt",
+        "system_prompt",
+        "description",
+    }
+)
+_TOOL_SURFACE_OPT_KEYS = frozenset(
+    {"toolsets", "allowedTools", "allowed_tools", "disallowedTools", "disallowed_tools"}
+)
+_MISSING_AGENT_TYPE_POLICIES = {"error", "fallback_warn"}
 
 
 def _validate_agent_opts(opts: dict[str, Any]) -> None:
@@ -440,9 +470,9 @@ def _validate_agent_opts(opts: dict[str, Any]) -> None:
         "unsupported agent() option(s): "
         + ", ".join(unknown)
         + ". Public workflow agent options are label, phase, schema, model, "
-        "isolation, and agentType. Put tool access in agentType presets or "
-        "plugin config; provider/runtime, timeout, and retry policy belong in "
-        "Hermes/plugin configuration, not workflow scripts."
+        "isolation, agentType, toolsets, allowedTools, disallowedTools, "
+        "instructions, and systemPrompt. Provider/runtime, timeout, and retry "
+        "policy belong in Hermes/plugin configuration, not workflow scripts."
     )
 
 
@@ -479,6 +509,28 @@ def _normalize_isolation(value: Any) -> str | None:
     raise WorkflowRuntimeError("isolation must be 'worktree'")
 
 
+def _runtime_agent_specs(meta: dict[str, Any]) -> dict[str, Any]:
+    raw = meta.get("agents") if isinstance(meta, dict) else None
+    if raw in (None, ""):
+        return {}
+    if not isinstance(raw, dict):
+        raise WorkflowRuntimeError("meta.agents must be an object")
+    from ..child.presets import build_runtime_agent_type
+
+    specs: dict[str, Any] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str):
+            raise WorkflowRuntimeError("meta.agents keys must be strings")
+        source = f"meta.agents.{key}"
+        try:
+            spec = build_runtime_agent_type(key, value, source=source)
+        except ValueError as exc:
+            raise WorkflowRuntimeError(str(exc)) from exc
+        specs[key.strip()] = spec
+        specs[spec.name] = spec
+    return specs
+
+
 def _resolve_agent_spec(
     opts: dict[str, Any],
     *,
@@ -486,59 +538,257 @@ def _resolve_agent_spec(
     config: Any,
     structured_output: bool,
     phase_model: str | None = None,
+    runtime_agents: dict[str, Any] | None = None,
 ) -> ResolvedAgentSpec:
-    from ..child.presets import list_agent_types, resolve_agent_type
+    from ..child.presets import generic_agent_type, list_agent_types, resolve_agent_type
     from ..child.runner import (
         _prepare_mcp_tool_registry,
         _resolve_child_toolsets,
         build_child_system_prompt,
     )
 
+    runtime_agents = runtime_agents or {}
     explicit_type = _normalize_agent_type(opts.get("agentType"))
     requested_type = explicit_type or "general-purpose"
-    agent_type_spec = resolve_agent_type(requested_type, cwd=cwd)
-    if explicit_type and agent_type_spec is None:
-        available = ", ".join(spec.name for spec in list_agent_types(cwd=cwd)) or "none"
-        raise WorkflowRuntimeError(
-            f"agent({{agentType}}): agent type '{requested_type}' not found. "
-            f"Available agents: {available}"
+    warnings: list[str] = []
+
+    if explicit_type:
+        agent_type_spec = runtime_agents.get(requested_type) or resolve_agent_type(requested_type, cwd=cwd)
+        if agent_type_spec is None:
+            policy = _missing_agent_type_policy(config)
+            if policy == "fallback_warn":
+                warning = (
+                    f"agentType '{requested_type}' not found; falling back to "
+                    "general-purpose"
+                )
+                warnings.append(warning)
+                agent_type_spec = (
+                    runtime_agents.get("general-purpose")
+                    or resolve_agent_type("general-purpose", cwd=cwd)
+                    or generic_agent_type()
+                )
+            else:
+                available = ", ".join(_available_agent_names(cwd, runtime_agents)) or "none"
+                raise WorkflowRuntimeError(
+                    f"agent({{agentType}}): agent type '{requested_type}' not found. "
+                    f"Available agents: {available}"
+                )
+    else:
+        agent_type_spec = (
+            runtime_agents.get("general-purpose")
+            or resolve_agent_type("general-purpose", cwd=cwd)
+            or generic_agent_type()
         )
 
+    effective_spec = _compose_effective_agent_type(agent_type_spec, opts)
     explicit_isolation = _normalize_isolation(opts.get("isolation"))
     agent_type_isolation = _normalize_agent_type_isolation(
-        getattr(agent_type_spec, "isolation", None)
+        getattr(effective_spec, "isolation", None)
     )
     model = _normalize_agent_model(
         opts.get("model")
         if opts.get("model")
         else phase_model
         if phase_model
-        else getattr(agent_type_spec, "model", None)
+        else getattr(effective_spec, "model", None)
     )
     _prepare_mcp_tool_registry(config)
+    has_inline_or_meta_tool_surface = _has_inline_tool_surface(opts) or (
+        not explicit_type
+        and requested_type in runtime_agents
+        and _spec_has_tool_surface(effective_spec)
+    )
     toolsets = tuple(
         _resolve_child_toolsets(
             config,
             [],
-            getattr(agent_type_spec, "toolsets", ()),
-            include_discoverable=not explicit_type,
+            getattr(effective_spec, "toolsets", ()),
+            agent_type_toolsets_explicit=bool(
+                getattr(effective_spec, "toolsets_explicit", False)
+                or getattr(effective_spec, "toolsets", ())
+            ),
+            include_discoverable=not explicit_type and not has_inline_or_meta_tool_surface,
         )
     )
     prompt = build_child_system_prompt(
-        agent_type_spec,
+        effective_spec,
         structured_output=structured_output,
     )
     return ResolvedAgentSpec(
         requested_agent_type=requested_type,
-        agent_type_spec=agent_type_spec,
+        agent_type_spec=effective_spec,
         model=model or None,
         isolation=explicit_isolation or agent_type_isolation,
         toolsets=toolsets,
-        allowed_tools=tuple(getattr(agent_type_spec, "allowed_tools", ()) or ()),
-        disallowed_tools=tuple(getattr(agent_type_spec, "disallowed_tools", ()) or ()),
+        toolsets_explicit=bool(getattr(effective_spec, "toolsets_explicit", False)),
+        allowed_tools=tuple(getattr(effective_spec, "allowed_tools", ()) or ()),
+        allowed_tools_explicit=bool(getattr(effective_spec, "allowed_tools_explicit", False)),
+        disallowed_tools=tuple(getattr(effective_spec, "disallowed_tools", ()) or ()),
         system_prompt_hash=hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         workspace=str(Path(cwd).expanduser().resolve()),
+        warnings=tuple(warnings),
     )
+
+
+def _compose_effective_agent_type(base_spec: Any, opts: dict[str, Any]) -> Any:
+    from ..child.presets import AgentTypeSpec
+
+    inline_instructions = _inline_instructions(opts)
+    inline_toolsets, inline_toolsets_explicit = _tuple_option(opts, "toolsets", "toolsets")
+    inline_allowed, inline_allowed_explicit = _tuple_option(
+        opts, "allowedTools", "allowed_tools", field_name="allowedTools"
+    )
+    inline_disallowed, inline_disallowed_explicit = _tuple_option(
+        opts, "disallowedTools", "disallowed_tools", field_name="disallowedTools"
+    )
+
+    instructions = str(getattr(base_spec, "instructions", "") or "").strip()
+    source = str(getattr(base_spec, "source", "") or "inline")
+    if inline_instructions:
+        if instructions:
+            instructions = (
+                instructions
+                + "\n\nAdditional inline workflow instructions:\n\n"
+                + inline_instructions
+            )
+        else:
+            instructions = inline_instructions
+        source = source + "+inline"
+
+    base_toolsets = tuple(getattr(base_spec, "toolsets", ()) or ())
+    base_toolsets_explicit = bool(getattr(base_spec, "toolsets_explicit", False) or base_toolsets)
+    if inline_toolsets_explicit:
+        toolsets = inline_toolsets
+        toolsets_explicit = True
+    else:
+        toolsets = base_toolsets
+        toolsets_explicit = base_toolsets_explicit
+
+    base_allowed = tuple(getattr(base_spec, "allowed_tools", ()) or ())
+    base_allowed_explicit = bool(getattr(base_spec, "allowed_tools_explicit", False) or base_allowed)
+    if base_allowed_explicit and inline_allowed_explicit:
+        inline_allowed_set = set(inline_allowed)
+        allowed_tools = tuple(item for item in base_allowed if item in inline_allowed_set)
+    elif inline_allowed_explicit:
+        allowed_tools = inline_allowed
+    elif base_allowed_explicit:
+        allowed_tools = base_allowed
+    else:
+        allowed_tools = ()
+    allowed_tools_explicit = base_allowed_explicit or inline_allowed_explicit
+
+    disallowed_tools = _dedupe_tuple(
+        tuple(getattr(base_spec, "disallowed_tools", ()) or ())
+        + (inline_disallowed if inline_disallowed_explicit else ())
+    )
+
+    return AgentTypeSpec(
+        name=str(getattr(base_spec, "name", None) or "general-purpose"),
+        instructions=instructions,
+        source=source,
+        description=str(opts.get("description") or getattr(base_spec, "description", "") or ""),
+        toolsets=toolsets,
+        allowed_tools=allowed_tools,
+        disallowed_tools=disallowed_tools,
+        model=getattr(base_spec, "model", None),
+        isolation=getattr(base_spec, "isolation", None),
+        toolsets_explicit=toolsets_explicit,
+        allowed_tools_explicit=allowed_tools_explicit,
+    )
+
+
+def _inline_instructions(opts: dict[str, Any]) -> str:
+    value, explicit = _first_present(opts, "instructions", "systemPrompt", "system_prompt")
+    if not explicit:
+        return ""
+    return str(value or "").strip()
+
+
+def _tuple_option(
+    opts: dict[str, Any],
+    *keys: str,
+    field_name: str | None = None,
+) -> tuple[tuple[str, ...], bool]:
+    value, explicit = _first_present(opts, *keys)
+    if not explicit or value is None:
+        return (), False
+    label = field_name or keys[0]
+    return _strict_string_tuple(value, label), True
+
+
+def _first_present(data: dict[str, Any], *keys: str) -> tuple[Any, bool]:
+    for key in keys:
+        if key in data:
+            return data.get(key), True
+    return None, False
+
+
+def _strict_string_tuple(value: Any, field_name: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        raw = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        raw = value
+    else:
+        raise WorkflowRuntimeError(f"{field_name} must be a string or list of strings")
+    cleaned: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            raise WorkflowRuntimeError(f"{field_name} must contain only strings")
+        clean = item.strip()
+        if not clean:
+            if isinstance(value, str) and not value.strip():
+                continue
+            raise WorkflowRuntimeError(f"{field_name} must contain non-empty strings")
+        cleaned.append(clean)
+    return tuple(cleaned)
+
+
+def _has_inline_tool_surface(opts: dict[str, Any]) -> bool:
+    return any(key in opts and opts.get(key) is not None for key in _TOOL_SURFACE_OPT_KEYS)
+
+
+def _spec_has_tool_surface(spec: Any) -> bool:
+    return bool(
+        getattr(spec, "toolsets_explicit", False)
+        or getattr(spec, "allowed_tools_explicit", False)
+        or getattr(spec, "disallowed_tools", ())
+    )
+
+
+def _dedupe_tuple(items: tuple[str, ...]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for item in items:
+        name = str(item).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        cleaned.append(name)
+    return tuple(cleaned)
+
+
+def _missing_agent_type_policy(config: Any) -> str:
+    value = str(getattr(config, "missing_agent_type_policy", "error") or "error").strip()
+    return value if value in _MISSING_AGENT_TYPE_POLICIES else "error"
+
+
+def _available_agent_names(cwd: str, runtime_agents: dict[str, Any]) -> list[str]:
+    from ..child.presets import list_agent_types
+
+    names: list[str] = []
+    seen: set[str] = set()
+    for name in runtime_agents:
+        clean = str(name).strip()
+        if clean and clean not in seen:
+            seen.add(clean)
+            names.append(clean)
+    for spec in list_agent_types(cwd=cwd):
+        if spec.name not in seen:
+            seen.add(spec.name)
+            names.append(spec.name)
+    return names
 
 
 def _phase_model(frame: WorkflowFrame, phase_name: str | None) -> str | None:

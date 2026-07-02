@@ -309,6 +309,71 @@ class ChildAgentTests(unittest.TestCase):
         self.assertNotIn("write_file", child.valid_tool_names)
         self.assertNotIn("patch", child.valid_tool_names)
 
+    def test_child_tool_surface_empty_allowed_list_denies_non_structured_tools(self):
+        definitions = [
+            _tool_definition("read_file"),
+            _tool_definition("write_file"),
+            _tool_definition("structured_output"),
+        ]
+        model_tools = types.ModuleType("model_tools")
+        model_tools.get_tool_definitions = lambda **kwargs: definitions
+        search_mod = types.ModuleType("tools.tool_search")
+
+        class ToolSearchConfig:
+            @staticmethod
+            def from_raw(raw):
+                return raw
+
+        def assemble_tool_defs(tool_defs, *, config):
+            return types.SimpleNamespace(tool_defs=tool_defs)
+
+        search_mod.ToolSearchConfig = ToolSearchConfig
+        search_mod.assemble_tool_defs = assemble_tool_defs
+        tools_pkg = types.ModuleType("tools")
+        tools_pkg.__path__ = []
+        tools_pkg.tool_search = search_mod
+
+        class Child:
+            tools = []
+            valid_tool_names = set()
+            enabled_toolsets = []
+
+        child = Child()
+        with patch.dict(
+            sys.modules,
+            {
+                "model_tools": model_tools,
+                "tools": tools_pkg,
+                "tools.tool_search": search_mod,
+            },
+        ):
+            _configure_child_tools(
+                child,
+                toolsets=["file", "workflow_structured"],
+                blocked_toolsets=PluginConfig().blocked_child_toolsets,
+                allowed_tools=(),
+                allowed_tools_explicit=True,
+            )
+
+        self.assertEqual(child.valid_tool_names, {"structured_output"})
+        self.assertNotIn("read_file", child.valid_tool_names)
+        self.assertNotIn("write_file", child.valid_tool_names)
+
+    def test_resolve_child_toolsets_respects_explicit_empty(self):
+        self.assertEqual(
+            _resolve_child_toolsets(PluginConfig(), [], requested_explicit=True),
+            [],
+        )
+        self.assertEqual(
+            _resolve_child_toolsets(
+                PluginConfig(),
+                [],
+                (),
+                agent_type_toolsets_explicit=True,
+            ),
+            [],
+        )
+
     def test_child_tool_surface_keeps_structured_output_despite_disallowed(self):
         # A custom agentType that lists structured_output in disallowed_tools
         # must NOT be able to strip it: the tool is injected on schema presence
@@ -555,6 +620,32 @@ Search carefully and return concise notes.
         assert named_spec is not None
         self.assertEqual(named_spec.name, "unique-researcher")
         self.assertIn("unique-researcher", [item.name for item in listed])
+
+    def test_markdown_agent_type_accepts_camelcase_tool_filters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            agent_dir = root / ".hermes" / "dynamic-workflows" / "agents"
+            agent_dir.mkdir(parents=True)
+            (agent_dir / "camel-agent.md").write_text(
+                """---
+name: camel-agent
+toolsets: [file]
+allowedTools: [read_file]
+disallowedTools: [write_file]
+---
+
+Review carefully.
+""",
+                encoding="utf-8",
+            )
+
+            spec = resolve_agent_type("camel-agent", cwd=str(root))
+
+        self.assertIsNotNone(spec)
+        assert spec is not None
+        self.assertEqual(spec.allowed_tools, ("read_file",))
+        self.assertTrue(spec.allowed_tools_explicit)
+        self.assertEqual(spec.disallowed_tools, ("write_file",))
 
     def test_resolves_user_agent_type_markdown(self):
         with tempfile.TemporaryDirectory() as tmp:

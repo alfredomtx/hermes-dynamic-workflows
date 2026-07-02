@@ -72,6 +72,17 @@ Review code carefully.
         )
         self.assertNotIn("- none discovered", schema["description"])
 
+    def test_dynamic_schema_documents_inline_runtime_agents(self):
+        description = get_dynamic_workflow_schema()["description"]
+
+        self.assertIn('meta["agents"]', description)
+        self.assertIn("toolsets", description)
+        self.assertIn("allowedTools", description)
+        self.assertIn("disallowedTools", description)
+        self.assertIn("instructions", description)
+        self.assertIn("missing_agent_type_policy", description)
+        self.assertIn("toolsets: []", description)
+
     def test_denied_launch_returns_clean_tool_error_without_trace(self):
         # A denied top-level launch is expected control flow, not an internal
         # bug — it must return a clean tool_error (no Python traceback leaked).
@@ -210,6 +221,7 @@ return await agent("do it", {"label": "worker"})
             )
             with (
                 patch("hermes_dynamic_workflows.adapters.workflow.get_run_manager", return_value=manager),
+                patch("hermes_dynamic_workflows.run.manager._capture_gateway_session_context", return_value=None),
                 patch(
                     "hermes_dynamic_workflows.child.runner.HermesChildAgentRunner",
                     side_effect=runner_factory,

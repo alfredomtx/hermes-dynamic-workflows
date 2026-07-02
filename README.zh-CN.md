@@ -54,6 +54,7 @@ plugins:
                                       # 子 agent 默认 toolset（不指定 agentType 时生效）
         keep_worktrees: false         # 是否保留 agent 的 git worktree（默认自动清理）
         allow_model_override: true    # 是否允许 agent(model=...) 指定模型
+        missing_agent_type_policy: error # 显式缺失 agentType 时: error|fallback_warn
         require_launch_approval: true # 顶层 workflow 启动前需确认（无人在线则拒绝）
         child_approval_policy: inherit # 子 agent 审批策略: inherit|smart|deny|approve|ask
         ask_fallback: smart           # ask 无人可达时的降级: smart|deny|approve
@@ -115,7 +116,7 @@ return await agent("Synthesize the verified findings:\n" + json.dumps(findings))
 ```
 
 - `agent(prompt, opts)` 起一个子代理；`opts` 可带 `schema`（强制结构化输出）、`model`、
-  `agentType`、`isolation="worktree"`。
+  `agentType`、`isolation="worktree"`、内联 `instructions`/`systemPrompt`、`toolsets`、`allowedTools`、`disallowedTools`。
 - `pipeline`（默认，无栅栏）/ `parallel`（栅栏）做并发；`phase`/`log` 报告进度；
   `workflow()` 内联跑命名工作流；`args` / `budget` 取入参与 token 预算。
 
@@ -130,7 +131,29 @@ return await agent("Synthesize the verified findings:\n" + json.dumps(findings))
 | `plan` | 只读（read_file, search_files, terminal） | 软件架构设计，输出分步实现方案 |
 | `verification` | web + file + terminal + browser | 验证实现正确性，跑构建/测试/lint 出 PASS/FAIL |
 
-Agent type 按优先级从三个位置查找（同名时前面的覆盖后面的）:
+也可以像 Claude Code 一样在脚本内定义 runtime agents，不必为每个 workflow 预先写 `.md` agent 文件：
+
+```python
+meta = {
+    "name": "review-matrix",
+    "description": "Review and verify",
+    "agents": {
+        "read-only-reviewer": {
+            "instructions": "只读审查代码，不要编辑文件。",
+            "toolsets": ["file", "terminal"],
+            "allowedTools": ["read_file", "search_files", "terminal", "process"],
+        },
+        "synthesizer": {"instructions": "综合结果。", "toolsets": []},
+    },
+}
+
+findings = await agent("Review diff", {"agentType": "read-only-reviewer"})
+return await agent("Synthesize: " + json.dumps(findings), {"agentType": "synthesizer"})
+```
+
+解析顺序：`meta["agents"]` → 项目 `.hermes/dynamic-workflows/agents` → 用户 `~/.hermes/dynamic-workflows/agents` → 插件内置。显式写错 `agentType` 默认报错；`missing_agent_type_policy: fallback_warn` 会记录警告并回退到 `general-purpose`。`toolsets` 省略表示继承；`toolsets: []` 表示无工具；内联/runtime `toolsets` 不会被 discoverable MCP/plugin 工具集自动放宽；`allowedTools` 与 preset 取交集，空列表表示拒绝普通工具。
+
+文件型 Agent type 按优先级从三个位置查找（同名时前面的覆盖后面的）:
 
 1. `<项目>/.hermes/dynamic-workflows/agents/*.md`   — 项目级，仅当前项目生效
 2. `~/.hermes/dynamic-workflows/agents/*.md`        — 用户级，全局生效

@@ -47,6 +47,10 @@ class PluginConfig:
     # session model, override only when a stage wants a different tier. Provider
     # selection stays in Hermes' runtime/model configuration.
     allow_model_override: bool = True
+    # Behavior when a workflow explicitly requests an unknown agentType.
+    # error = fail before child launch (default/backward compatible).
+    # fallback_warn = log visibly and run the generic general-purpose child.
+    missing_agent_type_policy: str = "error"
     keep_worktrees: bool = False
     # Ask the user to approve before a top-level workflow launches (CC gates
     # every launch — a run can spawn many agents and spend real tokens). On by
@@ -294,6 +298,14 @@ def load_config() -> PluginConfig:
         allow_model_override=_as_bool(
             os.getenv("HERMES_DYNAMIC_WORKFLOWS_ALLOW_MODEL_OVERRIDE", raw.get("allow_model_override")),
             default.allow_model_override,
+        ),
+        missing_agent_type_policy=_as_mode(
+            os.getenv(
+                "HERMES_DYNAMIC_WORKFLOWS_MISSING_AGENT_TYPE_POLICY",
+                raw.get("missing_agent_type_policy"),
+            ),
+            default.missing_agent_type_policy,
+            {"error", "fallback_warn"},
         ),
         keep_worktrees=_as_bool(
             os.getenv("HERMES_DYNAMIC_WORKFLOWS_KEEP_WORKTREES", raw.get("keep_worktrees")),

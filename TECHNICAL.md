@@ -38,11 +38,11 @@ On-disk locations (`<cwd>` is the sanitized working directory):
 
 The script body is itself async: write top-level `await` / `return` directly. **The
 first statement must be a pure literal `meta = {...}`** (`name` and `description`
-required; `whenToUse` and `phases` optional).
+required; `whenToUse`, `phases`, and `agents` optional). `meta["agents"]` is a pure-literal map of workflow-local runtime agent presets.
 
 | Global | Signature | Description |
 |---|---|---|
-| `agent` | `await agent(prompt, opts=None)` | Spawns a subagent. Without a schema it returns text; with `schema` it returns the validated object. `opts`: `label` `phase` `schema` `model` `isolation` `agentType`. Returns `None` if skipped by the user. |
+| `agent` | `await agent(prompt, opts=None)` | Spawns a subagent. Without a schema it returns text; with `schema` it returns the validated object. `opts`: `label` `phase` `schema` `model` `isolation` `agentType` `instructions`/`systemPrompt` `toolsets` `allowedTools`/`allowed_tools` `disallowedTools`/`disallowed_tools`. Returns `None` if skipped by the user. |
 | `pipeline` | `await pipeline(items, stage1, …)` | Each item flows through the stages independently, **no barrier**. Stage callbacks receive `(prev, original, index)`; if a stage throws → that item becomes `None`. The default for multi-stage work. |
 | `parallel` | `await parallel(thunks)` | Runs concurrently, **with a barrier**: returns only once all complete. A single failure → `None` in the results (the whole call does not throw). |
 | `phase` | `phase(title)` | Starts a progress group. |
@@ -267,8 +267,8 @@ breakpoint at the end of the system prompt. To make this work, **the subagent sy
 prompt stays byte-for-byte identical across the entire fan-out** — it contains only
 stable scaffolding (base instructions + agentType instructions), while per-task context
 (workspace, label, phase, worktree hints) goes into the subagent's first user message
-(`build_child_task_message`). Subagents with the same toolset + same agentType therefore
-share the cache prefix. The savings depend on the provider (0 for non-cacheable models).
+(`build_child_task_message`). Subagents with the same toolset + same effective agent preset therefore
+share the cache prefix. Inline `instructions` and `meta["agents"]` runtime presets are part of the effective system prompt and cache key. Put stable role text there; keep per-item facts in the normal `prompt` so fan-out children can still share the cached prefix. The savings depend on the provider (0 for non-cacheable models).
 
 ## Concurrency and Limits
 
@@ -415,14 +415,13 @@ reached, `agent()` raises `WorkflowLimitExceeded` (a run-level hard stop). The s
 **a single run**, not Claude Code's per-turn shared pool — the boundary a standalone tool
 ought to have. Tool inputs / `meta` / config / environment cannot set `total`.
 
-## agentType / worktree / Named Workflows
+## agentType / inline agents / worktree / Named Workflows
 
-- **agentType**: `agent(agentType="…")` loads subagent instructions from a workflow agent
-  file. Resolution order: project
-  `.hermes/dynamic-workflows/agents/<name>.{md,yaml,json}` → user
-  `~/.hermes/dynamic-workflows/agents/<name>.…` → the plugin's built-in
-  `agents/<name>.md`. Markdown supports YAML frontmatter (`model` / `toolsets` /
-  `isolation`, …). Built-in: `explore`, `general-purpose`, `plan`, `verification`.
+- **Inline agent opts**: `agent("task", {"instructions": "read-only reviewer", "toolsets": ["file"], "allowedTools": ["read_file", "search_files"]})` builds an in-memory agent preset for one call. `toolsets: []` is intentional no tools. `allowedTools: []` denies all normal tools; schema children still keep `structured_output` so they can submit results.
+- **Runtime presets**: `meta["agents"]` defines reusable in-script presets. Example: `meta = {"name":"x", "description":"x", "agents": {"reviewer": {"instructions":"Review only", "toolsets":["file"]}}}` then `agent(..., {"agentType":"reviewer"})`.
+- **Library agentType files**: explicit `agentType` resolution order is runtime `meta["agents"]` → project `.hermes/dynamic-workflows/agents/<name>.{md,yaml,json}` → user `~/.hermes/dynamic-workflows/agents/<name>.…` → plugin built-in `agents/<name>.md`. Markdown supports YAML frontmatter (`model` / `toolsets` / `allowed_tools` / `disallowed_tools` / `isolation`, …). Built-in: `explore`, `general-purpose`, `plan`, `verification`.
+- **Missing names**: explicit missing `agentType` raises before child launch by default (`missing_agent_type_policy: error`). Opt-in `fallback_warn` logs a visible warning and falls back to `general-purpose`. Omitted `agentType` still uses `general-purpose` normally.
+- **Tool-surface composition**: inline opts overlay the selected preset. Inline `toolsets` replace preset toolsets exactly and are not widened by discoverable MCP/plugin toolsets. Preset+inline allowlists intersect; denylists union. Blocked child toolsets still win.
 - **worktree**: `agent(isolation="worktree")` runs each subagent in its own git worktree,
   preventing conflicts from concurrent edits to the same checkout. This is workspace
   isolation, not a security sandbox; the worktree is deleted after use by default
