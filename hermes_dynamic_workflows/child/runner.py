@@ -42,6 +42,9 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 _CHILD_EXCLUDED_TOOL_NAMES = frozenset({"skill_manage"})
+_STRUCTURED_OUTPUT_MISSING_EXPECTATION = (
+    "no structured-output expectation is registered for this task"
+)
 
 
 class _WorkflowApprovalCoordinator:
@@ -508,6 +511,25 @@ class HermesChildAgentRunner(ChildAgentRunner):
                     captured, _value, tool_attempts = peek_result(lease.task_id)
                     if captured:
                         return result
+
+                    # The schema tool is a runner-owned side channel: runner.run()
+                    # registers an expectation in this process before the child
+                    # starts, and structured_output_handler captures into that
+                    # broker. If the tool says no expectation exists, another
+                    # runtime boundary (or timeout cleanup racing a still-running
+                    # child) invoked the tool outside the registered broker. That
+                    # is non-retryable. Re-prompting just burns model turns with
+                    # the same broken side channel.
+                    if _structured_output_missing_expectation(result):
+                        raise ChildAgentError(
+                            "structured_output tool was invoked without the "
+                            f"registered expectation for workflow child {lease.task_id}; "
+                            "aborting instead of retrying"
+                        )
+                    if getattr(child, "_interrupt_requested", False):
+                        raise ChildAgentError(
+                            "child was interrupted before providing structured output"
+                        )
 
                     stop_attempts += 1
                     if (
@@ -1323,6 +1345,33 @@ def _tool_call_count(result: dict[str, Any]) -> int:
                 if isinstance(block, dict) and block.get("type") == "tool_use"
             )
     return count
+
+
+def _structured_output_missing_expectation(result: dict[str, Any] | Any) -> bool:
+    """Return True when the child hit the unregistered structured-output broker.
+
+    Invalid JSON/schema attempts are recoverable and should be retried. A
+    missing expectation is a runtime wiring failure (or a timed-out child still
+    running after cleanup), so the runner must fail fast instead of asking the
+    child to call the same broken tool again.
+    """
+    if not isinstance(result, dict):
+        return False
+    messages = result.get("messages")
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") != "tool":
+            continue
+        tool_name = str(message.get("tool_name") or message.get("name") or "")
+        if tool_name and tool_name != STRUCTURED_OUTPUT_TOOL_NAME:
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and _STRUCTURED_OUTPUT_MISSING_EXPECTATION in content:
+            return True
+    return False
 
 
 def _callable_accepts_keyword(target: Any, keyword: str) -> bool:

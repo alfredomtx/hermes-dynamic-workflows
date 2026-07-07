@@ -27,6 +27,7 @@ from hermes_dynamic_workflows.child.runner import (
     _resolve_child_toolsets,
     _tool_progress_line_width,
     _tool_call_count,
+    _structured_output_missing_expectation,
 )
 from hermes_dynamic_workflows.child.worktree import WorkspaceLease, create_workspace_lease
 from hermes_dynamic_workflows.core.config import PluginConfig
@@ -689,6 +690,91 @@ class ChildFailureDetectionTests(unittest.TestCase):
 
     def test_non_dict_result_is_not_a_failure(self):
         self.assertIsNone(_child_failure_message("nope", ""))
+
+
+class StructuredOutputRunnerFailureTests(unittest.TestCase):
+    def test_detects_missing_expectation_tool_result(self):
+        result = {
+            "messages": [
+                {
+                    "role": "tool",
+                    "tool_name": "structured_output",
+                    "content": (
+                        '{"error":"Output does not match required schema: root: '
+                        'no structured-output expectation is registered for this task"}'
+                    ),
+                }
+            ]
+        }
+
+        self.assertTrue(_structured_output_missing_expectation(result))
+
+    def test_ignores_recoverable_structured_validation_error(self):
+        result = {
+            "messages": [
+                {
+                    "role": "tool",
+                    "tool_name": "structured_output",
+                    "content": (
+                        '{"error":"Output does not match required schema: root: '
+                        "must have required property 'ok'" + '"}'
+                    ),
+                }
+            ]
+        }
+
+        self.assertFalse(_structured_output_missing_expectation(result))
+
+    def test_runner_fails_fast_on_missing_structured_expectation(self):
+        class Child:
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_reasoning_tokens = 0
+            session_cache_read_tokens = 0
+            session_cache_write_tokens = 0
+            model = "test-model"
+            messages = []
+
+            def __init__(self):
+                self.calls = 0
+                self._interrupt_requested = False
+
+            def run_conversation(self, **_kwargs):
+                self.calls += 1
+                return {
+                    "final_response": "",
+                    "completed": True,
+                    "messages": [
+                        {
+                            "role": "tool",
+                            "tool_name": "structured_output",
+                            "content": (
+                                '{"error":"Output does not match required schema: root: '
+                                'no structured-output expectation is registered for this task"}'
+                            ),
+                        }
+                    ],
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = HermesChildAgentRunner(PluginConfig(child_timeout_seconds=5))
+            child = Child()
+            request = ChildAgentRequest(
+                id=1,
+                prompt="return json",
+                label="json",
+                phase=None,
+                toolsets=[],
+                schema={"type": "object"},
+                structured_tool=True,
+            )
+            lease = WorkspaceLease(task_id="workflow-test", cwd=tmp)
+
+            with self.assertRaises(ChildAgentError) as ctx:
+                runner._run_child_with_timeout(child, request, lease, None, [])
+
+        self.assertIn("without the registered expectation", str(ctx.exception))
+        self.assertEqual(child.calls, 1)
 
 
 class ToolCallCountTests(unittest.TestCase):
