@@ -995,6 +995,34 @@ class RunnerSessionContextTests(unittest.TestCase):
             )
             self.assertEqual(runner._resolve_runtime(request), runtime)
 
+    def test_blocked_parent_model_fails_before_child_launch(self):
+        runner = HermesChildAgentRunner(
+            PluginConfig(blocked_models=("gpt-5.5",)),
+            parent_runtime={"model": "gpt-5.5", "provider": "openai-codex"},
+        )
+        request = ChildAgentRequest(
+            id=1,
+            prompt="work",
+            label="worker",
+            phase=None,
+            toolsets=[],
+            model=None,
+        )
+
+        with self.assertRaisesRegex(ChildAgentError, "blocked by policy: gpt-5.5"):
+            runner._resolve_runtime(request)
+
+    def test_blocked_fallback_model_fails_before_child_launch(self):
+        runner = HermesChildAgentRunner(PluginConfig(blocked_models=("gpt-5.5",)))
+
+        with self.assertRaisesRegex(ChildAgentError, "blocked by policy: openai/gpt-5.5-fast"):
+            runner._assert_models_allowed(
+                {
+                    "model": "gpt-5.6-sol",
+                    "fallback_model": [{"provider": "openai-codex", "model": "openai/gpt-5.5-fast"}],
+                }
+            )
+
 
 class StructuredOutputContinuationTests(unittest.TestCase):
     def test_runner_binds_parent_approval_session_key_inside_child_thread(self):

@@ -260,7 +260,9 @@ class HermesChildAgentRunner(ChildAgentRunner):
         if requested_model and not self.config.allow_model_override:
             raise ChildAgentError("model override is disabled for workflow child agents")
         if requested_model is None and self._parent_runtime is not None:
-            return dict(self._parent_runtime)
+            runtime = dict(self._parent_runtime)
+            self._assert_models_allowed(runtime)
+            return runtime
 
         try:
             from hermes_cli.config import load_config
@@ -315,7 +317,24 @@ class HermesChildAgentRunner(ChildAgentRunner):
         )
         runtime["model"] = effective_model
         runtime["fallback_model"] = get_fallback_chain(cfg) or None
+        self._assert_models_allowed(runtime)
         return runtime
+
+    def _assert_models_allowed(self, runtime: dict[str, Any]) -> None:
+        blocked = tuple(model.strip().lower() for model in self.config.blocked_models if model.strip())
+        if not blocked:
+            return
+
+        configured = [runtime.get("model")]
+        fallback = runtime.get("fallback_model") or []
+        if isinstance(fallback, dict):
+            fallback = [fallback]
+        configured.extend(item.get("model") if isinstance(item, dict) else item for item in fallback)
+
+        for model in configured:
+            normalized = str(model or "").strip().lower().rsplit("/", 1)[-1]
+            if any(normalized == denied or normalized.startswith(denied + "-") for denied in blocked):
+                raise ChildAgentError(f"workflow child model is blocked by policy: {model}")
 
     def _build_agent(
         self,
