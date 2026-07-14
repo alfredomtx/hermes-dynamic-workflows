@@ -16,9 +16,9 @@ from .model import AgentView, PhaseView, SessionGroup, WorkflowView, group_sessi
 
 
 _DETAIL_HEADER_LINES = 4
-_LIST_FOOTER = "↑/↓ to select · → in · ← out · Enter to open · x to stop · s to save · Esc to close"
-_WORKFLOW_FOOTER = "↑↓ select · → in · ← back · x stop · p pause · r restart · s save"
-_AGENT_FOOTER = "↑↓ select · → detail · ← back · x stop · p pause · r restart · s save"
+_LIST_FOOTER = "↑/↓ to select · → in · ← out · Enter to open · x to stop · s to save report · Esc to close"
+_WORKFLOW_FOOTER = "↑↓ select · → in · ← back · x stop · p pause · r restart · s save report"
+_AGENT_FOOTER = "↑↓ select · → detail · ← back · x stop run · p pause run · r restart run · s save report"
 
 
 @dataclass(frozen=True)

@@ -34,6 +34,7 @@ from ..storage.store import (
 )
 from ..storage.control import ControlListener, new_control_owner
 from ..view.render import (
+    _current_phase,
     _RUNNING_STATES,
     render_agent_overview,
     render_cost_breakdown,
@@ -853,16 +854,19 @@ class WorkflowRunManager:
     def _update_state(self, managed: ManagedRun, state, config: PluginConfig | None = None) -> None:
         snapshot = state.snapshot()
         self._sync_live_child_transcripts(managed, snapshot)
-        self._update(
-            managed,
-            workflow=snapshot,
-            display=render_workflow_text(snapshot, completed=False),
-        )
+        with managed.lock:
+            old_signal = _progress_signal(managed.record)
+            managed.record.update(
+                workflow=snapshot,
+                display=render_workflow_text(snapshot, completed=False),
+            )
+            signal_changed = old_signal != _progress_signal(managed.record)
+            self.store.save_run(managed.record)
         # Mid-run edit of the live progress bubble (throttled + change-gated
         # inside the helper). No-op when no bubble is active.
         if config is not None and config.notify_progress:
             try:
-                _edit_progress_bubble(managed, config, completed=False)
+                _edit_progress_bubble(managed, config, completed=False, force=signal_changed)
             except Exception:
                 pass
 
@@ -953,6 +957,13 @@ def _content_from_value(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+
+
+def _progress_signal(record: dict[str, Any]) -> tuple[str, str]:
+    workflow = record.get("workflow") or {}
+    logs = workflow.get("logs") or []
+    latest_root_log = str(logs[-1]) if logs else ""
+    return _current_phase(workflow), latest_root_log
 
 
 def _completion_output_text(record: dict[str, Any]) -> str:
@@ -1993,6 +2004,11 @@ def _seed_progress_bubble(managed: "ManagedRun", config: PluginConfig) -> bool:
                     # bubble is never left stuck on the launch render.
                     try:
                         _edit_progress_bubble(managed, config, completed=True, force=True, block=False)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        _edit_progress_bubble(managed, config, completed=False, force=True, block=False)
                     except Exception:
                         pass
             else:

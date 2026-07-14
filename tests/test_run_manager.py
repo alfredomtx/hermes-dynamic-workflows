@@ -23,11 +23,14 @@ from hermes_dynamic_workflows.run.transcripts import (
     SessionTranscriptReader,
 )
 from hermes_dynamic_workflows.run.manager import (
+    ManagedRun,
     WorkflowRunManager,
     _capture_parent_runtime,
     _gateway_running_agent,
     _notify_launch,
+    _progress_signal,
     _render_gateway_launch_message,
+    _seed_progress_bubble,
 )
 from hermes_dynamic_workflows.view.render import render_agent_overview
 from hermes_dynamic_workflows.core.types import ChildAgentRequest, ChildAgentResult, ChildAgentRunner
@@ -415,6 +418,115 @@ class RunManagerTests(unittest.TestCase):
 
     def tearDown(self):
         self._env_patcher.stop()
+
+    def _progress_managed(self, workflow):
+        return ManagedRun(
+            run_id="wf_progress",
+            stop_event=threading.Event(),
+            pause_gate=manager_module.PauseGate(),
+            record={"runId": "wf_progress", "taskId": "wg-progress", "status": "running", "workflow": workflow},
+            session_context={"platform": "telegram", "chat_id": "chat-1", "thread_id": "topic-9"},
+        )
+
+    def test_progress_signal_uses_renderer_phase_and_latest_root_log_only(self):
+        workflow = {
+            "phases": [{"title": "Review"}, {"title": "Verify"}],
+            "agents": [
+                {"id": 1, "status": "running", "phase": "Review"},
+                {"id": 2, "status": "running", "phase": "Verify"},
+            ],
+            "logs": ["older", "root latest"],
+            "children": [{"logs": ["nested latest"], "agents": [], "children": []}],
+        }
+
+        self.assertEqual(_progress_signal({"workflow": workflow}), ("Verify", "root latest"))
+
+    def test_update_state_forces_progress_edit_when_root_log_changes(self):
+        old = {"phases": [{"title": "Review"}], "agents": [{"id": 1, "status": "running", "phase": "Review"}], "logs": ["old"]}
+        new = {**old, "logs": ["old", "new"]}
+        managed = self._progress_managed(old)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig())
+            state = SimpleNamespace(snapshot=lambda: new)
+            with patch.object(manager_module, "_edit_progress_bubble") as edit:
+                manager._update_state(managed, state, manager.config)
+
+        self.assertTrue(edit.call_args.kwargs["force"])
+
+    def test_update_state_forces_progress_edit_when_current_phase_changes(self):
+        old = {"phases": [{"title": "Review"}, {"title": "Verify"}], "agents": [{"id": 1, "status": "running", "phase": "Review"}], "logs": ["same"]}
+        new = {**old, "agents": [{"id": 1, "status": "done", "phase": "Review"}, {"id": 2, "status": "running", "phase": "Verify"}]}
+        managed = self._progress_managed(old)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig())
+            state = SimpleNamespace(snapshot=lambda: new)
+            with patch.object(manager_module, "_edit_progress_bubble") as edit:
+                manager._update_state(managed, state, manager.config)
+
+        self.assertTrue(edit.call_args.kwargs["force"])
+
+    def test_update_state_keeps_ordinary_activity_updates_throttled(self):
+        old = {"phases": [{"title": "Review"}], "agents": [{"id": 1, "status": "running", "phase": "Review", "tokens": 1}], "logs": ["same"]}
+        new = {**old, "agents": [{"id": 1, "status": "running", "phase": "Review", "tokens": 2}]}
+        managed = self._progress_managed(old)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig())
+            state = SimpleNamespace(snapshot=lambda: new)
+            with patch.object(manager_module, "_edit_progress_bubble") as edit:
+                manager._update_state(managed, state, manager.config)
+
+        self.assertFalse(edit.call_args.kwargs["force"])
+
+    def test_successful_seed_catches_up_running_state_with_topic_and_controls(self):
+        class Adapter:
+            def __init__(self):
+                self.sent = []
+                self.edited = []
+
+            async def send(self, chat_id, content, metadata=None, buttons=None):
+                self.sent.append((chat_id, content, metadata, buttons))
+                return SimpleNamespace(success=True, message_id="msg-seed")
+
+            async def edit_message(self, chat_id, message_id, content, metadata=None, buttons=None, finalize=False):
+                self.edited.append((chat_id, message_id, content, metadata, buttons, finalize))
+                return SimpleNamespace(success=True)
+
+        def schedule(coro, loop, **kwargs):
+            future = Future()
+            future.set_result(asyncio.run(coro))
+            return future
+
+        workflow = {
+            "meta": {"name": "seed-catch-up"},
+            "phases": [{"title": "Review"}],
+            "agents": [{"id": 1, "label": "worker", "status": "running", "phase": "Review"}],
+            "logs": ["newest state"],
+        }
+        managed = self._progress_managed(workflow)
+        adapter = Adapter()
+        metadata = {"thread_id": "topic-9", "notify": True}
+        agent_pkg = ModuleType("agent")
+        async_utils = ModuleType("agent.async_utils")
+        setattr(async_utils, "safe_schedule_threadsafe", schedule)
+        setattr(agent_pkg, "async_utils", async_utils)
+
+        with (
+            patch.object(manager_module, "_resolve_gateway_target", return_value=(adapter, object(), "chat-1", metadata)),
+            patch.dict(sys.modules, {"agent": agent_pkg, "agent.async_utils": async_utils}),
+        ):
+            self.assertTrue(_seed_progress_bubble(managed, PluginConfig()))
+
+        self.assertEqual(len(adapter.sent), 1)
+        self.assertEqual(len(adapter.edited), 1)
+        self.assertEqual(adapter.edited[0][0:2], ("chat-1", "msg-seed"))
+        self.assertEqual(adapter.edited[0][3], metadata)
+        callbacks = [button["callback_data"] for button in adapter.edited[0][4]]
+        self.assertIn("wf:pause:wf_progress", callbacks)
+        self.assertIn("wf:stop:wg-progress", callbacks)
+        self.assertFalse(adapter.edited[0][5])
 
     def test_task_output_path_uses_platform_tempdir_and_override(self):
         with tempfile.TemporaryDirectory() as tmp:

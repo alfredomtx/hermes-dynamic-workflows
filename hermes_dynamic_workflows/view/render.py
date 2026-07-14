@@ -23,6 +23,10 @@ from ..core.text import preview
 # full prompt (a paragraph), which is what made the old overview unreadable.
 _CHIP_LABEL_MAX = 32
 _RUNNING_STATES = {"queued", "running", "paused", "stopping"}
+_PROGRESS_NAME_MAX_CHARS = 96
+_PROGRESS_PHASE_MAX_CHARS = 96
+_PROGRESS_LOG_MAX_CHARS = 240
+_PROGRESS_TOTAL_MAX_CHARS = 4096
 
 # Char budget for the per-agent roster rows in the DETAILED progress bubble.
 # Alfredo asked the roster to show ALL items, not collapse a tail into "… +N".
@@ -36,6 +40,13 @@ _ROSTER_CHAR_BUDGET = 3500
 # Secondary backstop ceiling so a runaway 1000-agent run can't build a giant
 # list before the char budget trims it. Far above any real concurrent roster.
 _ROSTER_MAX_ROWS = 250
+
+
+def _bounded_text(value: Any, max_chars: int) -> str:
+    text = " ".join(str("" if value is None else value).split())
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1].rstrip() + "…"
 
 
 def render_workflow_text(snapshot: dict[str, Any], *, completed: bool = True, max_agents: int = 12) -> str:
@@ -257,6 +268,8 @@ def _render_run_block(
     snapshot = run.get("workflow") or {}
     meta = snapshot.get("meta") or {}
     name = meta.get("name") or run.get("source", {}).get("ref") or "workflow"
+    if detailed:
+        name = _bounded_text(name, _PROGRESS_NAME_MAX_CHARS)
     status = run.get("status")
     totals = _totals(snapshot)
     agents = _all_agents(snapshot)
@@ -279,32 +292,54 @@ def _render_run_block(
         head += f" · {status}"
     lines = [head]
 
-    if not totals["agents"]:
-        lines.append("   no agents started")
-        return _append_ids(lines, run, include_ids)
-
     if detailed:
-        # Richer bubble layout: phase checklist for pipelines (>=2 phases),
-        # per-agent elapsed for single-phase fan-out. Cleanly REPLACES the
-        # legacy phase+progress line and chip row below.
+        bits = (
+            [f"{totals['done']}/{totals['agents']} done"]
+            if totals["agents"]
+            else ["no agents started"]
+        )
+        if totals["running"]:
+            bits.append(f"{totals['running']} running")
+        if totals.get("errors"):
+            bits.append(f"{totals['errors']} err")
+        lines.append(f"   Status: {' · '.join(bits)}")
+
         phases = _phase_names(snapshot, recursive=False)
+        current_phase = _current_phase(snapshot) if totals["agents"] else ""
+        if current_phase:
+            current_line = f"   Current: {_bounded_text(current_phase, _PROGRESS_PHASE_MAX_CHARS)}"
+            if show_cost:
+                current_agents = [agent for agent in agents if agent.get("phase") == current_phase]
+                current_cost = _format_cost(_total_cost(current_agents))
+                if current_cost:
+                    current_line += f" · {current_cost}"
+            lines.append(current_line)
         if len(phases) >= 2:
-            lines.extend(_phase_checklist(snapshot, agents, show_cost=show_cost))
             next_line = _next_phase_line(snapshot, phases)
             if next_line:
                 lines.append(f"   {next_line}")
-        else:
-            # Fan-out: keep the phase + progress summary line, then per-agent
-            # rows with their own elapsed.
-            phase = _current_phase(snapshot)
-            bits = [f"{totals['done']}/{totals['agents']} done"]
-            if totals["running"]:
-                bits.append(f"{totals['running']} running")
-            if totals.get("errors"):
-                bits.append(f"{totals['errors']} err")
-            lines.append(f"   {phase + ' · ' if phase else ''}{' · '.join(bits)}")
-            for line in _agent_lines(agents, show_cost=show_cost):
-                lines.append(f"   {line}")
+
+        optional: list[str] = []
+        root_logs = snapshot.get("logs") or []
+        if root_logs:
+            root_log = _bounded_text(root_logs[-1], _PROGRESS_LOG_MAX_CHARS)
+            if root_log:
+                optional.append(f"   Log: {root_log}")
+        if totals["agents"]:
+            if len(phases) >= 2:
+                optional.extend(_phase_checklist(snapshot, agents, show_cost=show_cost))
+            else:
+                optional.extend(f"   {line}" for line in _agent_lines(agents, show_cost=show_cost))
+        if include_ids:
+            task_id = str(run.get("taskId") or "")
+            run_id = str(run.get("runId") or "")
+            id_bits = [bit for bit in (f"Task: {task_id}" if task_id else "", run_id) if bit]
+            if id_bits:
+                lines.append(f"   {' · '.join(id_bits)}")
+        return _append_optional_progress(lines, optional)
+
+    if not totals["agents"]:
+        lines.append("   no agents started")
         return _append_ids(lines, run, include_ids)
 
     # Compact overview layout (the /workflows list): phase + progress summary
@@ -342,6 +377,19 @@ def _append_ids(lines: list[str], run: dict[str, Any], include_ids: bool) -> str
         if id_bits:
             lines.append(f"   {' · '.join(id_bits)}")
     return "\n".join(lines)
+
+
+def _append_optional_progress(required: list[str], optional: list[str]) -> str:
+    text = "\n".join(required)
+    for line in optional:
+        candidate = f"{text}\n{line}"
+        if len(candidate) <= _PROGRESS_TOTAL_MAX_CHARS:
+            text = candidate
+            continue
+        if len(text) + 2 <= _PROGRESS_TOTAL_MAX_CHARS:
+            text += "\n…"
+        break
+    return text
 
 
 def _agent_chips(agents: list[dict[str, Any]], *, max_chips: int) -> str:
@@ -677,7 +725,8 @@ def _next_phase_line(snapshot: dict[str, Any], phases: list[str]) -> str:
         if isinstance(entry, dict) and str(entry.get("title") or "").strip() == next_title:
             detail = str(entry.get("detail") or "").strip()
             break
-    return f"Next: {preview(detail, 80) if detail else next_title}"
+    value = detail if detail else next_title
+    return f"Next: {_bounded_text(value, _PROGRESS_PHASE_MAX_CHARS)}"
 
 
 def render_agent_row(agent: dict[str, Any]) -> str:

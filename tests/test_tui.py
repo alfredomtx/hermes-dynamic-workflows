@@ -336,6 +336,28 @@ class TuiTests(unittest.TestCase):
         self.assertIn("agent-19", "\n".join(agent_lines))
         self.assertNotIn("agent-0 ", "\n".join(agent_lines))
 
+    def test_footers_describe_save_report_and_run_wide_controls_honestly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workflow = WorkflowRepository(_fake_store(Path(tmp))).detail("wf_fake-running")
+        assert workflow is not None
+
+        list_lines = render_screen([workflow], RenderState(view="list"), width=180, height=20)
+        workflow_lines = render_screen([workflow], RenderState(view="workflow"), width=180, height=20)
+        agent_lines = render_screen([workflow], RenderState(view="agent"), width=180, height=20)
+
+        self.assertEqual(
+            list_lines[-1].strip(),
+            "↑/↓ to select · → in · ← out · Enter to open · x to stop · s to save report · Esc to close",
+        )
+        self.assertEqual(
+            workflow_lines[-1].strip(),
+            "↑↓ select · → in · ← back · x stop · p pause · r restart · s save report",
+        )
+        self.assertEqual(
+            agent_lines[-1].strip(),
+            "↑↓ select · → detail · ← back · x stop run · p pause run · r restart run · s save report",
+        )
+
     def test_non_tty_command_prints_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
             _fake_store(Path(tmp))
