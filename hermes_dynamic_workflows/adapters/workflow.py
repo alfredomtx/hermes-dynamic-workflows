@@ -223,6 +223,8 @@ _DESCRIPTION = (
     '\n'
     'Use this tool for multi-step orchestration where control flow should be deterministic (loops, conditionals, fan-out) rather than model-driven.\n'
     '\n'
+    'For an outcome-first gateway completion card, return a `result.presentation` envelope as `{"presentation":{"status":"blocked","title":"Review blocked","summary":"...","findings":[...],"nextAction":"..."},"report":...}`. Use `status` for the domain verdict, not transport completion. Keep the full machine-readable result under `report`; the primary chat card shows the concise presentation.\n'
+    '\n'
     '## Resume\n'
     '\n'
     'The tool result includes a runId. To resume after a pause, kill, or script edit, relaunch with Workflow({scriptPath, resumeFromRunId})\n'

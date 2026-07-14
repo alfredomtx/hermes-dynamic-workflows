@@ -99,6 +99,17 @@ Review code carefully.
         ):
             self.assertIn(text, description)
 
+    def test_dynamic_schema_documents_completion_presentation_contract(self):
+        description = get_dynamic_workflow_schema()["description"]
+
+        for text in (
+            "result.presentation",
+            "nextAction",
+            "status",
+            "full machine-readable result",
+        ):
+            self.assertIn(text, description)
+
     def test_denied_launch_returns_clean_tool_error_without_trace(self):
         # A denied top-level launch is expected control flow, not an internal
         # bug — it must return a clean tool_error (no Python traceback leaked).

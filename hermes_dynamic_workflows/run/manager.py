@@ -33,13 +33,16 @@ from ..storage.store import (
     utc_now_iso,
 )
 from ..storage.control import ControlListener, new_control_owner
+from ..view.completion import (
+    content_from_value,
+    is_intentional_stop_record,
+    render_completion_card,
+)
 from ..view.render import (
     _current_phase,
     _RUNNING_STATES,
     render_agent_overview,
-    render_cost_breakdown,
     render_run_progress,
-    render_run_summary,
     render_saved_markdown,
     render_workflow_text,
 )
@@ -953,12 +956,6 @@ class WorkflowRunManager:
                 managed.record["journalError"] = f"{type(exc).__name__}: {exc}"
 
 
-def _content_from_value(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    return json.dumps(value, ensure_ascii=False, indent=2, default=str)
-
-
 def _progress_signal(record: dict[str, Any]) -> tuple[str, str]:
     workflow = record.get("workflow") or {}
     logs = workflow.get("logs") or []
@@ -968,20 +965,10 @@ def _progress_signal(record: dict[str, Any]) -> tuple[str, str]:
 
 def _completion_output_text(record: dict[str, Any]) -> str:
     if record.get("result") is not None:
-        return _content_from_value(record.get("result"))
+        return content_from_value(record.get("result"))
     if record.get("error"):
         return str(record.get("error") or "")
     return ""
-
-
-def _is_intentional_stop_record(record: dict[str, Any]) -> bool:
-    """True for a user-requested workflow stop, not an execution failure."""
-    if str(record.get("status") or "").lower() != "stopped":
-        return False
-    error = str(record.get("error") or "").strip()
-    if not error:
-        return True
-    return error.splitlines()[0].startswith("WorkflowStopped:")
 
 
 def _runtime_error_text(exc: BaseException) -> str:
@@ -2172,62 +2159,14 @@ def _edit_result_ok(result: Any) -> bool:
 
 
 def _progress_bubble_text(record: dict[str, Any], config: PluginConfig, *, completed: bool) -> str:
-    """Render the bubble body. Mid-run reuses ``render_run_progress`` (the
-    detailed phase-checklist / per-agent-elapsed layout). On completion the
-    progress block COLLAPSES to a one-line summary (``render_run_summary``) and
-    the result is rendered READABLY: a structured (dict/list) result goes in a
-    fenced code block (a clean monospace card, not a wall of unquoted JSON), a
-    short string plainly. The internal temp output-file path is NOT shown in
-    chat — it is an implementation detail (still written for programmatic use).
-    """
-    show_cost = config.notify_progress_cost
+    """Render live progress or the shared outcome-first completion card."""
     if not completed:
-        return render_run_progress(record, show_cost=show_cost)
-    lines = [render_run_summary(record, show_cost=show_cost), ""]
-    # Per-subtask cost breakdown: the live roster (with its per-agent cost) is
-    # gone once the bubble collapses to the one-line summary, so re-surface how
-    # much each verify/review subtask cost here, where the final figures are
-    # known. Omitted when cost display is off or nothing is priceable.
-    if show_cost:
-        breakdown = render_cost_breakdown(record)
-        if breakdown:
-            lines.append(breakdown)
-            lines.append("")
-    if _is_intentional_stop_record(record):
-        lines.append("Workflow stopped. Stopped intentionally.")
-    elif record.get("error"):
-        lines.append(f"Error: {str(record.get('error') or '').strip()}")
-    else:
-        result_body = _completion_result_block(record, config.notify_result_preview_chars)
-        if result_body:
-            lines.append(result_body)
-    return "\n".join(lines).rstrip()
-
-
-def _completion_result_block(record: dict[str, Any], preview_chars: int) -> str:
-    """Format a completed run's result for the bubble.
-
-    A structured result (dict/list) is pretty-printed inside a fenced ```code
-    block so Telegram renders a clean monospace card. A string result is shown
-    plainly under ``Result:``. Truncation honors ``preview_chars`` and still
-    closes the fence. Returns "" when there is no result.
-    """
-    result = record.get("result")
-    if result is None:
-        return ""
-    structured = not isinstance(result, str)
-    text = _content_from_value(result).strip()
-    if not text:
-        return ""
-    if preview_chars > 0 and len(text) > preview_chars:
-        remaining = len(text) - preview_chars
-        text = text[:preview_chars] + f"\n... (truncated {remaining} chars)"
-    if structured:
-        # Fenced block: Telegram shows a clean monospace card instead of a wall
-        # of unquoted JSON. ``` cannot appear in json.dumps output, so the
-        # fence can never be broken by the content.
-        return f"Result:\n```\n{text}\n```"
-    return f"Result:\n{text}"
+        return render_run_progress(record, show_cost=config.notify_progress_cost)
+    return render_completion_card(
+        record,
+        preview_chars=config.notify_result_preview_chars,
+        show_cost=config.notify_progress_cost,
+    )
 
 
 def _notify_launch(
@@ -2315,30 +2254,12 @@ def _gateway_thread_metadata(
 
 
 def _render_gateway_completion_message(record: dict[str, Any], config: PluginConfig) -> str:
-    status = str(record.get("status") or "completed")
-    task_id = str(record.get("taskId") or record.get("runId") or "")
-    summary = str(record.get("summary") or "Dynamic workflow")
-    icon = "✅" if status == "completed" else "⏹" if status == "stopped" else "❌"
-    lines = [
-        f"{icon} Workflow {status}: {summary}",
-        f"Task: {task_id}",
-    ]
-    if _is_intentional_stop_record(record):
-        lines.append("Stopped intentionally.")
-    elif record.get("error"):
-        lines.append(f"Error: {str(record.get('error') or '').strip()}")
-    else:
-        result_text = _completion_output_text(record).strip()
-        if result_text:
-            preview_chars = config.notify_result_preview_chars
-            if preview_chars > 0 and len(result_text) > preview_chars:
-                remaining = len(result_text) - preview_chars
-                result_text = result_text[:preview_chars] + f"\n... (truncated {remaining} chars)"
-            lines.append(f"Result:\n{result_text}")
-    output_file = str(record.get("outputFile") or "")
-    if output_file:
-        lines.append(f"Output: {output_file}")
-    return "\n".join(lines)
+    """Render the same terminal card used by the final progress-bubble edit."""
+    return render_completion_card(
+        record,
+        preview_chars=config.notify_result_preview_chars,
+        show_cost=config.notify_progress_cost,
+    )
 
 
 def _render_task_notification(record: dict[str, Any], preview_chars: int) -> str:
@@ -2352,7 +2273,7 @@ def _render_task_notification(record: dict[str, Any], preview_chars: int) -> str
     name = meta.get("name") or "workflow"
     totals = snapshot.get("totals") or {}
 
-    intentional_stop = _is_intentional_stop_record(record)
+    intentional_stop = is_intentional_stop_record(record)
     if intentional_stop:
         summary = f'Dynamic workflow "{name}" stopped intentionally'
     elif record.get("error"):

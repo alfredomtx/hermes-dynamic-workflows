@@ -119,29 +119,32 @@ def render_run_progress(run: dict[str, Any], *, max_chips: int = 8, verbose: boo
 
 
 def render_run_summary(run: dict[str, Any], *, show_cost: bool = True) -> str:
-    """One-line collapsed completion head: emoji, name, duration, agent count,
-    estimated cost, aggregate tokens. Used by the gateway bubble's final
-    (completion) edit so a finished run collapses to a single summary line
-    instead of leaving a wall of done-agent rows above the result.
-    """
+    """One-line collapsed completion head for compact run listings."""
     snapshot = run.get("workflow") or {}
     meta = snapshot.get("meta") or {}
     name = meta.get("name") or run.get("source", {}).get("ref") or "workflow"
-    status = run.get("status")
+    head = f"{status_emoji(run.get('status'))} {name}"
+    metrics = render_run_metrics(run, show_cost=show_cost)
+    return f"{head} · {metrics}" if metrics else head
+
+
+def render_run_metrics(run: dict[str, Any], *, show_cost: bool = True) -> str:
+    """Compact duration, agent, cost, and token footer for a run."""
+    snapshot = run.get("workflow") or {}
     totals = _totals(snapshot)
-    head = f"{status_emoji(status)} {name}"
+    parts: list[str] = []
     duration = _duration(run, snapshot)
     if duration:
-        head += f" · {_format_duration(duration)}"
+        parts.append(_format_duration(duration))
     if totals["agents"]:
-        head += f" · {totals['agents']} agent{'s' if totals['agents'] != 1 else ''}"
+        parts.append(f"{totals['agents']} agent{'s' if totals['agents'] != 1 else ''}")
     if show_cost:
         cost = _format_cost(_total_cost(_all_agents(snapshot)))
         if cost:
-            head += f" · {cost}"
+            parts.append(cost)
     if totals.get("tokens"):
-        head += f" · ~{_format_tokens(totals['tokens'])} tok"
-    return head
+        parts.append(f"{_format_tokens(totals['tokens'])} tokens")
+    return " · ".join(parts)
 
 
 def render_cost_breakdown(
@@ -968,6 +971,9 @@ def _as_int(value: Any) -> int:
 
 def _format_tokens(value: Any) -> str:
     number = _as_int(value)
+    if number >= 1_000_000:
+        millions = f"{number / 1_000_000:.2f}".rstrip("0").rstrip(".")
+        return f"{millions}M"
     if number >= 1000:
         return f"{number / 1000:.1f}K"
     return str(number)

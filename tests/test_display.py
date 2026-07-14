@@ -448,7 +448,7 @@ class DisplayTests(unittest.TestCase):
         text = _progress_bubble_text(run, PluginConfig(), completed=True)
         # Collapsed head: emoji + name + agent count, no per-agent rows.
         self.assertIn("✅", text)
-        self.assertIn("audit", text)
+        self.assertIn("Audit completed", text)
         self.assertIn("3 agents", text)
         self.assertNotIn("wireframe", text)  # per-agent rows gone
         # Result preserved.
@@ -471,7 +471,7 @@ class DisplayTests(unittest.TestCase):
         run["result"] = "x" * 5000
         cfg = PluginConfig()
         text = _progress_bubble_text(run, cfg, completed=True)
-        self.assertIn("truncated", text)
+        self.assertIn("chars omitted", text)
         self.assertLessEqual(len(text), cfg.notify_result_preview_chars + 300)
 
     def test_overview_stays_compact_no_header_tokens(self):
@@ -642,7 +642,7 @@ class CostAndCompletionTests(unittest.TestCase):
 
     # --- C7 readable completion ---
 
-    def test_completion_dict_result_is_fenced_no_temp_path(self):
+    def test_completion_dict_result_is_bounded_plain_text_no_temp_path(self):
         from hermes_dynamic_workflows.run.manager import _progress_bubble_text
         from hermes_dynamic_workflows.core.config import PluginConfig
 
@@ -650,12 +650,11 @@ class CostAndCompletionTests(unittest.TestCase):
         run["result"] = {"audit_scopes": [], "total_findings": 0, "register": []}
         run["outputFile"] = "/var/folders/mp/abc/tasks/wg432juun.output"
         text = _progress_bubble_text(run, PluginConfig(), completed=True)
-        # Structured result rendered in a fenced code block.
-        self.assertIn("```", text)
-        self.assertIn("total_findings", text)
-        # The internal temp output-file path is NOT shown in chat.
+        self.assertIn('"audit_scopes": []', text)
+        self.assertNotIn("```", text)
         self.assertNotIn("/var/folders", text)
-        self.assertNotIn("Output:", text)
+        self.assertNotIn("Full output", text)
+
 
     def test_completion_string_result_is_plain_not_fenced(self):
         from hermes_dynamic_workflows.run.manager import _progress_bubble_text

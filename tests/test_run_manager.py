@@ -988,9 +988,9 @@ return await agent("do it", {"label": "worker"})
         self.assertEqual(launch_metadata, {"reply": "message-1", "notify": True})
         chat_id, content, metadata = adapter.sent[1]
         self.assertEqual(chat_id, "chat-1")
-        self.assertIn("Workflow completed: Gateway notification test", content)
-        self.assertIn("Result:\n", content)
+        self.assertIn("✅ Gateway notify completed", content)
         self.assertIn("worker", content)
+        self.assertNotIn("Result:", content)
         self.assertEqual(metadata, {"reply": "message-1", "notify": True})
 
     def test_gateway_launch_notification_can_be_disabled(self):
@@ -1067,7 +1067,7 @@ return await agent("do it", {"label": "worker"})
         self.assertEqual(final["status"], "completed")
         # notify_on_launch off -> only the completion notification is sent.
         self.assertEqual(len(adapter.sent), 1)
-        self.assertIn("Workflow completed", adapter.sent[0][1])
+        self.assertIn("✅ No launch note completed", adapter.sent[0][1])
 
     def test_live_progress_bubble_seeds_then_finalizes_one_message(self):
         # With notify_progress on and an edit-capable adapter, a gateway run
@@ -1159,7 +1159,7 @@ return await agent("do it", {"label": "worker"})
         self.assertEqual(final_edit[1], "msg-100")
         self.assertTrue(final_edit[3])  # finalize=True
         self.assertIn("worker", final_edit[2])
-        self.assertIn("Result:", final_edit[2])
+        self.assertNotIn("Result:", final_edit[2])
 
     def test_completion_edit_flood_failure_falls_back_to_fresh_send(self):
         # Regression for the verdict-never-posted bug: when the FINAL completion
@@ -1256,14 +1256,14 @@ return await agent("do it", {"label": "worker"})
         # CRITICAL: because the finalize edit was not confirmed delivered, a
         # FRESH completion send must have fired carrying the full result, so the
         # verdict is never silently lost.
-        completion_sends = [s for s in adapter.sent if "Workflow completed" in s[1]]
+        completion_sends = [s for s in adapter.sent if "worker" in s[1]]
         self.assertEqual(
             len(completion_sends),
             1,
             f"expected exactly one fresh completion send after flood, got sends={adapter.sent}",
         )
-        self.assertIn("Result:", completion_sends[0][1])
         self.assertIn("worker", completion_sends[0][1])
+        self.assertNotIn("Result:", completion_sends[0][1])
 
     def test_completion_edit_flood_recovers_even_when_notify_on_complete_false(self):
         # Regression for WARN-1 (flagged independently by all 3 dual-review lanes):
@@ -1360,13 +1360,14 @@ return await agent("do it", {"label": "worker"})
         # CRITICAL: notify_on_complete=False normally suppresses the trailing
         # send, but the finalize edit FLOODED, so the recovery send must still
         # fire carrying the full result.
-        completion_sends = [s for s in adapter.sent if "Workflow completed" in s[1]]
+        completion_sends = [s for s in adapter.sent if "worker" in s[1]]
         self.assertEqual(
             len(completion_sends),
             1,
             f"expected one recovery send despite notify_on_complete=False, got sends={adapter.sent}",
         )
-        self.assertIn("Result:", completion_sends[0][1])
+        self.assertIn("worker", completion_sends[0][1])
+        self.assertNotIn("Result:", completion_sends[0][1])
 
     def test_completion_edit_success_with_notify_on_complete_false_no_send(self):
         # Guard the other side of WARN-1: when the finalize edit SUCCEEDS and
@@ -1455,7 +1456,7 @@ return await agent("do it", {"label": "worker"})
         self.assertTrue(any(e[3] for e in adapter.edited))  # finalize edit happened
         # Happy path + notify_on_complete=False: bubble carried the result, so
         # NO separate completion send.
-        completion_sends = [s for s in adapter.sent if "Workflow completed" in s[1]]
+        completion_sends = [s for s in adapter.sent if "worker" in s[1]]
         self.assertEqual(
             len(completion_sends),
             0,
@@ -1565,13 +1566,14 @@ return await agent("do it", {"label": "worker"})
 
         # Exactly one seed send, no separate "Workflow completed" send.
         self.assertEqual(len(adapter.sent), 1)
-        self.assertFalse(any("Workflow completed" in s[1] for s in adapter.sent))
+        self.assertFalse(any("worker" in s[1] for s in adapter.sent))
         # The callback delivered exactly the finalize edit carrying the result.
         self.assertEqual(len(adapter.edited), 1)
         final_edit = adapter.edited[-1]
         self.assertEqual(final_edit[1], "msg-slow")
         self.assertTrue(final_edit[3])  # finalize=True
-        self.assertIn("Result:", final_edit[2])
+        self.assertIn("worker", final_edit[2])
+        self.assertNotIn("Result:", final_edit[2])
 
     def test_notify_progress_disabled_falls_back_to_markers(self):
         # With notify_progress off, the run uses the classic launch + completion
@@ -1656,7 +1658,7 @@ return await agent("do it", {"label": "worker"})
         self.assertEqual(len(adapter.edited), 0)
         self.assertEqual(len(adapter.sent), 2)
         self.assertIn("Workflow started", adapter.sent[0][1])
-        self.assertIn("Workflow completed", adapter.sent[1][1])
+        self.assertIn("✅ No bubble completed", adapter.sent[1][1])
 
     def test_render_launch_message_includes_summary_and_task(self):
         msg = _render_gateway_launch_message(
@@ -2277,6 +2279,446 @@ return await agent("do it", {"label": "worker"})
 
         self.assertEqual(final["status"], "completed")
         self.assertEqual(final["result"], "1:worker")
+
+
+class CompletionCardRenderTests(unittest.TestCase):
+    def _blocked_review_record(self) -> dict:
+        return {
+            "runId": "wf_review_123",
+            "taskId": "wgreview123",
+            "status": "completed",
+            "summary": "Independent final quality and security review of Task 7",
+            "result": {
+                "status": "BLOCK",
+                "reviews": [
+                    {
+                        "verdict": "BLOCK",
+                        "findings": [
+                            "Task 7 implementation and its focused gates are clean. No surviving code defect was found.",
+                            "The final hygiene requirement is not met: live storage still contains synthetic test artifacts. This remains a release blocker.",
+                            "The blocker is stale pre-existing state, not leakage from this run.",
+                        ],
+                        "evidence": ["/Users/atorres/private/review-evidence.json"],
+                    },
+                    {
+                        "verdict": "BLOCK",
+                        "findings": [
+                            "[Important, blocking] Durable reporting can be silently omitted before the outbox exists. Persist the stable delivery envelope first.",
+                            "[Minor, non-blocking by itself] A test does not isolate one temporary directory.",
+                        ],
+                        "evidence": ["client.py:2980-3007"],
+                    },
+                ],
+            },
+            "workflow": {
+                "meta": {"name": "final-review-task-7"},
+                "duration_seconds": 691.0,
+                "totals": {
+                    "agents": 2,
+                    "done": 2,
+                    "running": 0,
+                    "errors": 0,
+                    "tokens": 5_039_100,
+                },
+            },
+        }
+
+    def test_block_result_drives_outcome_first_completion_card(self):
+        text = manager_module._progress_bubble_text(
+            self._blocked_review_record(),
+            PluginConfig(notify_progress_cost=False, notify_result_preview_chars=6000),
+            completed=True,
+        )
+
+        self.assertTrue(text.startswith("⛔ Review blocked"), text)
+        self.assertIn("2 blocking findings", text)
+        self.assertIn("live storage still contains synthetic test artifacts", text)
+        self.assertIn("Durable reporting can be silently omitted", text)
+        self.assertIn("11m 31s · 2 agents · 5.04M tokens", text)
+        self.assertNotIn("✅", text)
+        self.assertNotIn("Result:", text)
+        self.assertNotIn('"reviews"', text)
+        self.assertNotIn("evidence", text.lower())
+        self.assertNotIn("/Users/atorres", text)
+        self.assertNotIn("No surviving code defect", text)
+        self.assertNotIn("non-blocking by itself", text)
+        self.assertLess(len(text), 2000)
+
+    def test_explicit_presentation_controls_completion_copy(self):
+        record = self._blocked_review_record()
+        record["result"] = {
+            "presentation": {
+                "status": "blocked",
+                "title": "Final review blocked",
+                "summary": "No implementation defects were found.",
+                "findings": ["Synthetic test records remain in live storage."],
+                "nextAction": "Remove stale artifacts, then rerun the review.",
+            },
+            "report": {"secret_internal_key": "must stay out of the card"},
+        }
+
+        text = manager_module._progress_bubble_text(
+            record,
+            PluginConfig(notify_progress_cost=False),
+            completed=True,
+        )
+
+        self.assertTrue(text.startswith("⛔ Final review blocked"), text)
+        self.assertIn("No implementation defects were found.", text)
+        self.assertIn("Synthetic test records remain in live storage.", text)
+        self.assertIn("Required action", text)
+        self.assertIn("Remove stale artifacts, then rerun the review.", text)
+        self.assertNotIn("secret_internal_key", text)
+
+    def test_string_result_is_primary_completion_copy(self):
+        record = self._blocked_review_record()
+        record["result"] = "LIVE_SMOKE_OK"
+        record["workflow"]["meta"]["name"] = "telegram-live-smoke"
+
+        text = manager_module._progress_bubble_text(
+            record,
+            PluginConfig(notify_progress_cost=False),
+            completed=True,
+        )
+
+        self.assertTrue(text.startswith("✅ Telegram live smoke completed"), text)
+        self.assertIn("LIVE_SMOKE_OK", text)
+        self.assertNotIn("Result:", text)
+
+    def test_failed_transport_with_string_result_stays_failed(self):
+        record = self._blocked_review_record()
+        record["status"] = "failed"
+        record["result"] = "partial diagnostic output"
+
+        text = manager_module._progress_bubble_text(
+            record,
+            PluginConfig(notify_progress_cost=False),
+            completed=True,
+        )
+
+        self.assertTrue(text.startswith("❌ Final review task 7 failed"), text)
+        self.assertIn("partial diagnostic output", text)
+
+    def test_unknown_domain_status_uses_raw_fallback(self):
+        record = self._blocked_review_record()
+        record["result"] = {"status": "PENDING_APPROVAL", "opaque": {"step": 3}}
+
+        text = manager_module._progress_bubble_text(
+            record,
+            PluginConfig(notify_progress_cost=False),
+            completed=True,
+        )
+
+        self.assertTrue(text.startswith("⚠️ Final review task 7 needs attention"), text)
+        self.assertIn("PENDING_APPROVAL", text)
+        self.assertIn("Result:", text)
+
+    def test_negated_blocker_wording_is_not_relabelled_as_blocking(self):
+        record = self._blocked_review_record()
+        record["result"] = {
+            "status": "BLOCK",
+            "reviews": [
+                {
+                    "verdict": "BLOCK",
+                    "findings": ["This informational note is not a release blocker."],
+                }
+            ],
+        }
+
+        text = manager_module._progress_bubble_text(
+            record,
+            PluginConfig(notify_progress_cost=False),
+            completed=True,
+        )
+
+        self.assertIn("1 reviewer returned BLOCK", text)
+        self.assertIn("Review details", text)
+        self.assertIn("informational note", text)
+        self.assertNotIn("Blocking findings", text)
+
+    def test_blocker_count_is_not_limited_to_displayed_rows(self):
+        record = self._blocked_review_record()
+        record["result"] = {
+            "status": "BLOCK",
+            "reviews": [
+                {
+                    "verdict": "BLOCK",
+                    "findings": [
+                        {"severity": "blocker", "title": f"Blocker {index}"}
+                        for index in range(1, 6)
+                    ],
+                }
+            ],
+        }
+
+        text = manager_module._progress_bubble_text(
+            record,
+            PluginConfig(notify_progress_cost=False),
+            completed=True,
+        )
+
+        self.assertIn("5 blocking findings", text)
+        self.assertIn("Blocker 4", text)
+        self.assertNotIn("Blocker 5", text)
+
+    def test_outcome_resolution_uses_every_field_and_falls_back_on_unknown_shapes(self):
+        cases = {
+            "nested-verdict-beats-status": (
+                {"reviews": [{"status": "completed", "verdict": "BLOCK", "findings": []}]},
+                "⛔ Review blocked",
+                None,
+            ),
+            "nested-outcome": (
+                {"reviews": [{"outcome": "BLOCK", "findings": []}]},
+                "⛔ Review blocked",
+                None,
+            ),
+            "unknown-with-summary": (
+                {"status": "PENDING_APPROVAL", "summary": "Awaiting approver"},
+                "⚠️ Final review task 7 needs attention",
+                "PENDING_APPROVAL",
+            ),
+            "unknown-with-pass": (
+                {"status": "PENDING_APPROVAL", "verdict": "PASS"},
+                "⚠️ Final review task 7 needs attention",
+                "PENDING_APPROVAL",
+            ),
+            "unknown-with-completed": (
+                {"status": "PENDING_APPROVAL", "verdict": "COMPLETED"},
+                "⚠️ Final review task 7 needs attention",
+                "PENDING_APPROVAL",
+            ),
+            "unknown-presentation": (
+                {
+                    "status": "BLOCK",
+                    "presentation": {"status": "PENDING_APPROVAL", "summary": "Wait"},
+                },
+                "⛔ Final review task 7 blocked",
+                "PENDING_APPROVAL",
+            ),
+            "malformed-reviews": (
+                {"status": "BLOCK", "reviews": 1},
+                "⛔ Final review task 7 blocked",
+                '"reviews": 1',
+            ),
+        }
+        for name, (result, prefix, visible) in cases.items():
+            with self.subTest(name=name):
+                record = self._blocked_review_record()
+                record["result"] = result
+                text = manager_module._progress_bubble_text(
+                    record,
+                    PluginConfig(notify_progress_cost=False),
+                    completed=True,
+                )
+                self.assertTrue(text.startswith(prefix), text)
+                if visible:
+                    self.assertIn(visible, text)
+
+    def test_blocker_extraction_is_conservative_and_counts_occurrences(self):
+        duplicate = {"severity": "blocker", "title": "Same blocker"}
+        cases = {
+            "duplicates-counted": (
+                {"status": "BLOCK", "reviews": [{"verdict": "BLOCK", "findings": [duplicate, duplicate]}]},
+                "2 blocking findings",
+                "Blocking findings",
+                "Same blocker",
+            ),
+            "negated-dict": (
+                {
+                    "status": "BLOCK",
+                    "reviews": [
+                        {
+                            "verdict": "BLOCK",
+                            "findings": [
+                                {
+                                    "severity": "blocker",
+                                    "title": "This is non-blocking and not a release blocker.",
+                                }
+                            ],
+                        }
+                    ],
+                },
+                "1 reviewer returned BLOCK",
+                "Review details",
+                "This is non-blocking",
+            ),
+            "unmarked-review-finding": (
+                {
+                    "status": "BLOCK",
+                    "reviews": [
+                        {"verdict": "BLOCK", "findings": ["Critical SQL injection must be fixed."]}
+                    ],
+                },
+                "1 reviewer returned BLOCK",
+                "Review details",
+                "Critical SQL injection",
+            ),
+            "top-level-neutral": (
+                {"status": "BLOCK", "findings": ["Minor typo only"]},
+                "Final review task 7 blocked",
+                "Details",
+                "Minor typo only",
+            ),
+        }
+        for name, (result, summary, heading, detail) in cases.items():
+            with self.subTest(name=name):
+                record = self._blocked_review_record()
+                record["result"] = result
+                text = manager_module._progress_bubble_text(
+                    record,
+                    PluginConfig(notify_progress_cost=False),
+                    completed=True,
+                )
+                self.assertIn(summary, text)
+                self.assertIn(heading, text)
+                self.assertIn(detail, text)
+                if name != "duplicates-counted":
+                    self.assertNotIn("Blocking findings", text)
+
+    def test_interrupted_transport_never_renders_green(self):
+        record = self._blocked_review_record()
+        record["status"] = "interrupted"
+        record["result"] = {
+            "presentation": {
+                "status": "passed",
+                "title": "Review passed",
+                "summary": "Recovered partial output",
+            }
+        }
+
+        text = manager_module._progress_bubble_text(
+            record,
+            PluginConfig(notify_progress_cost=False),
+            completed=True,
+        )
+
+        self.assertTrue(text.startswith("⚠️ Final review task 7 needs attention"), text)
+        self.assertIn("Recovered partial output", text)
+
+        record["status"] = "PENDING_APPROVAL"
+        record["result"] = "Waiting for approval"
+        unknown = manager_module._progress_bubble_text(
+            record,
+            PluginConfig(notify_progress_cost=False),
+            completed=True,
+        )
+        self.assertTrue(unknown.startswith("⚠️ Final review task 7 needs attention"), unknown)
+
+    def test_false_finding_lists_use_raw_fallback(self):
+        cases = {
+            "review": {"status": "BLOCK", "reviews": [{"verdict": "BLOCK", "findings": False}]},
+            "presentation": {"presentation": {"status": "BLOCK", "findings": False}},
+            "top-level": {"status": "BLOCK", "findings": False},
+        }
+        for name, result in cases.items():
+            with self.subTest(name=name):
+                record = self._blocked_review_record()
+                record["result"] = result
+                text = manager_module._progress_bubble_text(
+                    record,
+                    PluginConfig(notify_progress_cost=False),
+                    completed=True,
+                )
+                self.assertIn("Result:", text)
+                self.assertIn("false", text)
+
+    def test_common_blocker_negations_are_review_details(self):
+        findings = [
+            {"severity": "blocker", "title": "This is not blocking."},
+            "[blocker] This does not block release.",
+            "[blocker] This isn't a blocker.",
+        ]
+        for finding in findings:
+            with self.subTest(finding=finding):
+                record = self._blocked_review_record()
+                record["result"] = {
+                    "status": "BLOCK",
+                    "reviews": [{"verdict": "BLOCK", "findings": [finding]}],
+                }
+                text = manager_module._progress_bubble_text(
+                    record,
+                    PluginConfig(notify_progress_cost=False),
+                    completed=True,
+                )
+                self.assertIn("Review details", text)
+                self.assertNotIn("Blocking findings", text)
+
+    def test_failed_transport_beats_passed_domain_result(self):
+        record = self._blocked_review_record()
+        record["status"] = "failed"
+        record["result"] = {
+            "presentation": {
+                "status": "passed",
+                "title": "Review passed",
+                "summary": "Everything is fine.",
+            }
+        }
+
+        text = manager_module._progress_bubble_text(
+            record,
+            PluginConfig(notify_progress_cost=False),
+            completed=True,
+        )
+
+        self.assertTrue(text.startswith("❌ Final review task 7 failed"), text)
+        self.assertIn("Everything is fine", text)
+
+    def test_completion_card_is_utf16_bounded_and_neutralizes_raw_fences(self):
+        record = self._blocked_review_record()
+        record["result"] = {
+            "presentation": {
+                "status": "blocked",
+                "title": "🚨" * 200,
+                "summary": "🧪" * 2000,
+                "findings": ["🔥" * 2000 for _ in range(10)],
+                "nextAction": "🛠" * 2000,
+            }
+        }
+        with patch(
+            "hermes_dynamic_workflows.view.completion.render_cost_breakdown",
+            return_value="💰" * 3500,
+        ):
+            text = manager_module._progress_bubble_text(record, PluginConfig(), completed=True)
+        self.assertLessEqual(len(text.encode("utf-16-le")) // 2, 4096)
+        self.assertTrue(text.startswith("⛔"), text)
+        self.assertNotIn("💰", text)
+
+        record["result"] = "compact result"
+        with patch(
+            "hermes_dynamic_workflows.view.completion.render_cost_breakdown",
+            return_value="```cost detail```",
+        ):
+            cost = manager_module._progress_bubble_text(record, PluginConfig(), completed=True)
+        self.assertIn("cost detail", cost)
+        self.assertNotIn("```", cost)
+
+        record["result"] = {"opaque": "````break the fence````"}
+        raw = manager_module._progress_bubble_text(
+            record,
+            PluginConfig(notify_progress_cost=False),
+            completed=True,
+        )
+        self.assertIn("break the fence", raw)
+        self.assertNotIn("```", raw)
+
+        record["result"] = "bad surrogate: \ud800"
+        surrogate = manager_module._progress_bubble_text(
+            record,
+            PluginConfig(notify_progress_cost=False),
+            completed=True,
+        )
+        self.assertIn("bad surrogate", surrogate)
+        self.assertNotIn("\ud800", surrogate)
+
+    def test_fresh_completion_send_uses_same_semantic_card(self):
+        record = self._blocked_review_record()
+        config = PluginConfig(notify_progress_cost=False)
+
+        bubble = manager_module._progress_bubble_text(record, config, completed=True)
+        fresh_send = manager_module._render_gateway_completion_message(record, config)
+
+        self.assertEqual(fresh_send, bubble)
 
 
 class StoppedWorkflowRenderTests(unittest.TestCase):
