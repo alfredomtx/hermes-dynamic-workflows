@@ -664,6 +664,25 @@ return "ok"
                 with self.assertRaises(WorkflowRuntimeError):
                     manager.start_from_params({"script": script}, cwd=tmp)
 
+    def test_resume_inherits_previous_args_when_omitted(self):
+        script = """
+meta = {"name": "resume args", "description": "Test workflow"}
+
+return args
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig(require_launch_approval=False))
+            first = manager.start_from_params({"script": script, "args": {"evidence": "kept"}}, cwd=tmp)
+            manager.wait(first["runId"], timeout=2)
+            second = manager.start_from_params(
+                {"script": script, "resumeFromRunId": first["runId"]},
+                cwd=tmp,
+            )
+            second_final = manager.wait(second["runId"], timeout=2)
+
+        self.assertEqual(second["args"], {"evidence": "kept"})
+        self.assertEqual(second_final["result"], {"evidence": "kept"})
+
     def test_resume_reuses_unchanged_prefix(self):
         script = """
 meta = {"name": "resume", "description": "Test workflow"}

@@ -204,7 +204,7 @@ class WorkflowRunManager:
         journal_path.touch(exist_ok=True)
         previous = self.store.load_run(resume_from) if resume_from else None
         resume_cache = ResumeCache.from_run(previous)
-        args = params["args"] if "args" in params else None
+        args = params["args"] if "args" in params else (previous.get("args") if previous else None)
         token_budget = (
             token_budget_total_override
             if token_budget_total_override is not None
