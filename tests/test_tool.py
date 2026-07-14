@@ -95,6 +95,7 @@ Review code carefully.
             "review",
             "codex_app_server",
             "wall-clock",
+            "provider retries",
         ):
             self.assertIn(text, description)
 

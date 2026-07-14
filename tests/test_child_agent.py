@@ -727,6 +727,73 @@ class MaxTurnsPresetTests(unittest.TestCase):
                 self.assertIn(str(path), str(ctx.exception))
                 self.assertIn("maxTurns must be an integer from 1 to 1000", str(ctx.exception))
 
+    def test_malformed_markdown_max_turns_fails_closed(self):
+        cases = {
+            "unquoted": "maxTurns: [2",
+            "double-quoted": '"maxTurns": [2',
+            "single-quoted": "'maxTurns': [2",
+            "flow-map": "{maxTurns: [2}",
+            "flow-map-second": "{name: foo, maxTurns: [2}",
+            "flow-map-second-quoted": '{name: foo, "maxTurns": [2}',
+            "flow-map-second-alias": "{name: foo, max_turns: [2}",
+        }
+        for name, frontmatter in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                path = self._agent_dir(Path(tmp)) / f"malformed-{name}.md"
+                path.write_text(
+                    f"---\n{frontmatter}\n---\nResearch.\n",
+                    encoding="utf-8",
+                )
+
+                with self.assertRaises(ValueError) as ctx:
+                    resolve_agent_type(f"malformed-{name}", cwd=tmp)
+
+                self.assertIn(str(path), str(ctx.exception))
+
+    def test_unterminated_frontmatter_fails_closed(self):
+        cases = {
+            "missing": "---\nmaxTurns: 2\nResearch.\n",
+            "bad-prefix": "---\nmaxTurns: 2\n---oops\nResearch.\n",
+            "padded": "---\nmaxTurns: 2\n --- \nResearch.\n",
+        }
+        for name, content in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                path = self._agent_dir(Path(tmp)) / f"unterminated-{name}.md"
+                path.write_text(content, encoding="utf-8")
+
+                with self.assertRaises(ValueError) as ctx:
+                    resolve_agent_type(f"unterminated-{name}", cwd=tmp)
+
+                self.assertIn(str(path), str(ctx.exception))
+
+    def test_padded_opening_delimiter_is_body_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._agent_dir(Path(tmp)) / "padded-opening.md"
+            path.write_text(
+                " --- \nmaxTurns: 2\n---\nResearch.\n",
+                encoding="utf-8",
+            )
+
+            spec = resolve_agent_type("padded-opening", cwd=tmp)
+
+        self.assertIsNotNone(spec)
+        assert spec is not None
+        self.assertIsNone(spec.max_turns)
+        self.assertIn("maxTurns: 2", spec.instructions)
+
+    def test_malformed_unrelated_frontmatter_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._agent_dir(Path(tmp)) / "unrelated.md"
+            path.write_text(
+                "---\ndescription: mention maxTurns: [2\n---\nResearch.\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(ValueError) as ctx:
+                resolve_agent_type("unrelated", cwd=tmp)
+
+        self.assertIn(str(path), str(ctx.exception))
+
     def test_negative_runtime_preset_value_has_source_specific_error(self):
         with self.assertRaisesRegex(
             ValueError,
@@ -753,6 +820,8 @@ class MaxTurnsPresetTests(unittest.TestCase):
         with patch.dict(sys.modules, {"yaml": None}):
             self.assertEqual(_read_yaml_text("maxTurns: +2\n")["maxTurns"], 2)
             self.assertEqual(_read_yaml_text("maxTurns: -2\n")["maxTurns"], -2)
+            self.assertEqual(_read_yaml_text('"maxTurns": 2\n')["maxTurns"], 2)
+            self.assertEqual(_read_yaml_text("description: hello}\n")["description"], "hello}")
             for scalar in ('"2"', "'2'", "true", "null", "2.0"):
                 with self.subTest(scalar=scalar):
                     self.assertNotIsInstance(
@@ -772,6 +841,25 @@ class MaxTurnsPresetTests(unittest.TestCase):
                         ValueError, "maxTurns must be an integer from 1 to 1000"
                     ):
                         resolve_agent_type("fallback", cwd=tmp)
+
+    def test_no_pyyaml_fallback_rejects_unsupported_flow_syntax(self):
+        cases = {
+            "mapping": "{name: foo, maxTurns: 2}",
+            "sequence": "description: [maxTurns: 2",
+        }
+        for name, frontmatter in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                path = self._agent_dir(Path(tmp)) / f"flow-{name}.md"
+                path.write_text(
+                    f"---\n{frontmatter}\n---\nResearch.\n",
+                    encoding="utf-8",
+                )
+
+                with patch.dict(sys.modules, {"yaml": None}):
+                    with self.assertRaises(ValueError) as ctx:
+                        resolve_agent_type(f"flow-{name}", cwd=tmp)
+
+                self.assertIn(str(path), str(ctx.exception))
 
     def test_host_frontmatter_string_does_not_bypass_local_typing(self):
         skill_utils = types.ModuleType("agent.skill_utils")
@@ -1538,6 +1626,53 @@ class MaxTurnsRunnerTests(unittest.TestCase):
             )
         self.assertNotIn("max_iterations", seen[0])
         self.assertEqual(seen[1]["max_iterations"], 7)
+
+    def test_capped_constructor_disables_core_exhaustion_summary_call(self):
+        summary_calls = []
+
+        class FakeAIAgent:
+            def __init__(self, **_kwargs):
+                self._handle_max_iterations = lambda *_: summary_calls.append("provider")
+
+        run_agent_mod = types.ModuleType("run_agent")
+        setattr(run_agent_mod, "AIAgent", FakeAIAgent)
+        runner = HermesChildAgentRunner(PluginConfig())
+        lease = WorkspaceLease(task_id="build-capped-summary", cwd="/tmp")
+        with patch.dict(sys.modules, {"run_agent": run_agent_mod}):
+            child = runner._build_agent(
+                ChildAgentRequest(1, "work", "capped", None, [], max_turns=1),
+                {"model": "test-model"},
+                [],
+                lease,
+                None,
+            )
+
+        self.assertIsNone(child._handle_max_iterations([], 1))
+        self.assertEqual(summary_calls, [])
+
+    def test_unstructured_capped_exhaustion_is_a_failure(self):
+        class Child:
+            session_prompt_tokens = session_completion_tokens = 0
+            session_reasoning_tokens = session_cache_read_tokens = 0
+            session_cache_write_tokens = 0
+            model = "test"
+
+            def run_conversation(self, **_kwargs):
+                return {
+                    "final_response": None,
+                    "messages": [],
+                    "completed": False,
+                    "api_calls": 1,
+                    "turn_exit_reason": "max_iterations_reached(1/1)",
+                }
+
+        request = self._request(1, structured=False)
+        lease = WorkspaceLease(task_id="unstructured-exhausted", cwd="/tmp")
+
+        with self.assertRaisesRegex(ChildAgentError, "maxTurns=1"):
+            HermesChildAgentRunner(PluginConfig())._run_child_with_timeout(
+                Child(), request, lease, None, []
+            )
 
 
 class ConfigDefaultsTests(unittest.TestCase):

@@ -47,6 +47,16 @@ _STRUCTURED_OUTPUT_MISSING_EXPECTATION = (
 )
 
 
+def _capped_child_exhaustion_response(_messages: list[Any], _api_call_count: int) -> None:
+    return None
+
+
+def _capped_child_exhausted(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return False
+    return str(result.get("turn_exit_reason") or "").startswith("max_iterations_reached(")
+
+
 class _WorkflowApprovalCoordinator:
     """Serialize workflow-child CLI approvals and reuse explicit session grants."""
 
@@ -396,6 +406,9 @@ class HermesChildAgentRunner(ChildAgentRunner):
         if request.max_turns is not None:
             kwargs["max_iterations"] = request.max_turns
         child = AIAgent(**kwargs)
+        if request.max_turns is not None:
+            # A capped child cannot spend an unreported provider call after its final turn.
+            child._handle_max_iterations = _capped_child_exhaustion_response
         # Freeze this child's tool surface against the between-turns MCP refresh.
         #
         # run() assembles a deliberate surface AFTER construction via
@@ -533,7 +546,14 @@ class HermesChildAgentRunner(ChildAgentRunner):
                         conversation_history=history,
                         task_id=lease.task_id,
                     )
+                    capped_exhaustion = (
+                        request.max_turns is not None and _capped_child_exhausted(result)
+                    )
                     if not request.structured_tool:
+                        if capped_exhaustion:
+                            raise ChildAgentError(
+                                f"child exhausted maxTurns={request.max_turns} before completing"
+                            )
                         return result
 
                     if remaining_turns is not None:
@@ -547,7 +567,9 @@ class HermesChildAgentRunner(ChildAgentRunner):
                     captured, _value, tool_attempts = peek_result(lease.task_id)
                     if captured:
                         return result
-                    if remaining_turns is not None and remaining_turns <= 0:
+                    if capped_exhaustion or (
+                        remaining_turns is not None and remaining_turns <= 0
+                    ):
                         raise ChildAgentError(
                             f"child exhausted maxTurns={request.max_turns} before providing "
                             "valid structured output"

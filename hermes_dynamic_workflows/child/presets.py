@@ -173,7 +173,10 @@ def _load_agent_type_file(name: str, path: Path) -> AgentTypeSpec:
 
 def _load_markdown_agent_type(name: str, path: Path) -> AgentTypeSpec:
     text = path.read_text(encoding="utf-8")
-    frontmatter, body = _parse_frontmatter(text)
+    try:
+        frontmatter, body = _parse_frontmatter(text)
+    except Exception as exc:
+        raise ValueError(f"invalid agentType file {path}: {exc}") from exc
     body = body.strip() or text.strip()
     return AgentTypeSpec(
         name=str(frontmatter.get("name") or Path(name).stem),
@@ -203,17 +206,22 @@ def _load_structured_agent_type(name: str, path: Path, data: Any) -> AgentTypeSp
 
 
 def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
-    if not text.startswith("---"):
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].rstrip("\r\n") != "---":
         return {}, text
-    end = text.find("\n---", 3)
-    if end == -1:
-        return {}, text
-    raw = text[3:end].strip()
-    body = text[end + 4 :].lstrip("\n")
-    try:
-        data = _read_yaml_text(raw)
-    except Exception:
-        data = {}
+    end = next(
+        (
+            index
+            for index, line in enumerate(lines[1:], start=1)
+            if line.rstrip("\r\n") == "---"
+        ),
+        None,
+    )
+    if end is None:
+        raise ValueError("unterminated Markdown frontmatter")
+    raw = "".join(lines[1:end]).strip()
+    body = "".join(lines[end + 1 :]).lstrip("\r\n")
+    data = _read_yaml_text(raw)
     return (data if isinstance(data, dict) else {}, body)
 
 
@@ -237,11 +245,22 @@ def _read_simple_yaml_text(text: str) -> dict[str, Any]:
     data: dict[str, Any] = {}
     for raw_line in text.splitlines():
         line = raw_line.strip()
-        if not line or line.startswith("#") or ":" not in line:
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("{"):
+            raise ValueError("flow mappings require PyYAML")
+        if ":" not in line:
             continue
         key, value = line.split(":", 1)
+        if value.lstrip().startswith("{"):
+            raise ValueError("flow mappings require PyYAML")
         key = key.strip()
+        turn_limit_key = key.strip("{}").strip().strip("'\"")
+        if turn_limit_key in ("maxTurns", "max_turns"):
+            key = turn_limit_key
         value = value.strip()
+        if value.startswith("[") != value.endswith("]"):
+            raise ValueError("unterminated flow sequence")
         if not key:
             continue
         if key == "maxTurns" and re.fullmatch(r"[+-]?\d+", value):
