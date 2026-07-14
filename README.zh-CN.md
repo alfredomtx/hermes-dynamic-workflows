@@ -62,7 +62,6 @@ plugins:
         notify_on_launch: true        # 启动时向来源 gateway 聊天发送「workflow 已启动」标记
         notify_result_preview_chars: 2000  # 通知中结果预览的截断长度（字符）
         notify_progress_stop_button: true  # 在实时进度气泡上显示可点击的 ⏹ 停止按钮（Telegram；需要支持内联按钮的核心）
-        auto_workflow_effort: xhigh    # /autoflow 开启时，对被引导消息应用的推理强度
         auto_workflow_default_on: false # 为 true 时每个会话默认 ON，除非运行 /autoflow off（会提高所有聊天的成本）
         auto_workflow_min_chars: 24    # 判定为「实质性」消息的最小长度（廉价预过滤，无 LLM 调用）
         orphan_grace_seconds: 900      # 无「PID 已死」信号时，判定为陈旧并回收的空闲时间窗（兜底 PID 复用）
@@ -116,7 +115,8 @@ return await agent("Synthesize the verified findings:\n" + json.dumps(findings))
 ```
 
 - `agent(prompt, opts)` 起一个子代理；`opts` 可带 `schema`（强制结构化输出）、`model`、
-  `agentType`、`isolation="worktree"`、内联 `instructions`/`systemPrompt`、`toolsets`、`allowedTools`、`disallowedTools`。
+  `agentType`、`isolation="worktree"`、内联 `instructions`/`systemPrompt`、`reasoningEffort`、`toolsets`、`allowedTools`、`disallowedTools`。
+  每个子代理必须从内联 `reasoningEffort` 或 agent type preset 的 `reasoning_effort` 解析推理强度；两者都缺失时会在启动前失败。
 - `pipeline`（默认，无栅栏）/ `parallel`（栅栏）做并发；`phase`/`log` 报告进度；
   `workflow()` 内联跑命名工作流；`args` / `budget` 取入参与 token 预算。
 
@@ -166,13 +166,14 @@ return await agent("Synthesize: " + json.dumps(findings), {"agentType": "synthes
 name: my-agent
 description: "简短描述这个 agent 的用途,模型会根据描述自动选择合适的 agent。"
 model: inherit
+reasoning_effort: high
 toolsets: [web, file, terminal]
 ---
 
 你可以在这里写 agent 的 system prompt,指导它的行为、风格和约束。
 ```
 `name` 和 `description` 必填,`model` 默认 `inherit`(继承当前会话模型),
-`toolsets` 默认走全局 `default_child_toolsets`,可选字段还有 `allowed_tools`、`disallowed_tools`、`isolation`。
+`toolsets` 默认走全局 `default_child_toolsets`,`reasoning_effort` 必填,可选字段还有 `allowed_tools`、`disallowed_tools`、`isolation`。
 
 运行时持久化脚本与每个子代理的完整执行链路（transcript），并在完成时把
 `<task-notification>` 注入对话——无需轮询。用 `/workflows` 看历史与详情。

@@ -231,6 +231,7 @@ class ResolvedAgentSpec:
     workspace: str = ""
     warnings: tuple[str, ...] = ()
     max_turns: int | None = None
+    reasoning_effort: str | None = None
 
     @property
     def agent_type_name(self) -> str | None:
@@ -252,6 +253,8 @@ class ResolvedAgentSpec:
         }
         if self.max_turns is not None:
             inputs["maxTurns"] = self.max_turns
+        if self.reasoning_effort is not None:
+            inputs["reasoningEffort"] = self.reasoning_effort
         return inputs
 
 
@@ -273,6 +276,7 @@ class ChildAgentRequest:
     on_update: Callable[[dict[str, Any]], None] | None = None
     resolved: ResolvedAgentSpec | None = None
     max_turns: int | None = None
+    reasoning_effort: str | None = None
 
 
 class ChildAgentRunner:

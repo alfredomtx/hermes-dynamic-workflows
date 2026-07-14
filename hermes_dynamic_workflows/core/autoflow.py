@@ -2,13 +2,9 @@
 
 A per-session mode, toggled with ``/autoflow on|off`` in the gateway. While a
 session is ON, the ``pre_gateway_dispatch`` hook (see
-``adapters/autoflow_hook.py``) does two things to each *substantive* inbound
-message:
-
-1. bumps the session's reasoning effort to ``auto_workflow_effort`` (the
-   "xhigh" half of Claude Code's ultracode), and
-2. appends a steering directive to the message text that nudges the model to
-   prefer the ``workflow`` tool (the "auto-workflow" half).
+``adapters/autoflow_hook.py``) appends a steering directive to each
+*substantive* inbound message that nudges the model to prefer the ``workflow``
+tool.
 
 This module is deliberately gateway-free: it holds only the per-session state
 store and the pure decision helpers, so it can be unit-tested without a live
@@ -55,11 +51,9 @@ STEERING_DIRECTIVE = (
 class AutoflowState:
     """Thread-safe per-session ON/OFF store.
 
-    Keyed by the gateway's canonical session_key (the same key
-    ``_set_session_reasoning_override`` / ``_resolve_session_reasoning_config``
-    use). Sticky: a session's explicit `/autoflow on|off` choice persists for
-    the process lifetime (not persisted to disk, matching ultracode resetting
-    on a new session).
+    Keyed by the gateway's canonical session_key. Sticky: a session's explicit
+    `/autoflow on|off` choice persists for the process lifetime (not persisted
+    to disk, matching ultracode resetting on a new session).
 
     Override semantics: the store records only EXPLICIT per-session choices. A
     session with no explicit choice resolves to the ``default`` passed to
@@ -133,12 +127,11 @@ def parse_toggle_command(text: str) -> str | None:
 
 
 def is_substantive(text: str, min_chars: int) -> bool:
-    """Cheap prefilter: is this message worth steering/effort-bumping?
+    """Cheap prefilter: is this message worth steering?
 
     Pure length gate on the stripped text — no LLM call. Trivial acks fall
-    through untouched so they don't pay xhigh latency. A command-like message
-    (starts with ``/`` or ``!``) is never substantive: slash commands route to
-    their own handlers, not the agent.
+    through untouched. A command-like message (starts with ``/`` or ``!``) is
+    never substantive: slash commands route to their own handlers, not the agent.
     """
     if not isinstance(text, str):
         return False

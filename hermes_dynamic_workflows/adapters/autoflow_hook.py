@@ -25,8 +25,7 @@ Behavior:
 * ``/autoflow on|off|status`` (or ``!autoflow`` / bare ``autoflow``): flips or
   reports the per-session mode, sends a confirmation, and skips the LLM turn.
 * While ON, a *substantive* inbound message gets the steering directive
-  appended (``rewrite``) and the session's reasoning effort bumped to
-  ``auto_workflow_effort``. Trivial/short messages and slash commands pass
+  appended (``rewrite``). Trivial/short messages and slash commands pass
   through untouched (``allow``).
 * Gateway-only; CLI/TUI are unaffected (this hook only fires in the gateway
   dispatch path).
@@ -99,18 +98,6 @@ def _send_confirmation(gateway: Any, source: Any, message: str) -> None:
         logger.debug("autoflow: no running loop for confirmation send")
 
 
-def _bump_effort(gateway: Any, session_key: str, effort: str) -> None:
-    """Set the session reasoning override to the autoflow effort level."""
-    try:
-        from hermes_constants import parse_reasoning_effort
-
-        cfg = parse_reasoning_effort(effort)
-        if cfg is not None:
-            gateway._set_session_reasoning_override(session_key, cfg)
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("autoflow: effort bump failed: %s", exc)
-
-
 def pre_gateway_dispatch_handler(
     event: Any = None,
     gateway: Any = None,
@@ -156,18 +143,11 @@ def pre_gateway_dispatch_handler(
                 gateway,
                 source,
                 "autoflow ON. Substantive messages this session will be "
-                f"steered toward the workflow tool at {cfg.auto_workflow_effort} "
-                "reasoning effort. Launch approval still applies. "
+                "steered toward the workflow tool. Launch approval still applies. "
                 "Turn off with /autoflow off.",
             )
         elif command == "off":
             store.set(session_key, False)
-            # Clear the effort override we may have set so effort returns to
-            # the session/config default.
-            try:
-                gateway._set_session_reasoning_override(session_key, None)
-            except Exception:
-                pass
             _send_confirmation(gateway, source, "autoflow OFF. Back to normal turn-by-turn handling.")
         else:  # status
             on = store.is_on(session_key, default_on)
@@ -182,7 +162,6 @@ def pre_gateway_dispatch_handler(
         return {"action": "skip", "reason": "autoflow-toggle"}
 
     if kind == "steer":
-        _bump_effort(gateway, session_key, cfg.auto_workflow_effort)
         return {"action": "rewrite", "text": decision.get("text") or text}
 
     return None

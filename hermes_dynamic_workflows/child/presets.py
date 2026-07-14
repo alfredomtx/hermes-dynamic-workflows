@@ -11,6 +11,9 @@ from typing import Any
 from ..storage.store import default_store_root
 
 
+REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
+
+
 @dataclass(frozen=True)
 class AgentTypeSpec:
     name: str
@@ -25,14 +28,22 @@ class AgentTypeSpec:
     toolsets_explicit: bool = False
     allowed_tools_explicit: bool = False
     max_turns: int | None = None
+    reasoning_effort: str | None = None
 
 
-def build_runtime_agent_type(name: str, data: Any, *, source: str) -> AgentTypeSpec:
+def build_runtime_agent_type(
+    name: str,
+    data: Any,
+    *,
+    source: str,
+    reasoning_key: str = "reasoningEffort",
+) -> AgentTypeSpec:
     """Build an in-memory agent type from meta["agents"] or structured files."""
     clean_name = _validate_runtime_agent_name(str(name or ""), source=source)
     if not isinstance(data, dict):
         raise ValueError(f"{source} must be an object")
     max_turns = _max_turns_from(data, source=source)
+    reasoning_effort = _reasoning_effort_from(data, source=source, key=reasoning_key)
     spec_name = _validate_runtime_agent_name(
         str(data.get("name") or clean_name), source=source
     )
@@ -70,6 +81,7 @@ def build_runtime_agent_type(name: str, data: Any, *, source: str) -> AgentTypeS
         toolsets_explicit=toolsets_explicit,
         allowed_tools_explicit=allowed_tools_explicit,
         max_turns=max_turns,
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -97,9 +109,26 @@ def resolve_agent_type(name: str | None, *, cwd: str | None = None) -> AgentType
     if path is not None:
         return _load_agent_type_file(clean, path)
 
-    for spec in list_agent_types(cwd=cwd):
-        if spec.name == clean:
-            return spec
+    for base in _agent_type_bases(cwd):
+        if not base.is_dir():
+            continue
+        for candidate in sorted(base.rglob("*")):
+            if not candidate.is_file() or candidate.suffix.lower() not in {
+                ".md",
+                ".yaml",
+                ".yml",
+                ".json",
+            }:
+                continue
+            try:
+                rel = candidate.resolve().relative_to(base.resolve())
+                spec = _load_agent_type_file(str(rel.with_suffix("")), candidate)
+            except Exception:
+                if _declared_agent_name(candidate) == clean:
+                    raise
+                continue
+            if spec.name == clean:
+                return spec
     return None
 
 
@@ -191,6 +220,11 @@ def _load_markdown_agent_type(name: str, path: Path) -> AgentTypeSpec:
         toolsets_explicit=("toolsets" in frontmatter or "tools" in frontmatter),
         allowed_tools_explicit=("allowed_tools" in frontmatter or "allowedTools" in frontmatter),
         max_turns=_max_turns_from(frontmatter, source=str(path)),
+        reasoning_effort=_reasoning_effort_from(
+            frontmatter,
+            source=str(path),
+            key="reasoning_effort",
+        ),
     )
 
 
@@ -200,7 +234,12 @@ def _load_structured_agent_type(name: str, path: Path, data: Any) -> AgentTypeSp
     data = dict(data)
     data.setdefault("name", Path(name).stem)
     try:
-        return build_runtime_agent_type(str(data.get("name") or name), data, source=str(path))
+        return build_runtime_agent_type(
+            str(data.get("name") or name),
+            data,
+            source=str(path),
+            reasoning_key="reasoning_effort",
+        )
     except ValueError as exc:
         raise ValueError(f"invalid agentType file {path}: {exc}") from exc
 
@@ -282,6 +321,40 @@ def _max_turns_from(data: dict[str, Any], *, source: str) -> int | None:
     if type(value) is not int or not 1 <= value <= 1000:
         raise ValueError(f"{source} maxTurns must be an integer from 1 to 1000")
     return value
+
+
+def _reasoning_effort_from(
+    data: dict[str, Any],
+    *,
+    source: str,
+    key: str,
+) -> str | None:
+    alias = "reasoning_effort" if key == "reasoningEffort" else "reasoningEffort"
+    if alias in data:
+        raise ValueError(f"{source} {alias} is not supported; use {key}")
+    if key not in data:
+        return None
+    value = data[key]
+    if type(value) is not str or value not in REASONING_EFFORTS:
+        allowed = ", ".join(REASONING_EFFORTS)
+        raise ValueError(f"{source} {key} must be one of: {allowed}")
+    return value
+
+
+def _declared_agent_name(path: Path) -> str | None:
+    try:
+        if path.suffix.lower() == ".json":
+            data = _read_json(path)
+        elif path.suffix.lower() in {".yaml", ".yml"}:
+            data = _read_yaml(path)
+        else:
+            data, _ = _parse_frontmatter(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get("name")
+    return str(value).strip() if isinstance(value, str) and value.strip() else None
 
 
 def _as_tuple(value: Any) -> tuple[str, ...]:

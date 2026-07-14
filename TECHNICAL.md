@@ -42,7 +42,7 @@ required; `whenToUse`, `phases`, and `agents` optional). `meta["agents"]` is a p
 
 | Global | Signature | Description |
 |---|---|---|
-| `agent` | `await agent(prompt, opts=None)` | Spawns a subagent. Without a schema it returns text; with `schema` it returns the validated object. `opts`: `label` `phase` `schema` `model` `isolation` `agentType` `instructions`/`systemPrompt` `toolsets` `allowedTools`/`allowed_tools` `disallowedTools`/`disallowed_tools`. Returns `None` if skipped by the user. |
+| `agent` | `await agent(prompt, opts=None)` | Spawns a subagent. Without a schema it returns text; with `schema` it returns the validated object. `opts`: `label` `phase` `schema` `model` `isolation` `agentType` `instructions`/`systemPrompt` `reasoningEffort` `toolsets` `allowedTools`/`allowed_tools` `disallowedTools`/`disallowed_tools`. `reasoningEffort` overrides the selected agent-type preset; missing effort fails before launch. Returns `None` if skipped by the user. |
 | `pipeline` | `await pipeline(items, stage1, …)` | Each item flows through the stages independently, **no barrier**. Stage callbacks receive `(prev, original, index)`; if a stage throws → that item becomes `None`. The default for multi-stage work. |
 | `parallel` | `await parallel(thunks)` | Runs concurrently, **with a barrier**: returns only once all complete. A single failure → `None` in the results (the whole call does not throw). |
 | `phase` | `phase(title)` | Starts a progress group. |
@@ -418,7 +418,7 @@ ought to have. Tool inputs / `meta` / config / environment cannot set `total`.
 ## agentType / inline agents / worktree / Named Workflows
 
 - **Inline agent opts**: `agent("task", {"instructions": "read-only reviewer", "toolsets": ["file"], "allowedTools": ["read_file", "search_files"]})` builds an in-memory agent preset for one call. `toolsets: []` is intentional no tools. `allowedTools: []` denies all normal tools; schema children still keep `structured_output` so they can submit results.
-- **Runtime presets**: `meta["agents"]` defines reusable in-script presets. Example: `meta = {"name":"x", "description":"x", "agents": {"reviewer": {"instructions":"Review only", "toolsets":["file"]}}}` then `agent(..., {"agentType":"reviewer"})`.
+- **Runtime presets**: `meta["agents"]` defines reusable in-script presets. Example: `meta = {"name":"x", "description":"x", "agents": {"reviewer": {"instructions":"Review only", "toolsets":["file"], "reasoningEffort":"medium"}}}` then `agent(..., {"agentType":"reviewer"})`.
 - **Library agentType files**: explicit `agentType` resolution order is runtime `meta["agents"]` → project `.hermes/dynamic-workflows/agents/<name>.{md,yaml,json}` → user `~/.hermes/dynamic-workflows/agents/<name>.…` → plugin built-in `agents/<name>.md`. Markdown supports YAML frontmatter (`model` / `toolsets` / `allowed_tools` / `disallowed_tools` / `isolation`, …). Built-in: `explore`, `general-purpose`, `plan`, `verification`.
 - **Missing names**: explicit missing `agentType` raises before child launch by default (`missing_agent_type_policy: error`). Opt-in `fallback_warn` logs a visible warning and falls back to `general-purpose`. Omitted `agentType` still uses `general-purpose` normally.
 - **Tool-surface composition**: inline opts overlay the selected preset. Inline `toolsets` replace preset toolsets exactly and are not widened by discoverable MCP/plugin toolsets. Preset+inline allowlists intersect; denylists union. Blocked child toolsets still win.

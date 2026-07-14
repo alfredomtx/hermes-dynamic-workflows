@@ -40,7 +40,11 @@ from hermes_dynamic_workflows.child.runner import (
 from hermes_dynamic_workflows.child.worktree import WorkspaceLease, create_workspace_lease
 from hermes_dynamic_workflows.core.config import PluginConfig
 from hermes_dynamic_workflows.core.errors import ChildAgentError
-from hermes_dynamic_workflows.core.types import ChildAgentRequest, ChildAgentResult
+from hermes_dynamic_workflows.core.types import (
+    ChildAgentRequest,
+    ChildAgentResult,
+    ResolvedAgentSpec,
+)
 from hermes_dynamic_workflows.child.structured_output import (
     MAX_STRUCTURED_OUTPUT_RETRIES,
     STRUCTURED_OUTPUT_CONTINUE_MESSAGE,
@@ -681,6 +685,75 @@ Review from the user-wide workflow agent store.
         self.assertIn("user-wide workflow agent store", spec.instructions)
 
 
+class ReasoningEffortPresetTests(unittest.TestCase):
+    def _agent_dir(self, root: Path) -> Path:
+        path = root / ".hermes" / "dynamic-workflows" / "agents"
+        path.mkdir(parents=True)
+        return path
+
+    def test_file_preset_loads_explicit_effort(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._agent_dir(Path(tmp)) / "researcher.md"
+            path.write_text(
+                "---\nreasoning_effort: high\n---\nResearch.\n",
+                encoding="utf-8",
+            )
+            spec = resolve_agent_type("researcher", cwd=tmp)
+
+        self.assertIsNotNone(spec)
+        assert spec is not None
+        self.assertEqual(spec.reasoning_effort, "high")
+
+    def test_file_preset_rejects_noncanonical_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._agent_dir(Path(tmp)) / "researcher.yaml"
+            path.write_text(
+                "instructions: Research.\nreasoningEffort: high\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError) as ctx:
+                resolve_agent_type("researcher", cwd=tmp)
+
+        self.assertIn(str(path), str(ctx.exception))
+        self.assertIn("reasoningEffort is not supported; use reasoning_effort", str(ctx.exception))
+
+    def test_invalid_file_efforts_name_the_source(self):
+        cases = {
+            "null": "null",
+            "boolean": "true",
+            "empty": "''",
+            "disabled": "none",
+            "uppercase": "HIGH",
+            "number": "1",
+            "unknown": "turbo",
+        }
+        for name, value in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                path = self._agent_dir(Path(tmp)) / f"{name}.yaml"
+                path.write_text(
+                    f"instructions: Research.\nreasoning_effort: {value}\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaises(ValueError) as ctx:
+                    resolve_agent_type(name, cwd=tmp)
+
+                self.assertIn(str(path), str(ctx.exception))
+                self.assertIn("reasoning_effort must be one of", str(ctx.exception))
+
+    def test_invalid_named_preset_preserves_source_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._agent_dir(Path(tmp)) / "different-filename.yaml"
+            path.write_text(
+                "name: named-researcher\ninstructions: Research.\nreasoning_effort: turbo\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError) as ctx:
+                resolve_agent_type("named-researcher", cwd=tmp)
+
+        self.assertIn(str(path), str(ctx.exception))
+        self.assertIn("reasoning_effort must be one of", str(ctx.exception))
+
+
 class MaxTurnsPresetTests(unittest.TestCase):
     def _agent_dir(self, root: Path) -> Path:
         path = root / ".hermes" / "dynamic-workflows" / "agents"
@@ -1101,6 +1174,7 @@ class ToolCallCountTests(unittest.TestCase):
             label="search:models",
             phase=None,
             toolsets=[],
+            reasoning_effort="high",
         )
         lease = WorkspaceLease(task_id="workflow-abc123", cwd="/tmp")
         runtime = {"model": "test-model"}
@@ -1399,8 +1473,104 @@ class StructuredOutputContinuationTests(unittest.TestCase):
         self.assertEqual(child.calls, MAX_STRUCTURED_OUTPUT_RETRIES)
 
 
+class ReasoningEffortRunnerTests(unittest.TestCase):
+    def test_runner_rejects_request_without_resolved_effort(self):
+        runner = HermesChildAgentRunner(PluginConfig())
+        request = ChildAgentRequest(1, "work", "worker", None, [])
+
+        with patch.object(
+            runner,
+            "_resolve_runtime",
+            side_effect=AssertionError("runtime resolution reached"),
+        ) as resolve_runtime:
+            with self.assertRaisesRegex(ChildAgentError, "resolved reasoning effort"):
+                runner.run(request)
+
+        resolve_runtime.assert_not_called()
+
+    def test_build_agent_uses_child_effort_and_scrubs_parent_overrides(self):
+        seen = []
+
+        class FakeAIAgent:
+            def __init__(self, **kwargs):
+                seen.append(kwargs)
+
+        run_agent_mod = types.ModuleType("run_agent")
+        run_agent_mod.AIAgent = FakeAIAgent
+        runner = HermesChildAgentRunner(PluginConfig())
+        lease = WorkspaceLease(task_id="reasoning-child", cwd="/tmp")
+        runtime = {
+            "model": "test-model",
+            "reasoning_config": {"enabled": True, "effort": "xhigh"},
+            "request_overrides": {
+                "reasoning": {"effort": "xhigh"},
+                "reasoning_effort": "xhigh",
+                "reasoning_config": {"enabled": True, "effort": "xhigh"},
+                "extra_body": {
+                    "reasoning": {"effort": "xhigh"},
+                    "reasoning_effort": "xhigh",
+                    "routing": "session",
+                },
+            },
+        }
+        request = ChildAgentRequest(
+            1,
+            "work",
+            "worker",
+            None,
+            [],
+            reasoning_effort="low",
+        )
+
+        with patch.dict(sys.modules, {"run_agent": run_agent_mod}):
+            runner._build_agent(request, runtime, [], lease, None)
+
+        self.assertEqual(seen[0]["reasoning_config"], {"enabled": True, "effort": "low"})
+        self.assertEqual(
+            seen[0]["request_overrides"],
+            {"extra_body": {"routing": "session"}},
+        )
+
+    def test_build_agent_sets_effort_without_parent_reasoning_state(self):
+        seen = []
+
+        class FakeAIAgent:
+            def __init__(self, **kwargs):
+                seen.append(kwargs)
+
+        run_agent_mod = types.ModuleType("run_agent")
+        run_agent_mod.AIAgent = FakeAIAgent
+        runner = HermesChildAgentRunner(PluginConfig())
+        request = ChildAgentRequest(
+            1,
+            "work",
+            "worker",
+            None,
+            [],
+            model="other-model",
+            reasoning_effort="high",
+        )
+
+        with patch.dict(sys.modules, {"run_agent": run_agent_mod}):
+            runner._build_agent(
+                request,
+                {"model": "other-model"},
+                [],
+                WorkspaceLease(task_id="reasoning-model-override", cwd="/tmp"),
+                None,
+            )
+
+        self.assertEqual(seen[0]["reasoning_config"], {"enabled": True, "effort": "high"})
+
+
 class MaxTurnsRunnerTests(unittest.TestCase):
     def _request(self, max_turns: int | None = 2, *, structured=True):
+        agent_type = AgentTypeSpec(
+            name="general-purpose",
+            instructions="Work.",
+            source="test",
+            reasoning_effort="high",
+        )
         return ChildAgentRequest(
             id=1,
             prompt="return status",
@@ -1410,6 +1580,12 @@ class MaxTurnsRunnerTests(unittest.TestCase):
             schema={"type": "object"} if structured else None,
             structured_tool=structured,
             max_turns=max_turns,
+            resolved=ResolvedAgentSpec(
+                requested_agent_type="general-purpose",
+                agent_type_spec=agent_type,
+                reasoning_effort="high",
+            ),
+            reasoning_effort="high",
         )
 
     def _run_structured(self, child, request, task_id):
@@ -1572,30 +1748,50 @@ class MaxTurnsRunnerTests(unittest.TestCase):
         create_lease.assert_not_called()
         build_agent.assert_not_called()
 
-    def test_codex_runtime_omission_keeps_existing_launch_path(self):
+    def test_codex_runtime_without_turn_cap_rejects_unsupported_effort(self):
         runner = HermesChildAgentRunner(PluginConfig())
         request = self._request(None, structured=False)
-        lease = WorkspaceLease(task_id="codex-uncapped", cwd="/tmp")
-        child = types.SimpleNamespace()
-        expected = ChildAgentResult(content="done")
         with (
             patch(
-                "hermes_dynamic_workflows.child.runner.create_workspace_lease",
-                return_value=lease,
-            ),
+                "hermes_dynamic_workflows.child.runner.create_workspace_lease"
+            ) as create_lease,
             patch.object(
                 runner,
                 "_resolve_runtime",
                 return_value={"api_mode": "codex_app_server", "model": "test"},
             ),
-            patch("hermes_dynamic_workflows.child.runner._prepare_mcp_tool_registry"),
-            patch.object(runner, "_build_agent", return_value=child) as build_agent,
-            patch("hermes_dynamic_workflows.child.runner._configure_child_tools"),
-            patch.object(runner, "_run_child_with_timeout", return_value=expected),
+            patch.object(runner, "_build_agent") as build_agent,
         ):
-            result = runner.run(request)
-        self.assertIs(result, expected)
-        build_agent.assert_called_once()
+            with self.assertRaisesRegex(ChildAgentError, "reasoningEffort.*codex_app_server"):
+                runner.run(request)
+        create_lease.assert_not_called()
+        build_agent.assert_not_called()
+
+    def test_bedrock_primary_and_fallback_rejected_before_workspace_creation(self):
+        request = self._request(None, structured=False)
+        runtimes = (
+            {"provider": "bedrock", "api_mode": "bedrock_converse", "model": "claude"},
+            {
+                "provider": "openai-codex",
+                "api_mode": "codex_responses",
+                "model": "gpt",
+                "fallback_model": [{"provider": "aws-bedrock", "model": "claude"}],
+            },
+        )
+        for runtime in runtimes:
+            with self.subTest(runtime=runtime):
+                runner = HermesChildAgentRunner(PluginConfig())
+                with (
+                    patch(
+                        "hermes_dynamic_workflows.child.runner.create_workspace_lease"
+                    ) as create_lease,
+                    patch.object(runner, "_resolve_runtime", return_value=runtime),
+                    patch.object(runner, "_build_agent") as build_agent,
+                ):
+                    with self.assertRaisesRegex(ChildAgentError, "reasoningEffort.*bedrock"):
+                        runner.run(request)
+                create_lease.assert_not_called()
+                build_agent.assert_not_called()
 
     def test_constructor_kwarg_only_present_for_explicit_cap(self):
         seen = []
@@ -1611,14 +1807,29 @@ class MaxTurnsRunnerTests(unittest.TestCase):
         runtime = {"model": "test-model"}
         with patch.dict(sys.modules, {"run_agent": run_agent_mod}):
             runner._build_agent(
-                ChildAgentRequest(1, "work", "uncapped", None, []),
+                ChildAgentRequest(
+                    1,
+                    "work",
+                    "uncapped",
+                    None,
+                    [],
+                    reasoning_effort="high",
+                ),
                 runtime,
                 [],
                 lease,
                 None,
             )
             runner._build_agent(
-                ChildAgentRequest(2, "work", "capped", None, [], max_turns=7),
+                ChildAgentRequest(
+                    2,
+                    "work",
+                    "capped",
+                    None,
+                    [],
+                    max_turns=7,
+                    reasoning_effort="high",
+                ),
                 runtime,
                 [],
                 lease,
@@ -1640,7 +1851,15 @@ class MaxTurnsRunnerTests(unittest.TestCase):
         lease = WorkspaceLease(task_id="build-capped-summary", cwd="/tmp")
         with patch.dict(sys.modules, {"run_agent": run_agent_mod}):
             child = runner._build_agent(
-                ChildAgentRequest(1, "work", "capped", None, [], max_turns=1),
+                ChildAgentRequest(
+                    1,
+                    "work",
+                    "capped",
+                    None,
+                    [],
+                    max_turns=1,
+                    reasoning_effort="high",
+                ),
                 {"model": "test-model"},
                 [],
                 lease,
@@ -1952,6 +2171,7 @@ class StructuredOutputSurvivesRealMcpRefreshTests(unittest.TestCase):
             label="schema-agent",
             phase=None,
             toolsets=["file"],
+            reasoning_effort="high",
         )
         lease = WorkspaceLease(task_id="workflow-int001", cwd="/tmp")
         runtime = {"model": "test-model"}

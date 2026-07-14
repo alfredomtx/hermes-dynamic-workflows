@@ -174,10 +174,11 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         sends = gw.adapters["telegram"].sends
         self.assertEqual(len(sends), 1)
         self.assertIn("autoflow ON", sends[0]["content"])
+        self.assertNotIn("reasoning effort", sends[0]["content"])
         # Topic targeting preserved.
         self.assertEqual(sends[0]["metadata"], {"thread_id": "7"})
 
-    async def test_steer_rewrites_and_bumps_effort_when_on(self):
+    async def test_steer_rewrites_without_changing_parent_effort(self):
         gw = FakeGateway()
         src = FakeSource(thread_id="7")
         autoflow.state().set(gw._session_key, True)
@@ -187,19 +188,21 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["action"], "rewrite")
         self.assertIn("[autoflow on]", result["text"])
         self.assertIn(msg, result["text"])
-        # Effort override bumped to xhigh (default).
-        self.assertEqual(gw.reasoning_overrides.get(gw._session_key), {"enabled": True, "effort": "xhigh"})
+        self.assertEqual(gw.reasoning_overrides, {})
 
-    async def test_off_clears_state_and_override(self):
+    async def test_off_clears_state_without_changing_parent_effort(self):
         gw = FakeGateway()
         src = FakeSource(thread_id="7")
         autoflow.state().set(gw._session_key, True)
-        gw.reasoning_overrides[gw._session_key] = {"enabled": True, "effort": "xhigh"}
+        existing = {"enabled": True, "effort": "low"}
+        gw.reasoning_overrides[gw._session_key] = existing
         result = pre_gateway_dispatch_handler(event=FakeEvent("/autoflow off", src), gateway=gw)
         self.assertEqual(result, {"action": "skip", "reason": "autoflow-toggle"})
         self.assertFalse(autoflow.state().is_on(gw._session_key))
-        # Override cleared (set to None).
-        self.assertIsNone(gw.reasoning_overrides.get(gw._session_key))
+        self.assertEqual(gw.reasoning_overrides.get(gw._session_key), existing)
+
+    async def test_plugin_config_has_no_autoflow_effort_setting(self):
+        self.assertFalse(hasattr(PluginConfig(), "auto_workflow_effort"))
 
     async def test_pass_when_off(self):
         gw = FakeGateway()
@@ -237,7 +240,7 @@ class DefaultOnHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(result, dict)
         self.assertEqual(result["action"], "rewrite")
         self.assertIn("[autoflow on]", result["text"])
-        self.assertEqual(gw.reasoning_overrides.get(gw._session_key), {"enabled": True, "effort": "xhigh"})
+        self.assertEqual(gw.reasoning_overrides, {})
 
     async def test_default_on_explicit_off_disables_session(self):
         gw = FakeGateway()

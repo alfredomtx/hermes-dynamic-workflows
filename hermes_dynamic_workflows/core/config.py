@@ -127,24 +127,15 @@ class PluginConfig:
     notify_progress_cost: bool = True
     # --- Autoflow (ultracode-style auto-workflow steering) ---------------
     # A per-session mode toggled with `/autoflow on|off` in the gateway. While
-    # ON for a session, each substantive inbound message (a) bumps reasoning
-    # effort to auto_workflow_effort and (b) gets a steering directive appended
-    # that nudges the model to prefer the `workflow` tool. It is a NUDGE, not a
-    # hard force (matching Claude Code's ultracode "Claude decides" model), it
-    # is gateway-only, and launch approval still applies. Default per-session
-    # state is OFF; these keys only set the behavior once a session opts in.
+    # ON for a session, each substantive inbound message gets a steering
+    # directive appended that nudges the model to prefer the `workflow` tool.
+    # It is a NUDGE, not a hard force, it is gateway-only, and launch approval
+    # still applies. Default per-session state is OFF.
     #
     # auto_workflow_default_on flips that baseline: when true, EVERY gateway
-    # session starts ON (substantive messages steered + effort-bumped) unless
-    # that session explicitly runs `/autoflow off`. Shipped default is false —
-    # enable in config.yaml only for benchmarking / always-orchestrate setups,
-    # since it raises cost across every connected chat. Launch approval still
-    # applies independently (require_launch_approval).
+    # session starts ON unless that session explicitly runs `/autoflow off`.
     auto_workflow_default_on: bool = False
-    auto_workflow_effort: str = "xhigh"
-    # Minimum stripped-text length for a message to count as "substantive" and
-    # be steered/effort-bumped. Trivial replies ("ok", "thanks") fall through
-    # untouched so they don't pay xhigh latency. Cheap prefilter, no LLM call.
+    # Minimum stripped-text length for a message to count as substantive.
     auto_workflow_min_chars: int = 24
     # --- Orphan reaping + auto-resume ------------------------------------
     # A workflow run executes inside the Hermes process that launched it (the
@@ -376,14 +367,6 @@ def load_config() -> PluginConfig:
                 raw.get("auto_workflow_default_on"),
             ),
             default.auto_workflow_default_on,
-        ),
-        auto_workflow_effort=_as_mode(
-            os.getenv(
-                "HERMES_DYNAMIC_WORKFLOWS_AUTO_WORKFLOW_EFFORT",
-                raw.get("auto_workflow_effort"),
-            ),
-            default.auto_workflow_effort,
-            {"minimal", "low", "medium", "high", "xhigh", "max"},
         ),
         auto_workflow_min_chars=_as_int(
             raw.get("auto_workflow_min_chars"),

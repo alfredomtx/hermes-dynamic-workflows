@@ -338,6 +338,7 @@ meta = {
             "instructions": "RUNTIME READER",
             "toolsets": ["file"],
             "allowedTools": ["read_file"],
+            "reasoningEffort": "medium",
         }
     },
 }
@@ -363,6 +364,7 @@ meta = {
             "toolsets": ["file"],
             "allowedTools": ["read_file"],
             "model": "inherit",
+            "reasoningEffort": "medium",
         }
     },
 }
@@ -389,7 +391,11 @@ meta = {
     "name": "runtime-precedence",
     "description": "Test workflow",
     "agents": {
-        "reader": {"instructions": "META WINS", "toolsets": ["file"]}
+        "reader": {
+            "instructions": "META WINS",
+            "toolsets": ["file"],
+            "reasoningEffort": "medium",
+        }
     },
 }
 
@@ -575,7 +581,7 @@ return await agent("work", {"agentType": "planner"})
             agent_dir = Path(tmp) / ".hermes" / "dynamic-workflows" / "agents"
             agent_dir.mkdir(parents=True)
             (agent_dir / "planner.md").write_text(
-                "---\nname: planner\nmodel: inherit\n---\n\nPlan carefully.\n",
+                "---\nname: planner\nmodel: inherit\nreasoning_effort: high\n---\n\nPlan carefully.\n",
                 encoding="utf-8",
             )
             runner = FakeRunner()
@@ -894,7 +900,10 @@ return await agent("same prompt", {"agentType": "researcher"})
             agent_dir = Path(tmp) / ".hermes" / "dynamic-workflows" / "agents"
             agent_dir.mkdir(parents=True)
             agent_file = agent_dir / "researcher.md"
-            agent_file.write_text("Version one.", encoding="utf-8")
+            agent_file.write_text(
+                "---\nreasoning_effort: medium\n---\nVersion one.\n",
+                encoding="utf-8",
+            )
             first_cache = ResumeCache()
             run_workflow(
                 script,
@@ -904,7 +913,10 @@ return await agent("same prompt", {"agentType": "researcher"})
                     resume_cache=first_cache,
                 ),
             )
-            agent_file.write_text("Version two.", encoding="utf-8")
+            agent_file.write_text(
+                "---\nreasoning_effort: medium\n---\nVersion two.\n",
+                encoding="utf-8",
+            )
             second_runner = FakeRunner()
             run_workflow(
                 script,
@@ -944,13 +956,156 @@ return await agent("same prompt")
         self.assertEqual(len(second_runner.requests), 1)
 
 
+class ReasoningEffortRuntimeTests(unittest.TestCase):
+    def test_inline_effort_overrides_runtime_preset_and_is_recorded(self):
+        script = """
+meta = {
+    "name": "reasoning-inline",
+    "description": "Test workflow",
+    "agents": {
+        "researcher": {
+            "instructions": "Research.",
+            "reasoningEffort": "low",
+        }
+    },
+}
+return await agent(
+    "go",
+    {"agentType": "researcher", "reasoningEffort": "high"},
+)
+"""
+        runner = FakeRunner()
+        result = run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+
+        request = runner.requests[0]
+        self.assertEqual(request.reasoning_effort, "high")
+        self.assertIsNotNone(request.resolved)
+        assert request.resolved is not None
+        self.assertEqual(request.resolved.reasoning_effort, "high")
+        self.assertEqual(result.state.snapshot()["agents"][0]["reasoning_effort"], "high")
+
+    def test_runtime_preset_effort_is_used_when_inline_is_absent(self):
+        script = """
+meta = {
+    "name": "reasoning-preset",
+    "description": "Test workflow",
+    "agents": {
+        "researcher": {
+            "instructions": "Research.",
+            "reasoningEffort": "medium",
+        }
+    },
+}
+return await agent("go", {"agentType": "researcher"})
+"""
+        runner = FakeRunner()
+        run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+
+        request = runner.requests[0]
+        self.assertEqual(request.reasoning_effort, "medium")
+        self.assertIsNotNone(request.resolved)
+        assert request.resolved is not None
+        self.assertEqual(request.resolved.reasoning_effort, "medium")
+
+    def test_missing_effort_fails_before_child_launch(self):
+        script = """
+meta = {
+    "name": "reasoning-missing",
+    "description": "Test workflow",
+    "agents": {"researcher": {"instructions": "Research."}},
+}
+return await agent("go", {"agentType": "researcher"})
+"""
+        runner = FakeRunner()
+        with self.assertRaises(Exception) as ctx:
+            run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+
+        self.assertEqual(runner.requests, [])
+        self.assertIn("reasoningEffort is required", str(ctx.exception))
+        self.assertIn("meta.agents.researcher", str(ctx.exception))
+
+    def test_invalid_inline_efforts_fail_before_child_launch(self):
+        for value in (None, True, False, "", "none", "HIGH", "minimal ", 1, []):
+            script = (
+                'meta = {"name": "reasoning-invalid", "description": "Test workflow"}\n'
+                f'return await agent("go", {{"reasoningEffort": {value!r}}})'
+            )
+            runner = FakeRunner()
+            with self.subTest(value=value), self.assertRaises(Exception) as ctx:
+                run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+            self.assertEqual(runner.requests, [])
+            self.assertIn("agent() reasoningEffort must be one of", str(ctx.exception))
+
+    def test_invalid_runtime_preset_efforts_fail_before_child_launch(self):
+        for value in (None, True, False, "", "none", "HIGH", "minimal ", 1, []):
+            meta = {
+                "name": "reasoning-invalid-preset",
+                "description": "Test workflow",
+                "agents": {
+                    "researcher": {
+                        "instructions": "Research.",
+                        "reasoningEffort": value,
+                    }
+                },
+            }
+            script = f"meta = {meta!r}\nreturn await agent('go', {{'agentType': 'researcher'}})"
+            runner = FakeRunner()
+            with self.subTest(value=value), self.assertRaises(Exception) as ctx:
+                run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+            self.assertEqual(runner.requests, [])
+            self.assertIn(
+                "meta.agents.researcher reasoningEffort must be one of",
+                str(ctx.exception),
+            )
+
+    def test_effort_changes_cache_identity_and_survives_cache_hit(self):
+        def script(effort: str) -> str:
+            return (
+                'meta = {"name": "reasoning-cache", "description": "Test workflow"}\n'
+                f'return await agent("same prompt", {{"reasoningEffort": "{effort}"}})'
+            )
+
+        low_cache = ResumeCache()
+        run_workflow(
+            script("low"),
+            WorkflowOptions(child_runner=FakeRunner(), resume_cache=low_cache),
+        )
+
+        high_runner = FakeRunner()
+        run_workflow(
+            script("high"),
+            WorkflowOptions(
+                child_runner=high_runner,
+                resume_cache=ResumeCache(low_cache.current),
+            ),
+        )
+        self.assertEqual(len(high_runner.requests), 1)
+
+        cached_runner = FakeRunner()
+        cached = run_workflow(
+            script("low"),
+            WorkflowOptions(
+                child_runner=cached_runner,
+                resume_cache=ResumeCache(low_cache.current),
+            ),
+        )
+        self.assertEqual(cached_runner.requests, [])
+        self.assertEqual(cached.state.snapshot()["agents"][0]["reasoning_effort"], "low")
+
+
 class MaxTurnsRuntimeTests(unittest.TestCase):
     def test_inline_overrides_runtime_preset(self):
         script = """
 meta = {
     "name": "bounded-inline",
     "description": "Test workflow",
-    "agents": {"researcher": {"instructions": "Research.", "maxTurns": 20}},
+    "agents": {
+        "researcher": {
+            "instructions": "Research.",
+            "maxTurns": 20,
+            "reasoningEffort": "medium",
+        }
+    },
 }
 return await agent("go", {"agentType": "researcher", "maxTurns": 3})
 """

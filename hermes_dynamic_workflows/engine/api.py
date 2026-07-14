@@ -119,6 +119,7 @@ class WorkflowAPI:
                 agent_type=resolved.agent_type_name,
                 isolation=resolved.isolation or "shared",
                 model=resolved.model,
+                reasoning_effort=resolved.reasoning_effort,
             )
             self.frame.agents.append(record)
             self._notify()
@@ -195,6 +196,7 @@ class WorkflowAPI:
             on_update=on_child_update,
             resolved=resolved,
             max_turns=resolved.max_turns,
+            reasoning_effort=resolved.reasoning_effort,
         )
         if schema:
             record.structured = {
@@ -442,6 +444,7 @@ _PUBLIC_AGENT_OPT_KEYS = frozenset(
         "system_prompt",
         "description",
         "maxTurns",
+        "reasoningEffort",
     }
 )
 
@@ -472,13 +475,14 @@ def _validate_agent_opts(opts: dict[str, Any]) -> None:
             + ", ".join(unknown)
             + ". Public workflow agent options are label, phase, schema, model, "
             "isolation, agentType, toolsets, allowedTools, disallowedTools, "
-            "instructions, systemPrompt, and maxTurns. Provider/runtime, timeout, "
+            "instructions, systemPrompt, maxTurns, and reasoningEffort. Provider/runtime, timeout, "
             "and retry policy belong in Hermes/plugin configuration, not workflow scripts."
         )
-    from ..child.presets import _max_turns_from
+    from ..child.presets import _max_turns_from, _reasoning_effort_from
 
     try:
         _max_turns_from(opts, source="agent()")
+        _reasoning_effort_from(opts, source="agent()", key="reasoningEffort")
     except ValueError as exc:
         raise WorkflowRuntimeError(str(exc)) from exc
 
@@ -588,6 +592,12 @@ def _resolve_agent_spec(
         )
 
     effective_spec = _compose_effective_agent_type(agent_type_spec, opts)
+    reasoning_effort = getattr(effective_spec, "reasoning_effort", None)
+    if reasoning_effort is None:
+        source = str(getattr(effective_spec, "source", "") or requested_type)
+        raise WorkflowRuntimeError(
+            f"{source} reasoningEffort is required; set it on agent() or the resolved agentType"
+        )
     explicit_isolation = _normalize_isolation(opts.get("isolation"))
     agent_type_isolation = _normalize_agent_type_isolation(
         getattr(effective_spec, "isolation", None)
@@ -635,11 +645,12 @@ def _resolve_agent_spec(
         workspace=str(Path(cwd).expanduser().resolve()),
         warnings=tuple(warnings),
         max_turns=getattr(effective_spec, "max_turns", None),
+        reasoning_effort=reasoning_effort,
     )
 
 
 def _compose_effective_agent_type(base_spec: Any, opts: dict[str, Any]) -> Any:
-    from ..child.presets import AgentTypeSpec, _max_turns_from
+    from ..child.presets import AgentTypeSpec, _max_turns_from, _reasoning_effort_from
 
     inline_instructions = _inline_instructions(opts)
     inline_toolsets, inline_toolsets_explicit = _tuple_option(opts, "toolsets", "toolsets")
@@ -650,6 +661,11 @@ def _compose_effective_agent_type(base_spec: Any, opts: dict[str, Any]) -> Any:
         opts, "disallowedTools", "disallowed_tools", field_name="disallowedTools"
     )
     inline_max_turns = _max_turns_from(opts, source="agent()")
+    inline_reasoning_effort = _reasoning_effort_from(
+        opts,
+        source="agent()",
+        key="reasoningEffort",
+    )
 
     instructions = str(getattr(base_spec, "instructions", "") or "").strip()
     source = str(getattr(base_spec, "source", "") or "inline")
@@ -707,6 +723,11 @@ def _compose_effective_agent_type(base_spec: Any, opts: dict[str, Any]) -> Any:
             inline_max_turns
             if "maxTurns" in opts
             else getattr(base_spec, "max_turns", None)
+        ),
+        reasoning_effort=(
+            inline_reasoning_effort
+            if "reasoningEffort" in opts
+            else getattr(base_spec, "reasoning_effort", None)
         ),
     )
 

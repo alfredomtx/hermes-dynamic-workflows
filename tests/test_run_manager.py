@@ -760,7 +760,7 @@ return await agent("inspect metadata", {"label": "meta-agent", "agentType": "res
             agent_types = root / ".hermes" / "dynamic-workflows" / "agents"
             agent_types.mkdir(parents=True)
             (agent_types / "researcher.md").write_text(
-                "Inspect carefully and return raw findings.",
+                "---\nreasoning_effort: high\n---\nInspect carefully and return raw findings.\n",
                 encoding="utf-8",
             )
             manager = WorkflowRunManager(store=WorkflowStore(root / "store"), config=PluginConfig(require_launch_approval=False))

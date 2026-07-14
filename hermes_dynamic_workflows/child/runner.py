@@ -159,11 +159,11 @@ class HermesChildAgentRunner(ChildAgentRunner):
         task_id = f"workflow-{uuid.uuid4().hex[:12]}"
         base_cwd = request.cwd or os.environ.get("TERMINAL_CWD") or os.getcwd()
         resolved = request.resolved
-        agent_type = (
-            resolved.agent_type_spec
-            if resolved is not None
-            else resolve_agent_type(request.agent_type, cwd=base_cwd)
-        )
+        if resolved is None or request.reasoning_effort is None:
+            raise ChildAgentError(
+                "workflow child request is missing a validated resolved reasoning effort"
+            )
+        agent_type = resolved.agent_type_spec
         if request.agent_type and agent_type is None:
             available = ", ".join(spec.name for spec in list_agent_types(cwd=base_cwd)) or "none"
             raise ChildAgentError(
@@ -173,6 +173,12 @@ class HermesChildAgentRunner(ChildAgentRunner):
         if resolved is None:
             request = _apply_agent_type_defaults(request, agent_type)
         runtime = self._resolve_runtime(request)
+        unsupported_runtime = _runtime_without_reasoning_effort(runtime)
+        if unsupported_runtime is not None:
+            raise ChildAgentError(
+                "reasoningEffort is not supported by workflow child runtime "
+                f"'{unsupported_runtime}'"
+            )
         if request.max_turns is not None and runtime.get("api_mode") == "codex_app_server":
             raise ChildAgentError(
                 "maxTurns is not supported by the codex_app_server runtime"
@@ -358,6 +364,10 @@ class HermesChildAgentRunner(ChildAgentRunner):
         lease: WorkspaceLease,
         agent_type: AgentTypeSpec | None,
     ):
+        if request.reasoning_effort is None:
+            raise ChildAgentError(
+                "workflow child request is missing a validated resolved reasoning effort"
+            )
         try:
             from run_agent import AIAgent
         except Exception as exc:
@@ -396,11 +406,15 @@ class HermesChildAgentRunner(ChildAgentRunner):
             "session_db": session_db,
             "session_id": lease.task_id,
         }
-        request_overrides = request.request_overrides or runtime.get("request_overrides")
+        request_overrides = _without_reasoning_overrides(
+            request.request_overrides or runtime.get("request_overrides")
+        )
         if request_overrides and _callable_accepts_keyword(AIAgent, "request_overrides"):
             kwargs["request_overrides"] = request_overrides
-        if runtime.get("reasoning_config") is not None:
-            kwargs["reasoning_config"] = runtime["reasoning_config"]
+        kwargs["reasoning_config"] = {
+            "enabled": True,
+            "effort": request.reasoning_effort,
+        }
         if runtime.get("service_tier") is not None:
             kwargs["service_tier"] = runtime["service_tier"]
         if request.max_turns is not None:
@@ -1436,6 +1450,46 @@ def _structured_output_missing_expectation(result: dict[str, Any] | Any) -> bool
         if isinstance(content, str) and _STRUCTURED_OUTPUT_MISSING_EXPECTATION in content:
             return True
     return False
+
+
+def _runtime_without_reasoning_effort(runtime: dict[str, Any]) -> str | None:
+    candidates = [runtime]
+    fallback = runtime.get("fallback_model") or []
+    if isinstance(fallback, dict):
+        fallback = [fallback]
+    candidates.extend(item for item in fallback if isinstance(item, dict))
+
+    for candidate in candidates:
+        api_mode = str(candidate.get("api_mode") or "").strip().lower()
+        provider = str(candidate.get("provider") or "").strip().lower()
+        if api_mode == "codex_app_server":
+            return "codex_app_server"
+        if api_mode == "bedrock_converse" or provider in {
+            "amazon",
+            "amazon-bedrock",
+            "aws",
+            "aws-bedrock",
+            "bedrock",
+        }:
+            return "bedrock"
+    return None
+
+
+def _without_reasoning_overrides(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    blocked = {"reasoning", "reasoning_effort", "reasoningEffort", "reasoning_config"}
+    cleaned: dict[str, Any] = {}
+    for key, item in value.items():
+        if key in blocked:
+            continue
+        if isinstance(item, dict):
+            nested = _without_reasoning_overrides(item)
+            if nested:
+                cleaned[key] = nested
+        else:
+            cleaned[key] = item
+    return cleaned
 
 
 def _callable_accepts_keyword(target: Any, keyword: str) -> bool:

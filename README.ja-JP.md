@@ -69,7 +69,6 @@ plugins:
         notify_result_preview_chars: 2000  # 通知での結果プレビューの切り詰め長（文字数）
         notify_progress_stop_button: true  # ライブ進捗バブルにタップ可能な ⏹ 停止ボタンを表示（Telegram；インラインボタン対応のコアが必要）
         notify_on_launch: true        # 起動時に起点となった gateway チャットへ「workflow 開始」マーカーを送信
-        auto_workflow_effort: xhigh    # /autoflow が ON のとき、誘導されたメッセージに適用する推論強度
         auto_workflow_default_on: false # true の場合、各セッションはデフォルトで ON（/autoflow off を実行するまで）。全チャットのコストが上がる
         auto_workflow_min_chars: 24    # 「実質的」とみなす最小メッセージ長（安価な事前フィルタ、LLM 呼び出しなし）
         orphan_grace_seconds: 900      # 「PID 死亡」シグナルがない場合に古いと判定して回収するまでのアイドル時間窓（PID 再利用への保険）
@@ -131,7 +130,8 @@ return await agent("検証済みの結果を統合する:\n" + json.dumps(findin
 ```
 
 - `agent(prompt, opts)` は子エージェントを起動します。`opts` には `schema`（構造化出力を強制）、
-  `model`、`agentType`、`isolation="worktree"`、インライン `instructions`/`systemPrompt`、`toolsets`、`allowedTools`、`disallowedTools` を含めることができます。
+  `model`、`agentType`、`isolation="worktree"`、インライン `instructions`/`systemPrompt`、`reasoningEffort`、`toolsets`、`allowedTools`、`disallowedTools` を含めることができます。
+  各子エージェントは、インラインの `reasoningEffort` または agent type preset の `reasoning_effort` を必ず解決します。どちらもない場合は起動前に失敗します。
 - `pipeline`（デフォルト、バリアなし）／`parallel`（バリアあり）が並行処理を扱います。
   `phase`／`log` は進捗を報告し、`workflow()` は名前付きワークフローをインラインで実行し、`args` /
   `budget` は入力引数とトークン予算にアクセスします。
@@ -184,6 +184,7 @@ return await agent("Synthesize: " + json.dumps(findings), {"agentType": "synthes
 name: my-agent
 description: "このエージェントが何のためのものかの短い説明。モデルがこれを使って適切なエージェントを自動選択します。"
 model: inherit
+reasoning_effort: high
 toolsets: [web, file, terminal]
 ---
 
@@ -192,7 +193,7 @@ toolsets: [web, file, terminal]
 
 `name` と `description` は必須です。`model` のデフォルトは `inherit`（現在のセッションの
 モデルを継承）、`toolsets` のデフォルトはグローバルの `default_child_toolsets` です。
-オプションフィールドとして `allowed_tools`、`disallowed_tools`、`isolation` もあります。
+`reasoning_effort` は必須です。オプションフィールドとして `allowed_tools`、`disallowed_tools`、`isolation` もあります。
 
 実行時、プラグインはスクリプトとすべての子エージェントの完全な実行トレース（トランスクリプト）を
 永続化し、完了時に `<task-notification>` を会話に注入します。ポーリングは不要です。

@@ -68,7 +68,6 @@ plugins:
         notify_on_launch: true        # Send a "workflow started" marker to the origin gateway chat at launch
         notify_result_preview_chars: 2000  # Truncation length (chars) for the result preview in notifications
         notify_progress_stop_button: true  # Show a tappable ⏹ Stop button on the live progress bubble (Telegram; needs a core that supports inline buttons)
-        auto_workflow_effort: xhigh    # Reasoning effort applied to steered messages while /autoflow is ON
         auto_workflow_default_on: false # When true, every session starts ON unless it runs /autoflow off (raises cost across all chats)
         auto_workflow_min_chars: 24    # Min message length to count as "substantive" (cheap prefilter, no LLM call)
         orphan_grace_seconds: 900      # Idle window before a run with no dead-PID signal is reaped as stale (backstops PID recycling)
@@ -97,17 +96,14 @@ without anyone typing `/autoflow on` — each session stays ON until it runs
 default is false; turning it on raises cost across every connected chat, so
 it's intended for benchmarking / always-orchestrate setups.
 
-While on, each substantive inbound message:
-
-1. bumps the session's reasoning effort to `auto_workflow_effort` (default `xhigh`), and
-2. gets a steering directive appended that tells the model the task is
-   pre-authorized for orchestration, so it prefers the `workflow` tool.
+While on, each substantive inbound message gets a steering directive appended
+that tells the model the task is pre-authorized for orchestration, so it prefers
+the `workflow` tool. Autoflow does not change the parent session's reasoning effort.
 
 It is a **nudge, not a hard force** (the model still decides, matching
 ultracode), it is **gateway-only** (CLI/TUI unaffected), and **launch approval
 still applies** — `require_launch_approval` gates every workflow launch
-regardless. Trivial messages (short acks, slash commands) pass through
-untouched so they don't pay the higher reasoning latency.
+regardless. Trivial messages (short acks, slash commands) pass through untouched.
 
 When a workflow launches, `notify_on_launch` (default on) posts a concise
 "🚀 Workflow started" marker to the origin chat, and `notify_on_complete` posts
@@ -173,7 +169,11 @@ return await agent("Synthesize the verified findings:\n" + json.dumps(findings))
 
 - `agent(prompt, opts)` spawns a child agent; `opts` may include `schema` (enforce
   structured output), `model`, `agentType`, `isolation="worktree"`, inline
-  `instructions`/`systemPrompt`, `toolsets`, `allowedTools`, and `disallowedTools`.
+  `instructions`/`systemPrompt`, `reasoningEffort`, `toolsets`, `allowedTools`, and
+  `disallowedTools`. Every child must resolve reasoning from inline
+  `reasoningEffort` or its agent-type preset; missing values fail before launch.
+  Current Bedrock and `codex_app_server` transports do not forward workflow reasoning
+  effort, so those runtimes fail before child launch.
 - `pipeline` (default, no barrier) / `parallel` (with barrier) handle concurrency;
   `phase`/`log` report progress; `workflow()` runs a named workflow inline; `args` /
   `budget` access the input arguments and the token budget.
@@ -193,6 +193,7 @@ await agent(
     "Review this diff for authorization bugs only.",
     {
         "instructions": "You are a read-only security reviewer. Return blockers only.",
+        "reasoningEffort": "high",
         "toolsets": ["file", "terminal"],
         "allowedTools": ["read_file", "search_files", "terminal", "process"],
     },
@@ -208,11 +209,13 @@ meta = {
     "agents": {
         "read-only-reviewer": {
             "instructions": "Review for correctness and regression risk. Do not edit files.",
+            "reasoningEffort": "high",
             "toolsets": ["file", "terminal"],
             "allowedTools": ["read_file", "search_files", "terminal", "process"],
         },
         "synthesizer": {
             "instructions": "Synthesize findings into a concise verdict.",
+            "reasoningEffort": "medium",
             "toolsets": [],
         },
     },
@@ -259,6 +262,7 @@ To add a reusable file-backed preset, create a new `.md` file under the project-
 name: my-agent
 description: "A short description of what this agent is for; the model uses it to automatically pick the right agent."
 model: inherit
+reasoning_effort: high
 toolsets: [web, file, terminal]
 ---
 
@@ -267,7 +271,8 @@ Write the agent's system prompt here to guide its behavior, style, and constrain
 
 `name` and `description` are required; `model` defaults to `inherit` (inherits the
 current session's model); `toolsets` defaults to the global `default_child_toolsets`;
-optional fields also include `allowed_tools`, `disallowed_tools`, and `isolation`.
+`reasoning_effort` is required. Optional fields also include `allowed_tools`,
+`disallowed_tools`, and `isolation`.
 
 At runtime the plugin persists the script and the full execution trace (transcript) of
 every child agent, and injects a `<task-notification>` into the conversation on
