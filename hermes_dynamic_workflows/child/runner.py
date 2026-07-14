@@ -162,6 +162,11 @@ class HermesChildAgentRunner(ChildAgentRunner):
             )
         if resolved is None:
             request = _apply_agent_type_defaults(request, agent_type)
+        runtime = self._resolve_runtime(request)
+        if request.max_turns is not None and runtime.get("api_mode") == "codex_app_server":
+            raise ChildAgentError(
+                "maxTurns is not supported by the codex_app_server runtime"
+            )
         lease = create_workspace_lease(
             cwd=base_cwd,
             isolation=request.isolation,
@@ -169,7 +174,6 @@ class HermesChildAgentRunner(ChildAgentRunner):
             task_id=task_id,
             keep_worktree=self.config.keep_worktrees,
         )
-        runtime = self._resolve_runtime(request)
         _prepare_mcp_tool_registry(self.config)
         if resolved is not None:
             toolsets = list(resolved.toolsets)
@@ -389,6 +393,8 @@ class HermesChildAgentRunner(ChildAgentRunner):
             kwargs["reasoning_config"] = runtime["reasoning_config"]
         if runtime.get("service_tier") is not None:
             kwargs["service_tier"] = runtime["service_tier"]
+        if request.max_turns is not None:
+            kwargs["max_iterations"] = request.max_turns
         child = AIAgent(**kwargs)
         # Freeze this child's tool surface against the between-turns MCP refresh.
         #
@@ -518,7 +524,10 @@ class HermesChildAgentRunner(ChildAgentRunner):
                 message = build_child_task_message(request, workspace=lease.cwd)
                 history = None
                 stop_attempts = 0
+                remaining_turns = request.max_turns
                 while True:
+                    if remaining_turns is not None:
+                        child.max_iterations = remaining_turns
                     result = child.run_conversation(
                         user_message=message,
                         conversation_history=history,
@@ -527,9 +536,22 @@ class HermesChildAgentRunner(ChildAgentRunner):
                     if not request.structured_tool:
                         return result
 
+                    if remaining_turns is not None:
+                        api_calls = result.get("api_calls") if isinstance(result, dict) else None
+                        if type(api_calls) is not int or api_calls < 0:
+                            raise ChildAgentError(
+                                "capped structured child must report non-negative integer api_calls"
+                            )
+                        remaining_turns -= api_calls
+
                     captured, _value, tool_attempts = peek_result(lease.task_id)
                     if captured:
                         return result
+                    if remaining_turns is not None and remaining_turns <= 0:
+                        raise ChildAgentError(
+                            f"child exhausted maxTurns={request.max_turns} before providing "
+                            "valid structured output"
+                        )
 
                     # The schema tool is a runner-owned side channel: runner.run()
                     # registers an expectation in this process before the child
@@ -726,6 +748,7 @@ def _apply_agent_type_defaults(
         request,
         model=model,
         isolation=request.isolation or agent_type.isolation,
+        max_turns=request.max_turns or agent_type.max_turns,
     )
 
 

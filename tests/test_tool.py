@@ -83,6 +83,21 @@ Review code carefully.
         self.assertIn("missing_agent_type_policy", description)
         self.assertIn("toolsets: []", description)
 
+    def test_dynamic_schema_documents_max_turns_safety_contract(self):
+        description = get_dynamic_workflow_schema()["description"]
+
+        for text in (
+            "maxTurns",
+            "1..1000",
+            "inline",
+            "preset",
+            "research",
+            "review",
+            "codex_app_server",
+            "wall-clock",
+        ):
+            self.assertIn(text, description)
+
     def test_denied_launch_returns_clean_tool_error_without_trace(self):
         # A denied top-level launch is expected control flow, not an internal
         # bug — it must return a clean tool_error (no Python traceback leaked).

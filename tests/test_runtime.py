@@ -944,6 +944,110 @@ return await agent("same prompt")
         self.assertEqual(len(second_runner.requests), 1)
 
 
+class MaxTurnsRuntimeTests(unittest.TestCase):
+    def test_inline_overrides_runtime_preset(self):
+        script = """
+meta = {
+    "name": "bounded-inline",
+    "description": "Test workflow",
+    "agents": {"researcher": {"instructions": "Research.", "maxTurns": 20}},
+}
+return await agent("go", {"agentType": "researcher", "maxTurns": 3})
+"""
+        runner = FakeRunner()
+        run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+
+        request = runner.requests[0]
+        self.assertEqual(request.max_turns, 3)
+        self.assertEqual(request.resolved.max_turns, 3)
+
+    def test_inline_boundaries_are_accepted(self):
+        for value in (1, 1000):
+            runner = FakeRunner()
+            script = (
+                'meta = {"name": "bounded", "description": "Test workflow"}\n'
+                f'return await agent("go", {{"maxTurns": {value}}})'
+            )
+            with self.subTest(value=value):
+                run_workflow(
+                    script,
+                    WorkflowOptions(config=PluginConfig(), child_runner=runner),
+                )
+            self.assertEqual(runner.requests[0].max_turns, value)
+
+    def test_invalid_inline_values_fail_before_launch(self):
+        for value in [None, True, False, 1.5, "2", 0, -1, 1001]:
+            runner = FakeRunner()
+            script = (
+                'meta = {"name": "bad-cap", "description": "Test workflow"}\n'
+                f'return await agent("go", {{"maxTurns": {value!r}}})'
+            )
+            with self.subTest(value=value), self.assertRaises(Exception) as ctx:
+                run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+            self.assertIn("agent() maxTurns must be an integer from 1 to 1000", str(ctx.exception))
+            self.assertEqual(runner.requests, [])
+
+    def test_invalid_runtime_preset_values_fail_before_launch(self):
+        for value in [None, True, 1.5, "2", 0, 1001]:
+            runner = FakeRunner()
+            script = (
+                'meta = {"name": "bad-preset", "description": "Test workflow", '
+                '"agents": {"researcher": {"instructions": "Research.", "maxTurns": %r}}}\n'
+                'return await agent("go", {"agentType": "researcher"})'
+            ) % (value,)
+            with self.subTest(value=value), self.assertRaises(Exception) as ctx:
+                run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+            self.assertIn(
+                "meta.agents.researcher maxTurns must be an integer from 1 to 1000",
+                str(ctx.exception),
+            )
+            self.assertEqual(runner.requests, [])
+
+    def test_internal_public_alias_is_rejected(self):
+        script = """
+meta = {"name": "bad-alias", "description": "Test workflow"}
+return await agent("go", {"max_turns": 2})
+"""
+        runner = FakeRunner()
+        with self.assertRaises(Exception) as ctx:
+            run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+        self.assertIn("unsupported agent() option(s): max_turns", str(ctx.exception))
+        self.assertEqual(runner.requests, [])
+
+    def test_omission_preserves_cache_identity_but_explicit_cap_changes_it(self):
+        uncapped = """
+meta = {"name": "cache-cap-none", "description": "Test workflow"}
+return await agent("same prompt")
+"""
+        capped = """
+meta = {"name": "cache-cap-set", "description": "Test workflow"}
+return await agent("same prompt", {"maxTurns": 2})
+"""
+        first_cache = ResumeCache()
+        run_workflow(uncapped, WorkflowOptions(child_runner=FakeRunner(), resume_cache=first_cache))
+
+        omitted_runner = FakeRunner()
+        run_workflow(
+            uncapped,
+            WorkflowOptions(
+                child_runner=omitted_runner,
+                resume_cache=ResumeCache(first_cache.current),
+            ),
+        )
+        capped_runner = FakeRunner()
+        run_workflow(
+            capped,
+            WorkflowOptions(
+                child_runner=capped_runner,
+                resume_cache=ResumeCache(first_cache.current),
+            ),
+        )
+
+        self.assertEqual(omitted_runner.requests, [])
+        self.assertEqual(len(capped_runner.requests), 1)
+        self.assertEqual(capped_runner.requests[0].max_turns, 2)
+
+
 class ResumeCacheTests(unittest.TestCase):
     def test_content_addressed_fifo_for_duplicate_fingerprints(self):
         fp = agent_fingerprint("same prompt", {"label": "x"})

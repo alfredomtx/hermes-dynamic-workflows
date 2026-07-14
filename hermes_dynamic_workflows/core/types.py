@@ -230,6 +230,7 @@ class ResolvedAgentSpec:
     system_prompt_hash: str = ""
     workspace: str = ""
     warnings: tuple[str, ...] = ()
+    max_turns: int | None = None
 
     @property
     def agent_type_name(self) -> str | None:
@@ -237,7 +238,7 @@ class ResolvedAgentSpec:
         return str(value) if value else self.requested_agent_type
 
     def cache_inputs(self) -> dict[str, Any]:
-        return {
+        inputs = {
             "model": self.model,
             "isolation": self.isolation,
             "toolsets": list(self.toolsets),
@@ -249,6 +250,9 @@ class ResolvedAgentSpec:
             "systemPromptHash": self.system_prompt_hash,
             "workspace": self.workspace,
         }
+        if self.max_turns is not None:
+            inputs["maxTurns"] = self.max_turns
+        return inputs
 
 
 @dataclass(frozen=True)
@@ -268,6 +272,7 @@ class ChildAgentRequest:
     on_start: Callable[[dict[str, Any]], None] | None = None
     on_update: Callable[[dict[str, Any]], None] | None = None
     resolved: ResolvedAgentSpec | None = None
+    max_turns: int | None = None
 
 
 class ChildAgentRunner:

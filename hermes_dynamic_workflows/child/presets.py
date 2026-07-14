@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ class AgentTypeSpec:
     isolation: str | None = None
     toolsets_explicit: bool = False
     allowed_tools_explicit: bool = False
+    max_turns: int | None = None
 
 
 def build_runtime_agent_type(name: str, data: Any, *, source: str) -> AgentTypeSpec:
@@ -30,6 +32,7 @@ def build_runtime_agent_type(name: str, data: Any, *, source: str) -> AgentTypeS
     clean_name = _validate_runtime_agent_name(str(name or ""), source=source)
     if not isinstance(data, dict):
         raise ValueError(f"{source} must be an object")
+    max_turns = _max_turns_from(data, source=source)
     spec_name = _validate_runtime_agent_name(
         str(data.get("name") or clean_name), source=source
     )
@@ -66,6 +69,7 @@ def build_runtime_agent_type(name: str, data: Any, *, source: str) -> AgentTypeS
         isolation=_as_runtime_isolation(data.get("isolation"), source=source),
         toolsets_explicit=toolsets_explicit,
         allowed_tools_explicit=allowed_tools_explicit,
+        max_turns=max_turns,
     )
 
 
@@ -183,6 +187,7 @@ def _load_markdown_agent_type(name: str, path: Path) -> AgentTypeSpec:
         isolation=_as_optional_str(frontmatter.get("isolation")),
         toolsets_explicit=("toolsets" in frontmatter or "tools" in frontmatter),
         allowed_tools_explicit=("allowed_tools" in frontmatter or "allowedTools" in frontmatter),
+        max_turns=_max_turns_from(frontmatter, source=str(path)),
     )
 
 
@@ -198,13 +203,6 @@ def _load_structured_agent_type(name: str, path: Path, data: Any) -> AgentTypeSp
 
 
 def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
-    try:
-        from agent.skill_utils import parse_frontmatter
-
-        frontmatter, body = parse_frontmatter(text)
-        return (frontmatter or {}, body or "")
-    except Exception:
-        pass
     if not text.startswith("---"):
         return {}, text
     end = text.find("\n---", 3)
@@ -246,12 +244,25 @@ def _read_simple_yaml_text(text: str) -> dict[str, Any]:
         value = value.strip()
         if not key:
             continue
-        if value.startswith("[") and value.endswith("]"):
+        if key == "maxTurns" and re.fullmatch(r"[+-]?\d+", value):
+            data[key] = int(value)
+        elif value.startswith("[") and value.endswith("]"):
             inner = value[1:-1].strip()
             data[key] = [part.strip().strip("'\"") for part in inner.split(",") if part.strip()]
         else:
             data[key] = value.strip("'\"")
     return data
+
+
+def _max_turns_from(data: dict[str, Any], *, source: str) -> int | None:
+    if "max_turns" in data:
+        raise ValueError(f"{source} max_turns is not supported; use maxTurns")
+    if "maxTurns" not in data:
+        return None
+    value = data["maxTurns"]
+    if type(value) is not int or not 1 <= value <= 1000:
+        raise ValueError(f"{source} maxTurns must be an integer from 1 to 1000")
+    return value
 
 
 def _as_tuple(value: Any) -> tuple[str, ...]:

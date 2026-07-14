@@ -194,6 +194,7 @@ class WorkflowAPI:
             on_start=on_child_start,
             on_update=on_child_update,
             resolved=resolved,
+            max_turns=resolved.max_turns,
         )
         if schema:
             record.structured = {
@@ -440,6 +441,7 @@ _PUBLIC_AGENT_OPT_KEYS = frozenset(
         "systemPrompt",
         "system_prompt",
         "description",
+        "maxTurns",
     }
 )
 
@@ -464,16 +466,21 @@ _MISSING_AGENT_TYPE_POLICIES = {"error", "fallback_warn"}
 
 def _validate_agent_opts(opts: dict[str, Any]) -> None:
     unknown = sorted(str(key) for key in opts if str(key) not in _PUBLIC_AGENT_OPT_KEYS)
-    if not unknown:
-        return
-    raise WorkflowRuntimeError(
-        "unsupported agent() option(s): "
-        + ", ".join(unknown)
-        + ". Public workflow agent options are label, phase, schema, model, "
-        "isolation, agentType, toolsets, allowedTools, disallowedTools, "
-        "instructions, and systemPrompt. Provider/runtime, timeout, and retry "
-        "policy belong in Hermes/plugin configuration, not workflow scripts."
-    )
+    if unknown:
+        raise WorkflowRuntimeError(
+            "unsupported agent() option(s): "
+            + ", ".join(unknown)
+            + ". Public workflow agent options are label, phase, schema, model, "
+            "isolation, agentType, toolsets, allowedTools, disallowedTools, "
+            "instructions, systemPrompt, and maxTurns. Provider/runtime, timeout, "
+            "and retry policy belong in Hermes/plugin configuration, not workflow scripts."
+        )
+    from ..child.presets import _max_turns_from
+
+    try:
+        _max_turns_from(opts, source="agent()")
+    except ValueError as exc:
+        raise WorkflowRuntimeError(str(exc)) from exc
 
 
 def _check_vm_array_length(items: list[Any]) -> None:
@@ -627,11 +634,12 @@ def _resolve_agent_spec(
         system_prompt_hash=hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         workspace=str(Path(cwd).expanduser().resolve()),
         warnings=tuple(warnings),
+        max_turns=getattr(effective_spec, "max_turns", None),
     )
 
 
 def _compose_effective_agent_type(base_spec: Any, opts: dict[str, Any]) -> Any:
-    from ..child.presets import AgentTypeSpec
+    from ..child.presets import AgentTypeSpec, _max_turns_from
 
     inline_instructions = _inline_instructions(opts)
     inline_toolsets, inline_toolsets_explicit = _tuple_option(opts, "toolsets", "toolsets")
@@ -641,6 +649,7 @@ def _compose_effective_agent_type(base_spec: Any, opts: dict[str, Any]) -> Any:
     inline_disallowed, inline_disallowed_explicit = _tuple_option(
         opts, "disallowedTools", "disallowed_tools", field_name="disallowedTools"
     )
+    inline_max_turns = _max_turns_from(opts, source="agent()")
 
     instructions = str(getattr(base_spec, "instructions", "") or "").strip()
     source = str(getattr(base_spec, "source", "") or "inline")
@@ -694,6 +703,11 @@ def _compose_effective_agent_type(base_spec: Any, opts: dict[str, Any]) -> Any:
         isolation=getattr(base_spec, "isolation", None),
         toolsets_explicit=toolsets_explicit,
         allowed_tools_explicit=allowed_tools_explicit,
+        max_turns=(
+            inline_max_turns
+            if "maxTurns" in opts
+            else getattr(base_spec, "max_turns", None)
+        ),
     )
 
 
