@@ -488,44 +488,53 @@ class ChildAgentTests(unittest.TestCase):
         self.assertFalse(runner._consume_skipped("first"))
         self.assertFalse(runner.skip_child("missing"))
 
-    def test_agent_type_applies_model_and_isolation_defaults(self):
+    def test_agent_type_applies_isolation_without_changing_routing(self):
         request = ChildAgentRequest(
             id=1,
             prompt="work",
             label="worker",
             phase=None,
             toolsets=[],
+            provider="openai-codex",
+            model="gpt-5.6-luna",
+            reasoning_effort="high",
         )
         spec = AgentTypeSpec(
             name="researcher",
             instructions="Search.",
             source="test",
-            model="test-model",
+            model="conflicting-model",
             isolation="worktree",
         )
 
         applied = _apply_agent_type_defaults(request, spec)
 
-        self.assertEqual(applied.model, "test-model")
+        self.assertEqual(applied.provider, "openai-codex")
+        self.assertEqual(applied.model, "gpt-5.6-luna")
+        self.assertEqual(applied.reasoning_effort, "high")
         self.assertEqual(applied.isolation, "worktree")
 
-    def test_agent_type_inherit_model_means_no_override(self):
+    def test_agent_type_model_never_supplies_missing_routing(self):
         request = ChildAgentRequest(
             id=1,
             prompt="work",
             label="worker",
             phase=None,
             toolsets=[],
+            max_turns=10,
+            max_tool_calls=16,
+            max_tool_output_chars=200000,
         )
         spec = AgentTypeSpec(
             name="planner",
             instructions="Plan.",
             source="test",
-            model="inherit",
+            model="conflicting-model",
         )
 
         applied = _apply_agent_type_defaults(request, spec)
 
+        self.assertIsNone(applied.provider)
         self.assertIsNone(applied.model)
 
     def test_system_prompt_excludes_per_task_data_for_cache_sharing(self):
@@ -576,7 +585,7 @@ class ChildAgentTests(unittest.TestCase):
         self.assertEqual(metadata["agent_type"], "general-purpose")
         self.assertIsNone(metadata["agent_type_source"])
 
-    def test_bundled_agent_types_inherit_launching_model(self):
+    def test_bundled_agent_types_define_role_and_tools_without_routing(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.dict(
                 os.environ,
@@ -586,7 +595,8 @@ class ChildAgentTests(unittest.TestCase):
                     spec = resolve_agent_type(name, cwd=tmp)
                     self.assertIsNotNone(spec)
                     assert spec is not None
-                    self.assertEqual(spec.model, "inherit")
+                    self.assertIsNone(spec.model)
+                    self.assertIsNone(spec.reasoning_effort)
                     if name in {"Explore", "Plan"}:
                         self.assertEqual(
                             spec.allowed_tools,
@@ -634,6 +644,27 @@ Search carefully and return concise notes.
         self.assertEqual(named_spec.name, "unique-researcher")
         self.assertIn("unique-researcher", [item.name for item in listed])
 
+    def test_file_preset_rejects_provider_model_and_reasoning_routing(self):
+        cases = {
+            "provider": "provider: openai-codex",
+            "model": "model: gpt-5.6-luna",
+            "reasoning_effort": "reasoning_effort: high",
+        }
+        for field, declaration in cases.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / ".hermes" / "dynamic-workflows" / "agents" / "reader.md"
+                path.parent.mkdir(parents=True)
+                path.write_text(
+                    f"---\n{declaration}\n---\nRead carefully.\n",
+                    encoding="utf-8",
+                )
+
+                with self.assertRaises(ValueError) as ctx:
+                    resolve_agent_type("reader", cwd=tmp)
+
+                self.assertIn(str(path), str(ctx.exception))
+                self.assertIn(f"{field} is not supported", str(ctx.exception))
+
     def test_markdown_agent_type_accepts_camelcase_tool_filters(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -668,7 +699,6 @@ Review carefully.
             (agent_dir / "global-reviewer.md").write_text(
                 """---
 name: global-reviewer
-model: test-model
 ---
 
 Review from the user-wide workflow agent store.
@@ -681,77 +711,8 @@ Review from the user-wide workflow agent store.
         self.assertIsNotNone(spec)
         assert spec is not None
         self.assertEqual(spec.name, "global-reviewer")
-        self.assertEqual(spec.model, "test-model")
+        self.assertIsNone(spec.model)
         self.assertIn("user-wide workflow agent store", spec.instructions)
-
-
-class ReasoningEffortPresetTests(unittest.TestCase):
-    def _agent_dir(self, root: Path) -> Path:
-        path = root / ".hermes" / "dynamic-workflows" / "agents"
-        path.mkdir(parents=True)
-        return path
-
-    def test_file_preset_loads_explicit_effort(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = self._agent_dir(Path(tmp)) / "researcher.md"
-            path.write_text(
-                "---\nreasoning_effort: high\n---\nResearch.\n",
-                encoding="utf-8",
-            )
-            spec = resolve_agent_type("researcher", cwd=tmp)
-
-        self.assertIsNotNone(spec)
-        assert spec is not None
-        self.assertEqual(spec.reasoning_effort, "high")
-
-    def test_file_preset_rejects_noncanonical_alias(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = self._agent_dir(Path(tmp)) / "researcher.yaml"
-            path.write_text(
-                "instructions: Research.\nreasoningEffort: high\n",
-                encoding="utf-8",
-            )
-            with self.assertRaises(ValueError) as ctx:
-                resolve_agent_type("researcher", cwd=tmp)
-
-        self.assertIn(str(path), str(ctx.exception))
-        self.assertIn("reasoningEffort is not supported; use reasoning_effort", str(ctx.exception))
-
-    def test_invalid_file_efforts_name_the_source(self):
-        cases = {
-            "null": "null",
-            "boolean": "true",
-            "empty": "''",
-            "disabled": "none",
-            "uppercase": "HIGH",
-            "number": "1",
-            "unknown": "turbo",
-        }
-        for name, value in cases.items():
-            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
-                path = self._agent_dir(Path(tmp)) / f"{name}.yaml"
-                path.write_text(
-                    f"instructions: Research.\nreasoning_effort: {value}\n",
-                    encoding="utf-8",
-                )
-                with self.assertRaises(ValueError) as ctx:
-                    resolve_agent_type(name, cwd=tmp)
-
-                self.assertIn(str(path), str(ctx.exception))
-                self.assertIn("reasoning_effort must be one of", str(ctx.exception))
-
-    def test_invalid_named_preset_preserves_source_path(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = self._agent_dir(Path(tmp)) / "different-filename.yaml"
-            path.write_text(
-                "name: named-researcher\ninstructions: Research.\nreasoning_effort: turbo\n",
-                encoding="utf-8",
-            )
-            with self.assertRaises(ValueError) as ctx:
-                resolve_agent_type("named-researcher", cwd=tmp)
-
-        self.assertIn(str(path), str(ctx.exception))
-        self.assertIn("reasoning_effort must be one of", str(ctx.exception))
 
 
 class MaxTurnsPresetTests(unittest.TestCase):
@@ -760,7 +721,7 @@ class MaxTurnsPresetTests(unittest.TestCase):
         path.mkdir(parents=True)
         return path
 
-    def test_applies_agent_type_default(self):
+    def test_agent_type_does_not_supply_budget_defaults(self):
         request = ChildAgentRequest(1, "work", "worker", None, [])
         spec = AgentTypeSpec(
             name="researcher",
@@ -768,22 +729,27 @@ class MaxTurnsPresetTests(unittest.TestCase):
             source="test",
             max_turns=12,
         )
-        self.assertEqual(_apply_agent_type_defaults(request, spec).max_turns, 12)
+        applied = _apply_agent_type_defaults(request, spec)
+        self.assertIsNone(applied.max_turns)
 
-    def test_loads_json_yaml_and_markdown_files(self):
+    def test_role_fields_load_without_routing_or_budget_fields(self):
         cases = {
-            "json-agent.json": json.dumps({"instructions": "Research.", "maxTurns": 4}),
-            "yaml-agent.yaml": "instructions: Research.\nmaxTurns: 5\n",
-            "markdown-agent.md": "---\nmaxTurns: 6\n---\nResearch.\n",
+            "json-agent.json": json.dumps({"instructions": "Research.", "toolsets": ["file"]}),
+            "yaml-agent.yaml": "instructions: Research.\ntoolsets: [file]\n",
+            "markdown-agent.md": "---\ntoolsets: [file]\n---\nResearch.\n",
         }
         with tempfile.TemporaryDirectory() as tmp:
             agent_dir = self._agent_dir(Path(tmp))
             for filename, content in cases.items():
                 (agent_dir / filename).write_text(content, encoding="utf-8")
 
-            self.assertEqual(resolve_agent_type("json-agent", cwd=tmp).max_turns, 4)
-            self.assertEqual(resolve_agent_type("yaml-agent", cwd=tmp).max_turns, 5)
-            self.assertEqual(resolve_agent_type("markdown-agent", cwd=tmp).max_turns, 6)
+            for filename in cases:
+                spec = resolve_agent_type(Path(filename).stem, cwd=tmp)
+                self.assertIsNotNone(spec)
+                assert spec is not None
+                self.assertIsNone(spec.max_turns)
+                self.assertIsNone(spec.reasoning_effort)
+                self.assertIsNone(spec.model)
 
     def test_invalid_file_values_name_the_source(self):
         cases = {
@@ -798,7 +764,7 @@ class MaxTurnsPresetTests(unittest.TestCase):
                 with self.assertRaises(ValueError) as ctx:
                     resolve_agent_type(Path(filename).stem, cwd=tmp)
                 self.assertIn(str(path), str(ctx.exception))
-                self.assertIn("maxTurns must be an integer from 1 to 1000", str(ctx.exception))
+                self.assertIn("maxTurns is not supported; set it inline on agent()", str(ctx.exception))
 
     def test_malformed_markdown_max_turns_fails_closed(self):
         cases = {
@@ -870,7 +836,7 @@ class MaxTurnsPresetTests(unittest.TestCase):
     def test_negative_runtime_preset_value_has_source_specific_error(self):
         with self.assertRaisesRegex(
             ValueError,
-            "meta.agents.researcher maxTurns must be an integer from 1 to 1000",
+            "meta.agents.researcher maxTurns is not supported; set it inline on agent()",
         ):
             build_runtime_agent_type(
                 "researcher",
@@ -887,7 +853,7 @@ class MaxTurnsPresetTests(unittest.TestCase):
             )
             with self.assertRaises(ValueError) as ctx:
                 resolve_agent_type("bad-alias", cwd=tmp)
-        self.assertIn("max_turns is not supported; use maxTurns", str(ctx.exception))
+        self.assertIn("max_turns is not supported; set it inline on agent()", str(ctx.exception))
 
     def test_no_pyyaml_fallback_only_types_unquoted_signed_decimal(self):
         with patch.dict(sys.modules, {"yaml": None}):
@@ -911,7 +877,7 @@ class MaxTurnsPresetTests(unittest.TestCase):
                 )
                 with patch.dict(sys.modules, {"yaml": None}):
                     with self.assertRaisesRegex(
-                        ValueError, "maxTurns must be an integer from 1 to 1000"
+                        ValueError, "maxTurns is not supported; set it inline on agent\(\)"
                     ):
                         resolve_agent_type("fallback", cwd=tmp)
 
@@ -1020,6 +986,7 @@ class StructuredOutputRunnerFailureTests(unittest.TestCase):
                 return {
                     "final_response": "",
                     "completed": True,
+                    "api_calls": 1,
                     "messages": [
                         {
                             "role": "tool",
@@ -1043,6 +1010,9 @@ class StructuredOutputRunnerFailureTests(unittest.TestCase):
                 toolsets=[],
                 schema={"type": "object"},
                 structured_tool=True,
+                max_turns=10,
+                max_tool_calls=16,
+                max_tool_output_chars=200000,
             )
             lease = WorkspaceLease(task_id="workflow-test", cwd=tmp)
 
@@ -1207,6 +1177,9 @@ class ToolCallCountTests(unittest.TestCase):
             label="read:source",
             phase=None,
             toolsets=[],
+            max_turns=10,
+            max_tool_calls=16,
+            max_tool_output_chars=200000,
         )
         lease = WorkspaceLease(task_id="workflow-abc123", cwd="/tmp")
         callback = runner._make_tool_progress_callback(request, lease)
@@ -1247,58 +1220,69 @@ class RunnerSessionContextTests(unittest.TestCase):
         runner = HermesChildAgentRunner(PluginConfig(), approval_session_key="parent-session")
         self.assertEqual(runner._approval_session_key, "parent-session")
 
-    def test_default_and_inherit_models_use_captured_parent_runtime(self):
-        runtime = {
-            "model": "session-switched-model",
-            "provider": "custom:session",
-            "base_url": "https://session.example/v1",
-            "api_key": "session-secret",
-            "api_mode": "chat_completions",
-            "request_overrides": {"extra_body": {"routing": "session"}},
-        }
-        runner = HermesChildAgentRunner(
-            PluginConfig(allow_model_override=False),
-            parent_runtime=runtime,
-        )
-
-        for model in (None, "inherit"):
-            request = ChildAgentRequest(
-                id=1,
-                prompt="work",
-                label="worker",
-                phase=None,
-                toolsets=[],
-                model=model,
-            )
-            self.assertEqual(runner._resolve_runtime(request), runtime)
-
-    def test_blocked_parent_model_fails_before_child_launch(self):
-        runner = HermesChildAgentRunner(
-            PluginConfig(blocked_models=("gpt-5.5",)),
-            parent_runtime={"model": "gpt-5.5", "provider": "openai-codex"},
-        )
+    def test_explicit_provider_and_model_bypass_parent_aliases_and_detection(self):
+        runner = HermesChildAgentRunner(PluginConfig())
         request = ChildAgentRequest(
             id=1,
             prompt="work",
             label="worker",
             phase=None,
             toolsets=[],
-            model=None,
+            provider="openai-codex",
+            model="gpt-5.6-luna",
+            reasoning_effort="high",
         )
+        resolved_runtime = {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "api_mode": "codex_responses",
+        }
 
-        with self.assertRaisesRegex(ChildAgentError, "blocked by policy: gpt-5.5"):
-            runner._resolve_runtime(request)
+        with (
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value=dict(resolved_runtime),
+            ) as resolve_runtime,
+            patch("hermes_cli.models.detect_provider_for_model") as detect_provider,
+            patch("hermes_cli.model_switch._ensure_direct_aliases") as ensure_aliases,
+        ):
+            runtime = runner._resolve_runtime(request)
 
-    def test_blocked_fallback_model_fails_before_child_launch(self):
+        resolve_runtime.assert_called_once_with(
+            requested="openai-codex",
+            target_model="gpt-5.6-luna",
+            explicit_base_url=None,
+        )
+        detect_provider.assert_not_called()
+        ensure_aliases.assert_not_called()
+        self.assertEqual(runtime["provider"], "openai-codex")
+        self.assertEqual(runtime["model"], "gpt-5.6-luna")
+        self.assertIsNone(runtime["fallback_model"])
+
+    def test_explicit_contract_resolves_without_an_override_setting(self):
+        runner = HermesChildAgentRunner(PluginConfig())
+        request = ChildAgentRequest(
+            id=1,
+            prompt="work",
+            label="worker",
+            phase=None,
+            toolsets=[],
+            provider="openai-codex",
+            model="gpt-5.6-luna",
+            reasoning_effort="high",
+        )
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value={"provider": "openai-codex", "model": "gpt-5.6-luna"},
+        ):
+            runtime = runner._resolve_runtime(request)
+        self.assertEqual(runtime["provider"], "openai-codex")
+        self.assertEqual(runtime["model"], "gpt-5.6-luna")
+
+    def test_blocked_explicit_model_fails_before_child_launch(self):
         runner = HermesChildAgentRunner(PluginConfig(blocked_models=("gpt-5.5",)))
-
-        with self.assertRaisesRegex(ChildAgentError, "blocked by policy: openai/gpt-5.5-fast"):
-            runner._assert_models_allowed(
-                {
-                    "model": "gpt-5.6-sol",
-                    "fallback_model": [{"provider": "openai-codex", "model": "openai/gpt-5.5-fast"}],
-                }
-            )
+        with self.assertRaisesRegex(ChildAgentError, "blocked by policy: gpt-5.5"):
+            runner._assert_models_allowed({"model": "gpt-5.5"})
 
 
 class StructuredOutputContinuationTests(unittest.TestCase):
@@ -1348,6 +1332,9 @@ class StructuredOutputContinuationTests(unittest.TestCase):
             label="worker",
             phase=None,
             toolsets=[],
+            max_turns=10,
+            max_tool_calls=16,
+            max_tool_output_chars=200000,
         )
         lease = WorkspaceLease(task_id="approval-session-child", cwd="/tmp")
         runner = HermesChildAgentRunner(
@@ -1382,6 +1369,9 @@ class StructuredOutputContinuationTests(unittest.TestCase):
             toolsets=[],
             schema=schema,
             structured_tool=True,
+            max_turns=10,
+            max_tool_calls=16,
+            max_tool_output_chars=200000,
         )
         lease = WorkspaceLease(task_id="structured-child", cwd="/tmp")
 
@@ -1405,6 +1395,7 @@ class StructuredOutputContinuationTests(unittest.TestCase):
                     "final_response": "done",
                     "messages": self.messages,
                     "completed": True,
+                    "api_calls": 1,
                 }
 
         child = Child()
@@ -1437,6 +1428,9 @@ class StructuredOutputContinuationTests(unittest.TestCase):
             toolsets=[],
             schema=schema,
             structured_tool=True,
+            max_turns=10,
+            max_tool_calls=16,
+            max_tool_output_chars=200000,
         )
         lease = WorkspaceLease(task_id="structured-child-fail", cwd="/tmp")
 
@@ -1453,7 +1447,7 @@ class StructuredOutputContinuationTests(unittest.TestCase):
 
             def run_conversation(self, **_):
                 self.calls += 1
-                return {"final_response": "done", "messages": [], "completed": True}
+                return {"final_response": "done", "messages": [], "completed": True, "api_calls": 1}
 
         child = Child()
         register_expectation(lease.task_id, schema)
@@ -1474,7 +1468,7 @@ class StructuredOutputContinuationTests(unittest.TestCase):
 
 
 class ReasoningEffortRunnerTests(unittest.TestCase):
-    def test_runner_rejects_request_without_resolved_effort(self):
+    def test_runner_rejects_request_without_resolved_contract(self):
         runner = HermesChildAgentRunner(PluginConfig())
         request = ChildAgentRequest(1, "work", "worker", None, [])
 
@@ -1483,7 +1477,10 @@ class ReasoningEffortRunnerTests(unittest.TestCase):
             "_resolve_runtime",
             side_effect=AssertionError("runtime resolution reached"),
         ) as resolve_runtime:
-            with self.assertRaisesRegex(ChildAgentError, "resolved reasoning effort"):
+            with self.assertRaisesRegex(
+                ChildAgentError,
+                "explicit provider, model, reasoning effort, or child budgets",
+            ):
                 runner.run(request)
 
         resolve_runtime.assert_not_called()
@@ -1564,12 +1561,18 @@ class ReasoningEffortRunnerTests(unittest.TestCase):
 
 
 class MaxTurnsRunnerTests(unittest.TestCase):
-    def _request(self, max_turns: int | None = 2, *, structured=True):
+    def _request(
+        self,
+        max_turns: int = 2,
+        *,
+        structured=True,
+        max_tool_calls: int = 16,
+        max_tool_output_chars: int = 200000,
+    ):
         agent_type = AgentTypeSpec(
             name="general-purpose",
             instructions="Work.",
             source="test",
-            reasoning_effort="high",
         )
         return ChildAgentRequest(
             id=1,
@@ -1577,13 +1580,22 @@ class MaxTurnsRunnerTests(unittest.TestCase):
             label="json",
             phase=None,
             toolsets=[],
+            provider="openai-codex",
+            model="gpt-5.6-luna",
             schema={"type": "object"} if structured else None,
             structured_tool=structured,
             max_turns=max_turns,
+            max_tool_calls=max_tool_calls,
+            max_tool_output_chars=max_tool_output_chars,
             resolved=ResolvedAgentSpec(
                 requested_agent_type="general-purpose",
                 agent_type_spec=agent_type,
+                provider="openai-codex",
+                model="gpt-5.6-luna",
                 reasoning_effort="high",
+                max_turns=max_turns,
+                max_tool_calls=max_tool_calls,
+                max_tool_output_chars=max_tool_output_chars,
             ),
             reasoning_effort="high",
         )
@@ -1729,6 +1741,131 @@ class MaxTurnsRunnerTests(unittest.TestCase):
         self._run_structured(child, self._request(2), task_id)
         self.assertEqual(child.caps, [2, 2])
 
+    def test_does_not_continue_after_consuming_final_tool_call(self):
+        class Child:
+            session_prompt_tokens = session_completion_tokens = 0
+            session_reasoning_tokens = session_cache_read_tokens = 0
+            session_cache_write_tokens = 0
+            model = "test"
+
+            def __init__(self):
+                self.calls = 0
+
+            def run_conversation(self, **_):
+                self.calls += 1
+                return {
+                    "final_response": "done",
+                    "messages": [
+                        {"role": "assistant", "tool_calls": [{"id": "one"}]},
+                        {"role": "tool", "content": "x"},
+                    ],
+                    "completed": True,
+                    "api_calls": 1,
+                }
+
+        child = Child()
+        request = self._request(3, max_tool_calls=1)
+        with self.assertRaisesRegex(ChildAgentError, "maxToolCalls=1"):
+            self._run_structured(child, request, "structured-tool-limit")
+        self.assertEqual(child.calls, 1)
+
+    def test_does_not_continue_after_consuming_output_character_budget(self):
+        class Child:
+            session_prompt_tokens = session_completion_tokens = 0
+            session_reasoning_tokens = session_cache_read_tokens = 0
+            session_cache_write_tokens = 0
+            model = "test"
+
+            def __init__(self):
+                self.calls = 0
+
+            def run_conversation(self, **_):
+                self.calls += 1
+                return {
+                    "final_response": "done",
+                    "messages": [{"role": "tool", "content": "four"}],
+                    "completed": True,
+                    "api_calls": 1,
+                }
+
+        child = Child()
+        request = self._request(3, max_tool_output_chars=4)
+        with self.assertRaisesRegex(ChildAgentError, "maxToolOutputChars=4"):
+            self._run_structured(child, request, "structured-output-limit")
+        self.assertEqual(child.calls, 1)
+
+    def test_continuation_history_is_counted_once(self):
+        task_id = "structured-history-budget"
+
+        class Child:
+            session_prompt_tokens = session_completion_tokens = 0
+            session_reasoning_tokens = session_cache_read_tokens = 0
+            session_cache_write_tokens = 0
+            model = "test"
+
+            def __init__(self):
+                self.calls = 0
+
+            def run_conversation(self, conversation_history=None, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return {
+                        "final_response": "continue",
+                        "messages": [
+                            {"role": "assistant", "tool_calls": [{"id": "one"}]},
+                            {"role": "tool", "tool_call_id": "one", "content": "four"},
+                        ],
+                        "completed": True,
+                        "api_calls": 1,
+                    }
+                structured_output_handler({"ok": True}, task_id=kwargs["task_id"])
+                return {
+                    "final_response": "done",
+                    "messages": list(conversation_history or []) + [
+                        {"role": "assistant", "content": "done"},
+                    ],
+                    "completed": True,
+                    "api_calls": 1,
+                }
+
+        child = Child()
+        result = self._run_structured(
+            child,
+            self._request(3, max_tool_calls=2, max_tool_output_chars=8),
+            task_id,
+        )
+        self.assertEqual(child.calls, 2)
+        self.assertEqual(result.metadata["tool_calls"], 1)
+        self.assertEqual(result.metadata["tool_output_chars"], 4)
+
+    def test_core_tool_budget_exhaustion_fails_unstructured_child(self):
+        class Child:
+            session_prompt_tokens = session_completion_tokens = 0
+            session_reasoning_tokens = session_cache_read_tokens = 0
+            session_cache_write_tokens = 0
+            model = "test"
+
+            def run_conversation(self, **_kwargs):
+                return {
+                    "final_response": "Tool budget exhausted",
+                    "messages": [],
+                    "completed": False,
+                    "api_calls": 1,
+                    "tool_budget": {
+                        "calls_used": 1,
+                        "output_chars_used": 4,
+                        "exhausted": True,
+                        "exhaustion_reason": "max_calls",
+                    },
+                }
+
+        request = self._request(3, structured=False, max_tool_calls=1)
+        lease = WorkspaceLease(task_id="unstructured-tool-budget", cwd="/tmp")
+        with self.assertRaisesRegex(ChildAgentError, "maxToolCalls=1"):
+            HermesChildAgentRunner(PluginConfig())._run_child_with_timeout(
+                Child(), request, lease, None, []
+            )
+
     def test_codex_runtime_rejected_before_agent_construction(self):
         runner = HermesChildAgentRunner(PluginConfig())
         request = self._request(2, structured=False)
@@ -1748,9 +1885,9 @@ class MaxTurnsRunnerTests(unittest.TestCase):
         create_lease.assert_not_called()
         build_agent.assert_not_called()
 
-    def test_codex_runtime_without_turn_cap_rejects_unsupported_effort(self):
+    def test_codex_runtime_rejects_unsupported_effort(self):
         runner = HermesChildAgentRunner(PluginConfig())
-        request = self._request(None, structured=False)
+        request = self._request(2, structured=False)
         with (
             patch(
                 "hermes_dynamic_workflows.child.runner.create_workspace_lease"
@@ -1768,7 +1905,7 @@ class MaxTurnsRunnerTests(unittest.TestCase):
         build_agent.assert_not_called()
 
     def test_bedrock_primary_and_fallback_rejected_before_workspace_creation(self):
-        request = self._request(None, structured=False)
+        request = self._request(2, structured=False)
         runtimes = (
             {"provider": "bedrock", "api_mode": "bedrock_converse", "model": "claude"},
             {
@@ -1838,6 +1975,51 @@ class MaxTurnsRunnerTests(unittest.TestCase):
         self.assertNotIn("max_iterations", seen[0])
         self.assertEqual(seen[1]["max_iterations"], 7)
 
+    def test_constructor_receives_shared_tool_budget(self):
+        seen = []
+
+        class FakeAIAgent:
+            def __init__(self, **kwargs):
+                seen.append(kwargs)
+
+        class FakeToolBudget:
+            def __init__(self, *, max_calls, max_output_chars):
+                self.max_calls = max_calls
+                self.max_output_chars = max_output_chars
+
+        run_agent_mod = types.ModuleType("run_agent")
+        setattr(run_agent_mod, "AIAgent", FakeAIAgent)
+        budget_mod = types.ModuleType("agent.tool_budget")
+        setattr(budget_mod, "ToolBudget", FakeToolBudget)
+        request = ChildAgentRequest(
+            1,
+            "work",
+            "budgeted",
+            None,
+            [],
+            max_turns=7,
+            max_tool_calls=3,
+            max_tool_output_chars=42,
+            reasoning_effort="high",
+        )
+
+        with patch.dict(
+            sys.modules,
+            {"run_agent": run_agent_mod, "agent.tool_budget": budget_mod},
+        ):
+            HermesChildAgentRunner(PluginConfig())._build_agent(
+                request,
+                {"model": "test-model"},
+                [],
+                WorkspaceLease(task_id="build-budgeted", cwd="/tmp"),
+                None,
+            )
+
+        budget = seen[0]["tool_budget"]
+        self.assertIsInstance(budget, FakeToolBudget)
+        self.assertEqual(budget.max_calls, 3)
+        self.assertEqual(budget.max_output_chars, 42)
+
     def test_capped_constructor_disables_core_exhaustion_summary_call(self):
         summary_calls = []
 
@@ -1892,15 +2074,6 @@ class MaxTurnsRunnerTests(unittest.TestCase):
             HermesChildAgentRunner(PluginConfig())._run_child_with_timeout(
                 Child(), request, lease, None, []
             )
-
-
-class ConfigDefaultsTests(unittest.TestCase):
-    def test_model_override_is_allowed_by_default(self):
-        # Aligns with Claude Code: per-agent model routing is allowed by default
-        # (session model unless a stage overrides). Provider selection stays in
-        # Hermes' runtime/model configuration, not workflow scripts.
-        cfg = PluginConfig()
-        self.assertTrue(cfg.allow_model_override)
 
 
 class ChildApprovalPolicyTests(unittest.TestCase):

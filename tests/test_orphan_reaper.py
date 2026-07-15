@@ -358,7 +358,7 @@ class AutoResumeTests(unittest.TestCase):
                 store=store,
                 config=PluginConfig(auto_resume_on_boot=True, require_launch_approval=False),
             )
-            script = 'meta = {"name": "orphan-test", "description": "x"}\nreturn await agent("go", {"label": "w"})\n'
+            script = 'meta = {"name": "orphan-test", "description": "x"}\nreturn await agent("go", {"label": "w", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})\n'
             _write_run(store, "wf_resume02-lll", status="interrupted", script=script)
 
             captured = {}

@@ -42,11 +42,6 @@ class PluginConfig:
         "messaging",
         "clarify",
     )
-    # Per-agent model override (agent(model=...)) is allowed by default,
-    # matching per-agent / per-stage model routing; the default is still the
-    # session model, override only when a stage wants a different tier. Provider
-    # selection stays in Hermes' runtime/model configuration.
-    allow_model_override: bool = True
     blocked_models: tuple[str, ...] = ()
     # Behavior when a workflow explicitly requests an unknown agentType.
     # error = fail before child launch (default/backward compatible).
@@ -286,10 +281,6 @@ def load_config() -> PluginConfig:
         blocked_child_toolsets=_as_str_tuple(
             raw.get("blocked_child_toolsets"),
             default.blocked_child_toolsets,
-        ),
-        allow_model_override=_as_bool(
-            os.getenv("HERMES_DYNAMIC_WORKFLOWS_ALLOW_MODEL_OVERRIDE", raw.get("allow_model_override")),
-            default.allow_model_override,
         ),
         blocked_models=_as_str_tuple(
             raw.get("blocked_models"),

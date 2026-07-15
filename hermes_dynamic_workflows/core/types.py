@@ -44,6 +44,11 @@ class AgentRecord:
     provider: str | None = None
     base_url: str | None = None
     reasoning_effort: str | None = None
+    max_turns: int | None = None
+    max_tool_calls: int | None = None
+    max_tool_output_chars: int | None = None
+    tool_output_chars: int = 0
+    stop_reason: str | None = None
     attempts: int = 0
     structured: dict[str, Any] = field(default_factory=dict)
 
@@ -83,6 +88,11 @@ class AgentRecord:
             "provider": self.provider,
             "base_url": self.base_url,
             "reasoning_effort": self.reasoning_effort,
+            "max_turns": self.max_turns,
+            "max_tool_calls": self.max_tool_calls,
+            "max_tool_output_chars": self.max_tool_output_chars,
+            "tool_output_chars": self.tool_output_chars,
+            "stop_reason": self.stop_reason,
             "attempts": self.attempts,
             "structured": dict(self.structured),
         }
@@ -92,14 +102,11 @@ class AgentRecord:
 class PhaseSpec:
     title: str
     detail: str = ""
-    model: str | None = None
 
     def snapshot(self) -> dict[str, Any]:
         data: dict[str, Any] = {"title": self.title}
         if self.detail:
             data["detail"] = self.detail
-        if self.model:
-            data["model"] = self.model
         return data
 
 
@@ -220,6 +227,7 @@ class ChildAgentResult:
 class ResolvedAgentSpec:
     requested_agent_type: str | None
     agent_type_spec: Any = None
+    provider: str | None = None
     model: str | None = None
     isolation: str | None = None
     toolsets: tuple[str, ...] = ()
@@ -231,6 +239,8 @@ class ResolvedAgentSpec:
     workspace: str = ""
     warnings: tuple[str, ...] = ()
     max_turns: int | None = None
+    max_tool_calls: int | None = None
+    max_tool_output_chars: int | None = None
     reasoning_effort: str | None = None
 
     @property
@@ -240,6 +250,7 @@ class ResolvedAgentSpec:
 
     def cache_inputs(self) -> dict[str, Any]:
         inputs = {
+            "provider": self.provider,
             "model": self.model,
             "isolation": self.isolation,
             "toolsets": list(self.toolsets),
@@ -253,6 +264,10 @@ class ResolvedAgentSpec:
         }
         if self.max_turns is not None:
             inputs["maxTurns"] = self.max_turns
+        if self.max_tool_calls is not None:
+            inputs["maxToolCalls"] = self.max_tool_calls
+        if self.max_tool_output_chars is not None:
+            inputs["maxToolOutputChars"] = self.max_tool_output_chars
         if self.reasoning_effort is not None:
             inputs["reasoningEffort"] = self.reasoning_effort
         return inputs
@@ -265,6 +280,7 @@ class ChildAgentRequest:
     label: str
     phase: str | None
     toolsets: list[str]
+    provider: str | None = None
     model: str | None = None
     schema: dict[str, Any] | None = None
     agent_type: str | None = None
@@ -276,6 +292,8 @@ class ChildAgentRequest:
     on_update: Callable[[dict[str, Any]], None] | None = None
     resolved: ResolvedAgentSpec | None = None
     max_turns: int | None = None
+    max_tool_calls: int | None = None
+    max_tool_output_chars: int | None = None
     reasoning_effort: str | None = None
 
 
@@ -302,8 +320,9 @@ def normalize_phase_specs(raw: Any) -> list[PhaseSpec]:
             if not title:
                 continue
             detail = str(item.get("detail") or "").strip()
-            model = str(item.get("model") or "").strip() or None
-            phases.append(PhaseSpec(title=title, detail=detail, model=model))
+            if "model" in item:
+                raise ValueError("meta.phases[].model is not supported")
+            phases.append(PhaseSpec(title=title, detail=detail))
     return phases
 
 

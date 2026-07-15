@@ -59,7 +59,6 @@ plugins:
         default_child_toolsets: [web, file, terminal, skills]
                                       # Default toolsets for child agents (used when no agentType is given)
         keep_worktrees: false         # Whether to keep each agent's git worktree (auto-cleaned by default)
-        allow_model_override: true    # Whether agent(model=...) may override the model
         missing_agent_type_policy: error # error|fallback_warn for explicit missing agentType
         require_launch_approval: true # Require confirmation before a top-level workflow launches (denied if nobody is online)
         child_approval_policy: inherit # Child agent approval policy: inherit|smart|deny|approve|ask
@@ -161,19 +160,18 @@ meta = {
 # (pipeline has no barrier: A can be at verify while B is still at review)
 findings = await pipeline(
     args["targets"],
-    lambda t, _o, i: agent(f"Review for bugs: {t}", {"label": f"review:{i}", "phase": "Review"}),
-    lambda r, _o, i: agent(f"Verify adversarially: {json.dumps(r)}", {"label": f"verify:{i}", "phase": "Verify"}),
+    lambda t, _o, i: agent(f"Review for bugs: {t}", {"label": f"review:{i}", "phase": "Review", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 8, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
+    lambda r, _o, i: agent(f"Verify adversarially: {json.dumps(r)}", {"label": f"verify:{i}", "phase": "Verify", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 8, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
 )
-return await agent("Synthesize the verified findings:\n" + json.dumps(findings))
+return await agent("Synthesize the verified findings:\n" + json.dumps(findings), {"provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 6, "maxToolCalls": 8, "maxToolOutputChars": 120000})
 ```
 
-- `agent(prompt, opts)` spawns a child agent; `opts` may include `schema` (enforce
-  structured output), `model`, `agentType`, `isolation="worktree"`, inline
-  `instructions`/`systemPrompt`, `reasoningEffort`, `toolsets`, `allowedTools`, and
-  `disallowedTools`. Every child must resolve reasoning from inline
-  `reasoningEffort` or its agent-type preset; missing values fail before launch.
-  Current Bedrock and `codex_app_server` transports do not forward workflow reasoning
-  effort, so those runtimes fail before child launch.
+- `agent(prompt, opts)` spawns a child agent. Every call requires inline `provider`,
+  canonical `model`, `reasoningEffort`, `maxTurns`, `maxToolCalls`, and
+  `maxToolOutputChars`. Missing or invalid values fail before reservation and launch.
+  Presets define role instructions and tool permissions only; routing and budgets cannot
+  come from presets. Current Bedrock and `codex_app_server` transports do not forward
+  workflow reasoning effort, so those runtimes fail before child launch.
 - `pipeline` (default, no barrier) / `parallel` (with barrier) handle concurrency;
   `phase`/`log` report progress; `workflow()` runs a named workflow inline; `args` /
   `budget` access the input arguments and the token budget.
@@ -193,7 +191,12 @@ await agent(
     "Review this diff for authorization bugs only.",
     {
         "instructions": "You are a read-only security reviewer. Return blockers only.",
+        "provider": "openai-codex",
+        "model": "gpt-5.6-luna",
         "reasoningEffort": "high",
+        "maxTurns": 8,
+        "maxToolCalls": 16,
+        "maxToolOutputChars": 200000,
         "toolsets": ["file", "terminal"],
         "allowedTools": ["read_file", "search_files", "terminal", "process"],
     },
@@ -209,20 +212,18 @@ meta = {
     "agents": {
         "read-only-reviewer": {
             "instructions": "Review for correctness and regression risk. Do not edit files.",
-            "reasoningEffort": "high",
             "toolsets": ["file", "terminal"],
             "allowedTools": ["read_file", "search_files", "terminal", "process"],
         },
         "synthesizer": {
             "instructions": "Synthesize findings into a concise verdict.",
-            "reasoningEffort": "medium",
             "toolsets": [],
         },
     },
 }
 
-findings = await agent("Review diff", {"agentType": "read-only-reviewer"})
-return await agent("Synthesize: " + json.dumps(findings), {"agentType": "synthesizer"})
+findings = await agent("Review diff", {"agentType": "read-only-reviewer", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 8, "maxToolCalls": 16, "maxToolOutputChars": 200000})
+return await agent("Synthesize: " + json.dumps(findings), {"agentType": "synthesizer", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 6, "maxToolCalls": 8, "maxToolOutputChars": 120000})
 ```
 
 Built-in library presets:
@@ -260,19 +261,17 @@ To add a reusable file-backed preset, create a new `.md` file under the project-
 ```markdown
 ---
 name: my-agent
-description: "A short description of what this agent is for; the model uses it to automatically pick the right agent."
-model: inherit
-reasoning_effort: high
+description: "A short description of what this agent is for."
 toolsets: [web, file, terminal]
 ---
 
 Write the agent's system prompt here to guide its behavior, style, and constraints.
 ```
 
-`name` and `description` are required; `model` defaults to `inherit` (inherits the
-current session's model); `toolsets` defaults to the global `default_child_toolsets`;
-`reasoning_effort` is required. Optional fields also include `allowed_tools`,
-`disallowed_tools`, and `isolation`.
+`name` and `description` are required. Presets may define role instructions, `toolsets`,
+`allowed_tools`, `disallowed_tools`, and `isolation`. Preset `provider`, `model`,
+`reasoning_effort`, and child-budget fields are rejected; declare them inline on each
+`agent()` call.
 
 At runtime the plugin persists the script and the full execution trace (transcript) of
 every child agent, and injects a `<task-notification>` into the conversation on

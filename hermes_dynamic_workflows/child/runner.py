@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import inspect
 import os
 import re
@@ -146,9 +147,7 @@ class HermesChildAgentRunner(ChildAgentRunner):
         self._approval_callback = approval_callback if callable(approval_callback) else None
         self._approval_coordinator = _WorkflowApprovalCoordinator(self._approval_callback)
         self._approval_session_key = str(approval_session_key or "").strip()
-        # Captured from the launching main agent. It stays in memory so default
-        # children and model="inherit" use the active session runtime, including
-        # a non-persisted /model switch, without leaking credentials to run data.
+        # Retained for constructor compatibility; workflow children never inherit it.
         self._parent_runtime = dict(parent_runtime) if parent_runtime else None
         self._active_children: dict[str, Any] = {}
         self._skipped_children: set[str] = set()
@@ -159,10 +158,26 @@ class HermesChildAgentRunner(ChildAgentRunner):
         task_id = f"workflow-{uuid.uuid4().hex[:12]}"
         base_cwd = request.cwd or os.environ.get("TERMINAL_CWD") or os.getcwd()
         resolved = request.resolved
-        if resolved is None or request.reasoning_effort is None:
+        if (
+            resolved is None
+            or request.reasoning_effort is None
+            or not (request.provider or "").strip()
+            or not (request.model or "").strip()
+            or request.max_turns is None
+            or request.max_tool_calls is None
+            or request.max_tool_output_chars is None
+        ):
             raise ChildAgentError(
-                "workflow child request is missing a validated resolved reasoning effort"
+                "workflow child request is missing validated explicit provider, model, reasoning effort, or child budgets"
             )
+        if (
+            request.provider != resolved.provider
+            or request.model != resolved.model
+            or request.max_turns != resolved.max_turns
+            or request.max_tool_calls != resolved.max_tool_calls
+            or request.max_tool_output_chars != resolved.max_tool_output_chars
+        ):
+            raise ChildAgentError("workflow child routing or budgets do not match its resolved specification")
         agent_type = resolved.agent_type_spec
         if request.agent_type and agent_type is None:
             available = ", ".join(spec.name for spec in list_agent_types(cwd=base_cwd)) or "none"
@@ -274,69 +289,30 @@ class HermesChildAgentRunner(ChildAgentRunner):
         return _callable_accepts_keyword(AIAgent, "request_overrides")
 
     def _resolve_runtime(self, request: ChildAgentRequest) -> dict[str, Any]:
-        requested_model = (request.model or "").strip() or None
-        if requested_model and requested_model.lower() == "inherit":
-            requested_model = None
-        if requested_model and not self.config.allow_model_override:
-            raise ChildAgentError("model override is disabled for workflow child agents")
-        if requested_model is None and self._parent_runtime is not None:
-            runtime = dict(self._parent_runtime)
-            self._assert_models_allowed(runtime)
-            return runtime
-
+        requested_provider = (request.provider or "").strip().lower()
+        requested_model = (request.model or "").strip()
+        if not requested_provider:
+            raise ChildAgentError("workflow child request is missing an explicit provider")
+        if not requested_model or requested_model.lower() == "inherit":
+            raise ChildAgentError("workflow child request is missing an exact model")
         try:
-            from hermes_cli.config import load_config
-            from hermes_cli.fallback_config import get_fallback_chain
-            from hermes_cli.models import detect_provider_for_model
             from hermes_cli.runtime_provider import resolve_runtime_provider
         except Exception as exc:
             raise ChildAgentError(f"could not import Hermes runtime helpers: {exc}") from exc
 
-        cfg = load_config() or {}
-        model_cfg = cfg.get("model") or {}
-        if isinstance(model_cfg, str):
-            cfg_model = model_cfg
-            cfg_provider = ""
-        else:
-            cfg_model = model_cfg.get("default") or model_cfg.get("model") or ""
-            cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
-
-        env_model = os.getenv("HERMES_INFERENCE_MODEL", "").strip()
-        effective_model = requested_model or env_model or cfg_model
-        effective_provider = None
-        explicit_base_url = None
-
-        if effective_provider is None and (requested_model or env_model):
-            explicit_model = requested_model or env_model
-            direct = None
-            try:
-                from hermes_cli import model_switch as model_switch
-
-                model_switch._ensure_direct_aliases()
-                direct = model_switch.DIRECT_ALIASES.get(explicit_model.strip().lower())
-            except Exception:
-                direct = None
-            if direct is not None:
-                effective_model = direct.model
-                effective_provider = direct.provider
-                explicit_base_url = direct.base_url.rstrip("/") if direct.base_url else None
-            else:
-                current_provider = (
-                    cfg_provider
-                    or os.getenv("HERMES_INFERENCE_PROVIDER", "").strip().lower()
-                    or "auto"
-                )
-                detected = detect_provider_for_model(explicit_model, current_provider)
-                if detected:
-                    effective_provider, effective_model = detected
-
         runtime = resolve_runtime_provider(
-            requested=effective_provider,
-            target_model=effective_model or None,
-            explicit_base_url=explicit_base_url,
+            requested=requested_provider,
+            target_model=requested_model,
+            explicit_base_url=None,
         )
-        runtime["model"] = effective_model
-        runtime["fallback_model"] = get_fallback_chain(cfg) or None
+        resolved_provider = str(runtime.get("provider") or requested_provider).strip().lower()
+        resolved_model = str(runtime.get("model") or requested_model).strip()
+        if resolved_provider != requested_provider or resolved_model != requested_model:
+            raise ChildAgentError(
+                "workflow child provider/model pair did not resolve exactly as requested"
+            )
+        runtime["model"] = requested_model
+        runtime["fallback_model"] = None
         self._assert_models_allowed(runtime)
         return runtime
 
@@ -419,6 +395,17 @@ class HermesChildAgentRunner(ChildAgentRunner):
             kwargs["service_tier"] = runtime["service_tier"]
         if request.max_turns is not None:
             kwargs["max_iterations"] = request.max_turns
+        if request.max_tool_calls is not None and request.max_tool_output_chars is not None:
+            try:
+                ToolBudget = importlib.import_module("agent.tool_budget").ToolBudget
+            except Exception as exc:
+                raise ChildAgentError(
+                    "Hermes core does not support workflow child tool budgets"
+                ) from exc
+            kwargs["tool_budget"] = ToolBudget(
+                max_calls=request.max_tool_calls,
+                max_output_chars=request.max_tool_output_chars,
+            )
         child = AIAgent(**kwargs)
         if request.max_turns is not None:
             # A capped child cannot spend an unreported provider call after its final turn.
@@ -552,18 +539,70 @@ class HermesChildAgentRunner(ChildAgentRunner):
                 history = None
                 stop_attempts = 0
                 remaining_turns = request.max_turns
+                tool_calls_used = 0
+                tool_output_chars_used = 0
+                tool_call_limit = request.max_tool_calls
+                tool_output_limit = request.max_tool_output_chars
+                if tool_call_limit is None or tool_output_limit is None:
+                    raise ChildAgentError("workflow child request is missing child budgets")
                 while True:
                     if remaining_turns is not None:
                         child.max_iterations = remaining_turns
+                    input_history = history
                     result = child.run_conversation(
                         user_message=message,
                         conversation_history=history,
                         task_id=lease.task_id,
                     )
+                    core_budget = result.get("tool_budget") if isinstance(result, dict) else None
+                    if isinstance(core_budget, dict):
+                        tool_calls_used = _nonnegative_int(core_budget.get("calls_used"))
+                        tool_output_chars_used = _nonnegative_int(
+                            core_budget.get("output_chars_used")
+                        )
+                    else:
+                        incremental_result = _incremental_result(result, input_history)
+                        tool_calls_used += _tool_call_count(incremental_result)
+                        tool_output_chars_used += _tool_output_chars(incremental_result)
+                    usage = {
+                        "tool_calls": tool_calls_used,
+                        "tool_output_chars": tool_output_chars_used,
+                    }
+                    _emit_request_update(request, usage)
+                    if tool_calls_used > tool_call_limit:
+                        _emit_request_update(
+                            request,
+                            {
+                                **usage,
+                                "stop_reason": "maxToolCalls",
+                            },
+                        )
+                        raise ChildAgentError(
+                            f"child exhausted maxToolCalls={tool_call_limit}"
+                        )
+                    if tool_output_chars_used > tool_output_limit:
+                        _emit_request_update(
+                            request,
+                            {
+                                **usage,
+                                "stop_reason": "maxToolOutputChars",
+                            },
+                        )
+                        raise ChildAgentError(
+                            f"child exhausted maxToolOutputChars={tool_output_limit}"
+                        )
+                    if isinstance(result, dict):
+                        result["_workflow_tool_calls"] = tool_calls_used
+                        result["_workflow_tool_output_chars"] = tool_output_chars_used
                     capped_exhaustion = (
                         request.max_turns is not None and _capped_child_exhausted(result)
                     )
                     if not request.structured_tool:
+                        _raise_for_core_tool_budget_exhaustion(
+                            core_budget,
+                            tool_call_limit,
+                            tool_output_limit,
+                        )
                         if capped_exhaustion:
                             raise ChildAgentError(
                                 f"child exhausted maxTurns={request.max_turns} before completing"
@@ -581,6 +620,11 @@ class HermesChildAgentRunner(ChildAgentRunner):
                     captured, _value, tool_attempts = peek_result(lease.task_id)
                     if captured:
                         return result
+                    _raise_for_core_tool_budget_exhaustion(
+                        core_budget,
+                        tool_call_limit,
+                        tool_output_limit,
+                    )
                     if capped_exhaustion or (
                         remaining_turns is not None and remaining_turns <= 0
                     ):
@@ -608,6 +652,28 @@ class HermesChildAgentRunner(ChildAgentRunner):
                             "child was interrupted before providing structured output"
                         )
 
+                    if tool_calls_used >= tool_call_limit:
+                        _emit_request_update(
+                            request,
+                            {
+                                **usage,
+                                "stop_reason": "maxToolCalls",
+                            },
+                        )
+                        raise ChildAgentError(
+                            f"child exhausted maxToolCalls={tool_call_limit}"
+                        )
+                    if tool_output_chars_used >= tool_output_limit:
+                        _emit_request_update(
+                            request,
+                            {
+                                **usage,
+                                "stop_reason": "maxToolOutputChars",
+                            },
+                        )
+                        raise ChildAgentError(
+                            f"child exhausted maxToolOutputChars={tool_output_limit}"
+                        )
                     stop_attempts += 1
                     if (
                         tool_attempts >= MAX_STRUCTURED_OUTPUT_RETRIES
@@ -777,14 +843,9 @@ def _apply_agent_type_defaults(
 ) -> ChildAgentRequest:
     if agent_type is None:
         return request
-    model = request.model or agent_type.model
-    if model and model.strip().lower() == "inherit":
-        model = None
     return replace(
         request,
-        model=model,
         isolation=request.isolation or agent_type.isolation,
-        max_turns=request.max_turns or agent_type.max_turns,
     )
 
 
@@ -1370,7 +1431,16 @@ def _child_metadata(
         # how much each child reused vs wrote to the cache.
         "cache_read_tokens": _int_attr(child, "session_cache_read_tokens"),
         "cache_write_tokens": _int_attr(child, "session_cache_write_tokens"),
-        "tool_calls": _tool_call_count(result),
+        "tool_calls": (
+            _nonnegative_int(result.get("_workflow_tool_calls"))
+            if isinstance(result, dict) and "_workflow_tool_calls" in result
+            else _tool_call_count(result)
+        ),
+        "tool_output_chars": (
+            _nonnegative_int(result.get("_workflow_tool_output_chars"))
+            if isinstance(result, dict) and "_workflow_tool_output_chars" in result
+            else _tool_output_chars(result)
+        ),
     }
     return metadata
 
@@ -1394,6 +1464,69 @@ def _reasoning_effort_of(child: Any) -> str | None:
         return None
     effort = cfg.get("effort")
     return str(effort).strip() or None if effort else None
+
+
+def _nonnegative_int(value: Any) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _raise_for_core_tool_budget_exhaustion(
+    core_budget: Any,
+    tool_call_limit: int,
+    tool_output_limit: int,
+) -> None:
+    if not isinstance(core_budget, dict) or not core_budget.get("exhausted"):
+        return
+    reason = core_budget.get("exhaustion_reason")
+    if reason == "max_output_chars":
+        raise ChildAgentError(
+            f"child exhausted maxToolOutputChars={tool_output_limit}"
+        )
+    raise ChildAgentError(f"child exhausted maxToolCalls={tool_call_limit}")
+
+
+def _incremental_result(
+    result: dict[str, Any],
+    input_history: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    messages = result.get("messages") if isinstance(result, dict) else None
+    if (
+        not isinstance(messages, list)
+        or not isinstance(input_history, list)
+        or len(messages) < len(input_history)
+        or messages[: len(input_history)] != input_history
+    ):
+        return result
+    return {**result, "messages": messages[len(input_history) :]}
+
+
+def _tool_output_chars(result: dict[str, Any]) -> int:
+    """Count characters in tool results returned to the child context."""
+    messages = result.get("messages") if isinstance(result, dict) else None
+    if not isinstance(messages, list):
+        return 0
+    return sum(
+        _value_chars(message.get("content"))
+        for message in messages
+        if isinstance(message, dict) and message.get("role") == "tool"
+    )
+
+
+def _value_chars(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, list):
+        return sum(_value_chars(item) for item in value)
+    if isinstance(value, dict):
+        for key in ("text", "content", "output"):
+            if key in value:
+                return _value_chars(value[key])
+    return len(str(value))
 
 
 def _tool_call_count(result: dict[str, Any]) -> int:

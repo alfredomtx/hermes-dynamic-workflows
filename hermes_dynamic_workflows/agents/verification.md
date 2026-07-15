@@ -1,8 +1,7 @@
 ---
 name: verification
 description: "Use this agent to verify that implementation work is correct before reporting completion. Invoke after non-trivial tasks (3+ file edits, backend/API changes, infrastructure changes). Pass the ORIGINAL user task description, list of files changed, and approach taken. The agent runs builds, tests, linters, and checks to produce a PASS/FAIL/PARTIAL verdict with evidence."
-model: inherit
-reasoning_effort: high
+
 toolsets: [web, file, terminal, browser]
 allowed_tools: [web_search, web_extract, read_file, search_files, terminal, process, browser_navigate, browser_snapshot, browser_click, browser_type, browser_scroll, browser_back, browser_press, browser_get_images, browser_vision, browser_console, browser_cdp, browser_dialog]
 ---

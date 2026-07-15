@@ -53,7 +53,6 @@ plugins:
         default_child_toolsets: [web, file, terminal, skills]
                                       # 子 agent 默认 toolset（不指定 agentType 时生效）
         keep_worktrees: false         # 是否保留 agent 的 git worktree（默认自动清理）
-        allow_model_override: true    # 是否允许 agent(model=...) 指定模型
         missing_agent_type_policy: error # 显式缺失 agentType 时: error|fallback_warn
         require_launch_approval: true # 顶层 workflow 启动前需确认（无人在线则拒绝）
         child_approval_policy: inherit # 子 agent 审批策略: inherit|smart|deny|approve|ask
@@ -108,15 +107,15 @@ meta = {
 # 每个目标独立流过 review → verify（pipeline 无栅栏：A 可在 verify 时 B 还在 review）
 findings = await pipeline(
     args["targets"],
-    lambda t, _o, i: agent(f"Review for bugs: {t}", {"label": f"review:{i}", "phase": "Review"}),
-    lambda r, _o, i: agent(f"Verify adversarially: {json.dumps(r)}", {"label": f"verify:{i}", "phase": "Verify"}),
+    lambda t, _o, i: agent(f"Review for bugs: {t}", {"label": f"review:{i}", "phase": "Review", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 8, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
+    lambda r, _o, i: agent(f"Verify adversarially: {json.dumps(r)}", {"label": f"verify:{i}", "phase": "Verify", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 8, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
 )
-return await agent("Synthesize the verified findings:\n" + json.dumps(findings))
+return await agent("Synthesize the verified findings:\n" + json.dumps(findings), {"provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 6, "maxToolCalls": 8, "maxToolOutputChars": 120000})
 ```
 
-- `agent(prompt, opts)` 起一个子代理；`opts` 可带 `schema`（强制结构化输出）、`model`、
-  `agentType`、`isolation="worktree"`、内联 `instructions`/`systemPrompt`、`reasoningEffort`、`toolsets`、`allowedTools`、`disallowedTools`。
-  每个子代理必须从内联 `reasoningEffort` 或 agent type preset 的 `reasoning_effort` 解析推理强度；两者都缺失时会在启动前失败。
+- `agent(prompt, opts)` 起一个子代理。每次调用都必须内联声明 `provider`、规范 `model`、
+  `reasoningEffort`、`maxTurns`、`maxToolCalls` 和 `maxToolOutputChars`；缺失或无效值会在预留 agent 和启动前失败。
+  preset 只定义角色指令和工具权限，不能提供路由或预算。Bedrock 和 `codex_app_server` 当前不会转发 workflow reasoning effort，因此会在子代理启动前失败。
 - `pipeline`（默认，无栅栏）/ `parallel`（栅栏）做并发；`phase`/`log` 报告进度；
   `workflow()` 内联跑命名工作流；`args` / `budget` 取入参与 token 预算。
 
@@ -147,8 +146,8 @@ meta = {
     },
 }
 
-findings = await agent("Review diff", {"agentType": "read-only-reviewer"})
-return await agent("Synthesize: " + json.dumps(findings), {"agentType": "synthesizer"})
+findings = await agent("Review diff", {"agentType": "read-only-reviewer", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 8, "maxToolCalls": 16, "maxToolOutputChars": 200000})
+return await agent("Synthesize: " + json.dumps(findings), {"agentType": "synthesizer", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 6, "maxToolCalls": 8, "maxToolOutputChars": 120000})
 ```
 
 解析顺序：`meta["agents"]` → 项目 `.hermes/dynamic-workflows/agents` → 用户 `~/.hermes/dynamic-workflows/agents` → 插件内置。显式写错 `agentType` 默认报错；`missing_agent_type_policy: fallback_warn` 会记录警告并回退到 `general-purpose`。`toolsets` 省略表示继承；`toolsets: []` 表示无工具；内联/runtime `toolsets` 不会被 discoverable MCP/plugin 工具集自动放宽；`allowedTools` 与 preset 取交集，空列表表示拒绝普通工具。
@@ -165,15 +164,13 @@ return await agent("Synthesize: " + json.dumps(findings), {"agentType": "synthes
 ---
 name: my-agent
 description: "简短描述这个 agent 的用途,模型会根据描述自动选择合适的 agent。"
-model: inherit
-reasoning_effort: high
 toolsets: [web, file, terminal]
 ---
 
 你可以在这里写 agent 的 system prompt,指导它的行为、风格和约束。
 ```
-`name` 和 `description` 必填,`model` 默认 `inherit`(继承当前会话模型),
-`toolsets` 默认走全局 `default_child_toolsets`,`reasoning_effort` 必填,可选字段还有 `allowed_tools`、`disallowed_tools`、`isolation`。
+`name` 和 `description` 必填。preset 可定义 `toolsets`、`allowed_tools`、`disallowed_tools` 和 `isolation`。
+`provider`、`model`、`reasoning_effort` 与子代理预算字段在 preset 中会被拒绝，必须在每次 `agent()` 调用中内联声明。
 
 运行时持久化脚本与每个子代理的完整执行链路（transcript），并在完成时把
 `<task-notification>` 注入对话——无需轮询。用 `/workflows` 看历史与详情。

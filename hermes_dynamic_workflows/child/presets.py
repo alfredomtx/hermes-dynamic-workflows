@@ -42,8 +42,7 @@ def build_runtime_agent_type(
     clean_name = _validate_runtime_agent_name(str(name or ""), source=source)
     if not isinstance(data, dict):
         raise ValueError(f"{source} must be an object")
-    max_turns = _max_turns_from(data, source=source)
-    reasoning_effort = _reasoning_effort_from(data, source=source, key=reasoning_key)
+    _reject_routing_fields(data, source=source)
     spec_name = _validate_runtime_agent_name(
         str(data.get("name") or clean_name), source=source
     )
@@ -76,12 +75,9 @@ def build_runtime_agent_type(
         toolsets=toolsets,
         allowed_tools=allowed_tools,
         disallowed_tools=disallowed_tools,
-        model=_as_optional_str(data.get("model")),
         isolation=_as_runtime_isolation(data.get("isolation"), source=source),
         toolsets_explicit=toolsets_explicit,
         allowed_tools_explicit=allowed_tools_explicit,
-        max_turns=max_turns,
-        reasoning_effort=reasoning_effort,
     )
 
 
@@ -95,7 +91,6 @@ def generic_agent_type() -> AgentTypeSpec:
         source="builtin:generic-fallback",
         description="Generic workflow child agent fallback.",
         toolsets=("*",),
-        model="inherit",
         toolsets_explicit=True,
     )
 
@@ -206,6 +201,7 @@ def _load_markdown_agent_type(name: str, path: Path) -> AgentTypeSpec:
         frontmatter, body = _parse_frontmatter(text)
     except Exception as exc:
         raise ValueError(f"invalid agentType file {path}: {exc}") from exc
+    _reject_routing_fields(frontmatter, source=str(path))
     body = body.strip() or text.strip()
     return AgentTypeSpec(
         name=str(frontmatter.get("name") or Path(name).stem),
@@ -215,16 +211,9 @@ def _load_markdown_agent_type(name: str, path: Path) -> AgentTypeSpec:
         toolsets=_as_tuple(_first_present(frontmatter, "toolsets", "tools")),
         allowed_tools=_as_tuple(_first_present(frontmatter, "allowed_tools", "allowedTools")),
         disallowed_tools=_as_tuple(_first_present(frontmatter, "disallowed_tools", "disallowedTools")),
-        model=_as_optional_str(frontmatter.get("model")),
         isolation=_as_optional_str(frontmatter.get("isolation")),
         toolsets_explicit=("toolsets" in frontmatter or "tools" in frontmatter),
         allowed_tools_explicit=("allowed_tools" in frontmatter or "allowedTools" in frontmatter),
-        max_turns=_max_turns_from(frontmatter, source=str(path)),
-        reasoning_effort=_reasoning_effort_from(
-            frontmatter,
-            source=str(path),
-            key="reasoning_effort",
-        ),
     )
 
 
@@ -312,15 +301,22 @@ def _read_simple_yaml_text(text: str) -> dict[str, Any]:
     return data
 
 
-def _max_turns_from(data: dict[str, Any], *, source: str) -> int | None:
-    if "max_turns" in data:
-        raise ValueError(f"{source} max_turns is not supported; use maxTurns")
-    if "maxTurns" not in data:
-        return None
-    value = data["maxTurns"]
-    if type(value) is not int or not 1 <= value <= 1000:
-        raise ValueError(f"{source} maxTurns must be an integer from 1 to 1000")
-    return value
+def _reject_routing_fields(data: dict[str, Any], *, source: str) -> None:
+    for key in (
+        "provider",
+        "model",
+        "reasoningEffort",
+        "reasoning_effort",
+        "agentType",
+        "maxTurns",
+        "max_turns",
+        "maxToolCalls",
+        "max_tool_calls",
+        "maxToolOutputChars",
+        "max_tool_output_chars",
+    ):
+        if key in data:
+            raise ValueError(f"{source} {key} is not supported; set it inline on agent()")
 
 
 def _reasoning_effort_from(

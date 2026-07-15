@@ -60,7 +60,6 @@ plugins:
         default_child_toolsets: [web, file, terminal, skills]
                                       # 子エージェントのデフォルトツールセット（agentType が指定されていない場合に使用）
         keep_worktrees: false         # 各エージェントの git worktree を残すかどうか（デフォルトでは自動クリーンアップ）
-        allow_model_override: true    # agent(model=...) によるモデルの上書きを許可するかどうか
         missing_agent_type_policy: error # 明示的な agentType が見つからない場合: error|fallback_warn
         require_launch_approval: true # トップレベルのワークフロー起動前に確認を要求する（オンラインの人がいない場合は拒否）
         child_approval_policy: inherit # 子エージェントの承認ポリシー: inherit|smart|deny|approve|ask
@@ -123,15 +122,15 @@ meta = {
 # (pipeline にはバリアがない: B がまだ review にいる間に A は verify にいられる)
 findings = await pipeline(
     args["targets"],
-    lambda t, _o, i: agent(f"バグをレビュー: {t}", {"label": f"review:{i}", "phase": "Review"}),
-    lambda r, _o, i: agent(f"敵対的に検証: {json.dumps(r)}", {"label": f"verify:{i}", "phase": "Verify"}),
+    lambda t, _o, i: agent(f"バグをレビュー: {t}", {"label": f"review:{i}", "phase": "Review", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 8, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
+    lambda r, _o, i: agent(f"敵対的に検証: {json.dumps(r)}", {"label": f"verify:{i}", "phase": "Verify", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 8, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
 )
-return await agent("検証済みの結果を統合する:\n" + json.dumps(findings))
+return await agent("検証済みの結果を統合する:\n" + json.dumps(findings), {"provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 6, "maxToolCalls": 8, "maxToolOutputChars": 120000})
 ```
 
-- `agent(prompt, opts)` は子エージェントを起動します。`opts` には `schema`（構造化出力を強制）、
-  `model`、`agentType`、`isolation="worktree"`、インライン `instructions`/`systemPrompt`、`reasoningEffort`、`toolsets`、`allowedTools`、`disallowedTools` を含めることができます。
-  各子エージェントは、インラインの `reasoningEffort` または agent type preset の `reasoning_effort` を必ず解決します。どちらもない場合は起動前に失敗します。
+- `agent(prompt, opts)` は子エージェントを起動します。各呼び出しは `provider`、正規の `model`、
+  `reasoningEffort`、`maxTurns`、`maxToolCalls`、`maxToolOutputChars` をインラインで必ず宣言します。欠落または無効な値はエージェント予約・起動前に失敗します。
+  preset はロール指示とツール権限だけを定義し、ルーティングや予算を提供できません。Bedrock と `codex_app_server` は workflow reasoning effort を転送しないため、子エージェント起動前に失敗します。
 - `pipeline`（デフォルト、バリアなし）／`parallel`（バリアあり）が並行処理を扱います。
   `phase`／`log` は進捗を報告し、`workflow()` は名前付きワークフローをインラインで実行し、`args` /
   `budget` は入力引数とトークン予算にアクセスします。
@@ -164,8 +163,8 @@ meta = {
     },
 }
 
-findings = await agent("Review diff", {"agentType": "read-only-reviewer"})
-return await agent("Synthesize: " + json.dumps(findings), {"agentType": "synthesizer"})
+findings = await agent("Review diff", {"agentType": "read-only-reviewer", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 8, "maxToolCalls": 16, "maxToolOutputChars": 200000})
+return await agent("Synthesize: " + json.dumps(findings), {"agentType": "synthesizer", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 6, "maxToolCalls": 8, "maxToolOutputChars": 120000})
 ```
 
 解決順序は `meta["agents"]` → project `.hermes/dynamic-workflows/agents` → user `~/.hermes/dynamic-workflows/agents` → plugin built-ins です。明示された `agentType` が見つからない場合はデフォルトでエラーです。`missing_agent_type_policy: fallback_warn` なら警告を記録して `general-purpose` にフォールバックします。`toolsets` 省略は継承、`toolsets: []` はツールなし、inline/runtime の `toolsets` は discoverable MCP/plugin toolsets で拡張されません。`allowedTools` は preset と交差し、空リストは通常ツールを拒否します。
@@ -183,17 +182,14 @@ return await agent("Synthesize: " + json.dumps(findings), {"agentType": "synthes
 ---
 name: my-agent
 description: "このエージェントが何のためのものかの短い説明。モデルがこれを使って適切なエージェントを自動選択します。"
-model: inherit
-reasoning_effort: high
 toolsets: [web, file, terminal]
 ---
 
 ここにエージェントのシステムプロンプトを記述し、その挙動、スタイル、制約を指示します。
 ```
 
-`name` と `description` は必須です。`model` のデフォルトは `inherit`（現在のセッションの
-モデルを継承）、`toolsets` のデフォルトはグローバルの `default_child_toolsets` です。
-`reasoning_effort` は必須です。オプションフィールドとして `allowed_tools`、`disallowed_tools`、`isolation` もあります。
+`name` と `description` は必須です。preset は `toolsets`、`allowed_tools`、`disallowed_tools`、`isolation` を定義できます。
+`provider`、`model`、`reasoning_effort`、子エージェント予算フィールドは preset では拒否され、各 `agent()` 呼び出しでインライン宣言する必要があります。
 
 実行時、プラグインはスクリプトとすべての子エージェントの完全な実行トレース（トランスクリプト）を
 永続化し、完了時に `<task-notification>` を会話に注入します。ポーリングは不要です。

@@ -53,7 +53,6 @@ class ToolTests(unittest.TestCase):
                 """---
 name: code-reviewer
 description: Review code for bugs and regressions.
-model: test-model
 toolsets: [file, terminal]
 ---
 
@@ -87,15 +86,19 @@ Review code carefully.
         description = get_dynamic_workflow_schema()["description"]
 
         for text in (
+            "provider",
+            "canonical `model`",
+            "reasoningEffort",
             "maxTurns",
+            "maxToolCalls",
+            "maxToolOutputChars",
             "1..1000",
-            "inline",
-            "preset",
-            "research",
-            "review",
+            "1..10000",
+            "1..20000000",
+            "required inline",
+            "role presets",
             "codex_app_server",
-            "wall-clock",
-            "provider retries",
+            "Provider retries",
         ):
             self.assertIn(text, description)
 
@@ -134,7 +137,7 @@ Review code carefully.
         script = """
 meta = {"name": "budget-source", "description": "Test workflow"}
 
-await agent("do it", {"label": "worker"})
+await agent("do it", {"label": "worker", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 return budget.total
 """
         with tempfile.TemporaryDirectory() as tmp:
@@ -180,7 +183,7 @@ return budget.total
         script = """
 meta = {"name": "tool-test", "description": "Test workflow"}
 
-return await agent("do it", {"label": "worker"})
+return await agent("do it", {"label": "worker", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         with tempfile.TemporaryDirectory() as tmp:
             manager = WorkflowRunManager(
@@ -214,7 +217,7 @@ return await agent("do it", {"label": "worker"})
         script = """
 meta = {"name": "inherit-runtime", "description": "Test workflow"}
 
-return await agent("do it", {"label": "worker"})
+return await agent("do it", {"label": "worker", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         parent = SimpleNamespace(
             model="session-switched-model",
@@ -278,7 +281,7 @@ return await agent("do it", {"label": "worker"})
         script = """
 meta = {"name": "stop-test", "description": "Stop me"}
 
-return await agent("wait", {"label": "worker"})
+return await agent("wait", {"label": "worker", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         with tempfile.TemporaryDirectory() as tmp:
             runner = BlockingRunner()
@@ -342,7 +345,7 @@ return await agent("wait", {"label": "worker"})
         script = """
 meta = {"name": "resume-active", "description": "Still running"}
 
-return await agent("wait", {"label": "worker"})
+return await agent("wait", {"label": "worker", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         with tempfile.TemporaryDirectory() as tmp:
             runner = BlockingRunner()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
 import inspect
 import threading
 from pathlib import Path
@@ -101,7 +102,6 @@ class WorkflowAPI:
             cwd=self.frame.cwd,
             config=self.config,
             structured_output=schema is not None,
-            phase_model=_phase_model(self.frame, phase_name),
             runtime_agents=_runtime_agent_specs(self.frame.meta),
         )
         for warning in resolved.warnings:
@@ -118,8 +118,12 @@ class WorkflowAPI:
                 prompt_preview=preview(prompt, 160),
                 agent_type=resolved.agent_type_name,
                 isolation=resolved.isolation or "shared",
+                provider=resolved.provider,
                 model=resolved.model,
                 reasoning_effort=resolved.reasoning_effort,
+                max_turns=resolved.max_turns,
+                max_tool_calls=resolved.max_tool_calls,
+                max_tool_output_chars=resolved.max_tool_output_chars,
             )
             self.frame.agents.append(record)
             self._notify()
@@ -186,6 +190,7 @@ class WorkflowAPI:
             label=label,
             phase=phase_name,
             toolsets=list(resolved.toolsets),
+            provider=resolved.provider,
             model=resolved.model,
             schema=schema,
             agent_type=resolved.agent_type_name,
@@ -196,6 +201,8 @@ class WorkflowAPI:
             on_update=on_child_update,
             resolved=resolved,
             max_turns=resolved.max_turns,
+            max_tool_calls=resolved.max_tool_calls,
+            max_tool_output_chars=resolved.max_tool_output_chars,
             reasoning_effort=resolved.reasoning_effort,
         )
         if schema:
@@ -431,6 +438,7 @@ _PUBLIC_AGENT_OPT_KEYS = frozenset(
         "label",
         "phase",
         "schema",
+        "provider",
         "model",
         "isolation",
         "agentType",
@@ -444,6 +452,8 @@ _PUBLIC_AGENT_OPT_KEYS = frozenset(
         "system_prompt",
         "description",
         "maxTurns",
+        "maxToolCalls",
+        "maxToolOutputChars",
         "reasoningEffort",
     }
 )
@@ -473,18 +483,58 @@ def _validate_agent_opts(opts: dict[str, Any]) -> None:
         raise WorkflowRuntimeError(
             "unsupported agent() option(s): "
             + ", ".join(unknown)
-            + ". Public workflow agent options are label, phase, schema, model, "
+            + ". Public workflow agent options are label, phase, schema, provider, model, "
             "isolation, agentType, toolsets, allowedTools, disallowedTools, "
-            "instructions, systemPrompt, maxTurns, and reasoningEffort. Provider/runtime, timeout, "
-            "and retry policy belong in Hermes/plugin configuration, not workflow scripts."
+            "instructions, systemPrompt, maxTurns, maxToolCalls, maxToolOutputChars, "
+            "and reasoningEffort. Runtime, timeout, and retry policy belong in "
+            "Hermes/plugin configuration, not workflow scripts."
         )
-    from ..child.presets import _max_turns_from, _reasoning_effort_from
+    from ..child.presets import _reasoning_effort_from
 
     try:
-        _max_turns_from(opts, source="agent()")
-        _reasoning_effort_from(opts, source="agent()", key="reasoningEffort")
+        effort = _reasoning_effort_from(opts, source="agent()", key="reasoningEffort")
     except ValueError as exc:
         raise WorkflowRuntimeError(str(exc)) from exc
+    for key in ("provider", "model"):
+        value = opts.get(key)
+        if not isinstance(value, str) or not value.strip() or value.strip().lower() == "inherit":
+            raise WorkflowRuntimeError(f"agent() {key} is required")
+    provider = str(opts["provider"]).strip().lower()
+    model = str(opts["model"]).strip()
+    if provider == "auto":
+        raise WorkflowRuntimeError("agent() provider must be explicit; auto is not supported")
+    try:
+        config_module = importlib.import_module("hermes_cli.config")
+        aliases = (config_module.load_config() or {}).get("model_aliases") or {}
+    except Exception as exc:
+        raise WorkflowRuntimeError(
+            f"could not validate agent() canonical model id: {exc}"
+        ) from exc
+    if isinstance(aliases, dict) and model.lower() in {
+        str(alias).strip().lower() for alias in aliases
+    }:
+        raise WorkflowRuntimeError(
+            "agent() model must be a canonical model id, not a configured alias"
+        )
+    if effort is None:
+        raise WorkflowRuntimeError("agent() reasoningEffort is required")
+    for key, upper in (
+        ("maxTurns", 1000),
+        ("maxToolCalls", 10000),
+        ("maxToolOutputChars", 20_000_000),
+    ):
+        _required_limit(opts, key, upper)
+
+
+def _required_limit(opts: dict[str, Any], key: str, upper: int) -> int:
+    if key not in opts:
+        raise WorkflowRuntimeError(f"agent() {key} is required")
+    value = opts.get(key)
+    if type(value) is not int or not 1 <= value <= upper:
+        raise WorkflowRuntimeError(
+            f"agent() {key} must be an integer from 1 to {upper}"
+        )
+    return value
 
 
 def _check_vm_array_length(items: list[Any]) -> None:
@@ -548,7 +598,6 @@ def _resolve_agent_spec(
     cwd: str,
     config: Any,
     structured_output: bool,
-    phase_model: str | None = None,
     runtime_agents: dict[str, Any] | None = None,
 ) -> ResolvedAgentSpec:
     from ..child.presets import generic_agent_type, list_agent_types, resolve_agent_type
@@ -592,23 +641,22 @@ def _resolve_agent_spec(
         )
 
     effective_spec = _compose_effective_agent_type(agent_type_spec, opts)
-    reasoning_effort = getattr(effective_spec, "reasoning_effort", None)
-    if reasoning_effort is None:
-        source = str(getattr(effective_spec, "source", "") or requested_type)
-        raise WorkflowRuntimeError(
-            f"{source} reasoningEffort is required; set it on agent() or the resolved agentType"
-        )
+    from ..child.presets import _reasoning_effort_from
+
+    reasoning_effort = _reasoning_effort_from(
+        opts,
+        source="agent()",
+        key="reasoningEffort",
+    )
     explicit_isolation = _normalize_isolation(opts.get("isolation"))
     agent_type_isolation = _normalize_agent_type_isolation(
         getattr(effective_spec, "isolation", None)
     )
-    model = _normalize_agent_model(
-        opts.get("model")
-        if opts.get("model")
-        else phase_model
-        if phase_model
-        else getattr(effective_spec, "model", None)
-    )
+    provider = str(opts["provider"]).strip()
+    model = str(opts["model"]).strip()
+    max_turns = _required_limit(opts, "maxTurns", 1000)
+    max_tool_calls = _required_limit(opts, "maxToolCalls", 10000)
+    max_tool_output_chars = _required_limit(opts, "maxToolOutputChars", 20_000_000)
     _prepare_mcp_tool_registry(config)
     has_inline_or_meta_tool_surface = _has_inline_tool_surface(opts) or (
         not explicit_type
@@ -634,7 +682,8 @@ def _resolve_agent_spec(
     return ResolvedAgentSpec(
         requested_agent_type=requested_type,
         agent_type_spec=effective_spec,
-        model=model or None,
+        provider=provider,
+        model=model,
         isolation=explicit_isolation or agent_type_isolation,
         toolsets=toolsets,
         toolsets_explicit=bool(getattr(effective_spec, "toolsets_explicit", False)),
@@ -644,13 +693,15 @@ def _resolve_agent_spec(
         system_prompt_hash=hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         workspace=str(Path(cwd).expanduser().resolve()),
         warnings=tuple(warnings),
-        max_turns=getattr(effective_spec, "max_turns", None),
+        max_turns=max_turns,
+        max_tool_calls=max_tool_calls,
+        max_tool_output_chars=max_tool_output_chars,
         reasoning_effort=reasoning_effort,
     )
 
 
 def _compose_effective_agent_type(base_spec: Any, opts: dict[str, Any]) -> Any:
-    from ..child.presets import AgentTypeSpec, _max_turns_from, _reasoning_effort_from
+    from ..child.presets import AgentTypeSpec, _reasoning_effort_from
 
     inline_instructions = _inline_instructions(opts)
     inline_toolsets, inline_toolsets_explicit = _tuple_option(opts, "toolsets", "toolsets")
@@ -660,7 +711,7 @@ def _compose_effective_agent_type(base_spec: Any, opts: dict[str, Any]) -> Any:
     inline_disallowed, inline_disallowed_explicit = _tuple_option(
         opts, "disallowedTools", "disallowed_tools", field_name="disallowedTools"
     )
-    inline_max_turns = _max_turns_from(opts, source="agent()")
+    inline_max_turns = _required_limit(opts, "maxTurns", 1000)
     inline_reasoning_effort = _reasoning_effort_from(
         opts,
         source="agent()",
@@ -715,20 +766,11 @@ def _compose_effective_agent_type(base_spec: Any, opts: dict[str, Any]) -> Any:
         toolsets=toolsets,
         allowed_tools=allowed_tools,
         disallowed_tools=disallowed_tools,
-        model=getattr(base_spec, "model", None),
         isolation=getattr(base_spec, "isolation", None),
         toolsets_explicit=toolsets_explicit,
         allowed_tools_explicit=allowed_tools_explicit,
-        max_turns=(
-            inline_max_turns
-            if "maxTurns" in opts
-            else getattr(base_spec, "max_turns", None)
-        ),
-        reasoning_effort=(
-            inline_reasoning_effort
-            if "reasoningEffort" in opts
-            else getattr(base_spec, "reasoning_effort", None)
-        ),
+        max_turns=inline_max_turns,
+        reasoning_effort=inline_reasoning_effort,
     )
 
 
@@ -909,6 +951,8 @@ def _apply_child_metadata(record: AgentRecord, metadata: dict[str, Any]) -> None
         _optional_str(metadata.get("reasoning_effort")) or record.reasoning_effort
     )
     record.tool_calls = _as_int_metadata(metadata.get("tool_calls"))
+    record.tool_output_chars = _as_int_metadata(metadata.get("tool_output_chars"))
+    record.stop_reason = _optional_str(metadata.get("stop_reason")) or record.stop_reason
 
 
 def _optional_str(value: Any) -> str | None:

@@ -81,7 +81,7 @@ class RuntimeTests(unittest.TestCase):
     def test_live_child_updates_refresh_snapshot_and_journal(self):
         events = []
         result = run_workflow(
-            'meta = {"name": "live", "description": "live"}\nreturn await agent("work")',
+            'meta = {"name": "live", "description": "live"}\nreturn await agent("work", {"provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})',
             WorkflowOptions(
                 config=PluginConfig(),
                 child_runner=LiveUpdateRunner(),
@@ -100,7 +100,7 @@ class RuntimeTests(unittest.TestCase):
 meta = {"name": "simple", "description": "Test workflow", "phases": ["scan"]}
 
 phase("scan")
-return await agent("inspect repo", {"label": "scan-agent"})
+return await agent("inspect repo", {"label": "scan-agent", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         runner = FakeRunner()
         with patch(
@@ -132,7 +132,7 @@ def workflow():
 meta = {"name": "top-level-await", "description": "Test workflow", "phases": ["scan"]}
 
 phase("scan")
-return await agent("inspect repo", {"label": "top-agent"})
+return await agent("inspect repo", {"label": "top-agent", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         runner = FakeRunner()
         result = run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
@@ -147,9 +147,9 @@ return await agent("inspect repo", {"label": "top-agent"})
 meta = {"name": "parallel", "description": "Test workflow"}
 
 return await parallel([
-    lambda: agent("a", {"label": "a"}),
-    lambda: agent("b", {"label": "b"}),
-    lambda: agent("c", {"label": "c"}),
+    lambda: agent("a", {"label": "a", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
+    lambda: agent("b", {"label": "b", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
+    lambda: agent("c", {"label": "c", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
 ])
 """
         runner = FakeRunner()
@@ -201,7 +201,7 @@ meta = {"name": "structured", "description": "Test workflow"}
 
 return await agent(
     "return status",
-    {"label": "json", "schema": {"type": "object", "required": ["ok"]}},
+    {"label": "json", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000, "schema": {"type": "object", "required": ["ok"]}},
 )
 """
         runner = FakeRunner(
@@ -226,7 +226,7 @@ meta = {"name": "structured-no-parse", "description": "Test workflow"}
 
 return await agent(
     "return status",
-    {"label": "json", "schema": {"type": "object", "required": ["ok"]}},
+    {"label": "json", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000, "schema": {"type": "object", "required": ["ok"]}},
 )
 """
         runner = FakeRunner(responses=['{"ok": true}'])
@@ -240,7 +240,7 @@ meta = {"name": "invalid-schema", "description": "Test workflow"}
 
 return await agent(
     "return status",
-    {"label": "json", "schema": {"type": 123}},
+    {"label": "json", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000, "schema": {"type": 123}},
 )
 """
         runner = FakeRunner()
@@ -260,6 +260,31 @@ return await agent("go", {"label": "r", "toolsets": ["web"], "retries": 2})
             run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=FakeRunner()))
         self.assertIn("unsupported agent() option(s): retries", str(ctx.exception))
         self.assertIn("toolsets", str(ctx.exception))
+        self.assertIn("maxToolCalls", str(ctx.exception))
+        self.assertIn("maxToolOutputChars", str(ctx.exception))
+        self.assertNotIn("maxToolCalls, maxToolOutputChars, and retry policy belong", str(ctx.exception))
+
+    def test_agent_rejects_auto_provider(self):
+        script = """
+meta = {"name": "auto-provider", "description": "Test workflow"}
+return await agent("go", {"provider": "auto", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
+"""
+        with self.assertRaisesRegex(Exception, "provider must be explicit"):
+            run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=FakeRunner()))
+
+    def test_agent_rejects_configured_model_alias(self):
+        script = """
+meta = {"name": "model-alias", "description": "Test workflow"}
+return await agent("go", {"provider": "bedrock", "model": "sonnet", "reasoningEffort": "high", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
+"""
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"model_aliases": {"sonnet": {"provider": "bedrock", "model": "canonical"}}},
+            ),
+            self.assertRaisesRegex(Exception, "canonical model id"),
+        ):
+            run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=FakeRunner()))
 
     def test_agent_accepts_inline_runtime_agent_options(self):
         script = """
@@ -269,6 +294,12 @@ return await agent(
     "go",
     {
         "label": "inline",
+        "provider": "openai-codex",
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "medium",
+        "maxTurns": 10,
+        "maxToolCalls": 16,
+        "maxToolOutputChars": 200000,
         "instructions": "INLINE ROLE",
         "toolsets": ["file"],
         "allowedTools": ["read_file", "search_files"],
@@ -294,7 +325,7 @@ return await agent(
         script = """
 meta = {"name": "inline-empty-tools", "description": "Test workflow"}
 
-return await agent("go", {"label": "empty", "toolsets": []})
+return await agent("go", {"label": "empty", "toolsets": [], "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         runner = FakeRunner()
         run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
@@ -308,7 +339,7 @@ return await agent("go", {"label": "empty", "toolsets": []})
         script = """
 meta = {"name": "inline-none-tools", "description": "Test workflow"}
 
-return await agent("go", {"label": "none", "toolsets": None})
+return await agent("go", {"label": "none", "toolsets": None, "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         runner = FakeRunner()
         with patch(
@@ -338,12 +369,11 @@ meta = {
             "instructions": "RUNTIME READER",
             "toolsets": ["file"],
             "allowedTools": ["read_file"],
-            "reasoningEffort": "medium",
         }
     },
 }
 
-return await agent("go", {"agentType": "reader", "label": "reader", "allowedTools": None})
+return await agent("go", {"agentType": "reader", "label": "reader", "allowedTools": None, "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         runner = FakeRunner()
         run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
@@ -363,13 +393,11 @@ meta = {
             "instructions": "RUNTIME READER",
             "toolsets": ["file"],
             "allowedTools": ["read_file"],
-            "model": "inherit",
-            "reasoningEffort": "medium",
         }
     },
 }
 
-return await agent("go", {"agentType": "reader", "label": "reader"})
+return await agent("go", {"agentType": "reader", "label": "reader", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         runner = FakeRunner()
         run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
@@ -377,13 +405,118 @@ return await agent("go", {"agentType": "reader", "label": "reader"})
         request = runner.requests[0]
         self.assertEqual(request.agent_type, "reader")
         self.assertEqual(request.toolsets, ["file"])
-        self.assertIsNone(request.model)
+        self.assertEqual(request.model, "gpt-5.6-luna")
         self.assertIsNotNone(request.resolved)
         assert request.resolved is not None
         self.assertEqual(request.resolved.agent_type_spec.source, "meta.agents.reader")
         self.assertIn("RUNTIME READER", request.resolved.agent_type_spec.instructions)
         self.assertEqual(request.resolved.allowed_tools, ("read_file",))
         self.assertTrue(request.resolved.allowed_tools_explicit)
+
+    def test_agent_requires_inline_provider_model_and_effort_before_launch(self):
+        complete = {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "reasoningEffort": "high",
+            "maxTurns": 10,
+            "maxToolCalls": 16,
+            "maxToolOutputChars": 200000,
+        }
+        for missing in complete:
+            opts = {key: value for key, value in complete.items() if key != missing}
+            script = (
+                'meta = {"name": "missing-routing", "description": "Test workflow"}\n'
+                f'return await agent("go", {opts!r})\n'
+            )
+            runner = FakeRunner()
+
+            with self.subTest(missing=missing):
+                with self.assertRaises(Exception) as ctx:
+                    run_workflow(
+                        script,
+                        WorkflowOptions(config=PluginConfig(), child_runner=runner),
+                    )
+
+                self.assertIn(f"agent() {missing} is required", str(ctx.exception))
+                self.assertEqual(runner.requests, [])
+
+    def test_inline_provider_model_and_effort_reach_request_and_cache_inputs(self):
+        script = """
+meta = {"name": "explicit-routing", "description": "Test workflow"}
+
+return await agent("go", {
+    "provider": "openai-codex",
+    "model": "gpt-5.6-luna",
+    "reasoningEffort": "max",
+    "maxTurns": 10,
+    "maxToolCalls": 16,
+    "maxToolOutputChars": 200000,
+})
+"""
+        runner = FakeRunner()
+        run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+
+        request = runner.requests[0]
+        self.assertEqual(request.provider, "openai-codex")
+        self.assertEqual(request.model, "gpt-5.6-luna")
+        self.assertEqual(request.reasoning_effort, "max")
+        self.assertEqual(request.resolved.cache_inputs()["provider"], "openai-codex")
+
+    def test_runtime_preset_rejects_routing_and_nested_agent_type_fields(self):
+        cases = {
+            "provider": '"provider": "openai-codex"',
+            "model": '"model": "gpt-5.6-luna"',
+            "reasoningEffort": '"reasoningEffort": "high"',
+            "agentType": '"agentType": "activix-reviewer"',
+        }
+        for field, definition in cases.items():
+            script = f'''meta = {{
+    "name": "preset-routing",
+    "description": "Test workflow",
+    "agents": {{"reader": {{"instructions": "Read.", {definition}}}}},
+}}
+return await agent("go", {{
+    "agentType": "reader",
+    "provider": "openai-codex",
+    "model": "gpt-5.6-luna",
+    "reasoningEffort": "high",
+    "maxTurns": 10,
+    "maxToolCalls": 16,
+    "maxToolOutputChars": 200000,
+}})
+'''
+            runner = FakeRunner()
+
+            with self.subTest(field=field), self.assertRaises(Exception) as ctx:
+                run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+
+            self.assertIn(f"meta.agents.reader {field} is not supported", str(ctx.exception))
+            self.assertEqual(runner.requests, [])
+
+    def test_phase_model_is_rejected(self):
+        script = """
+meta = {
+    "name": "phase-routing",
+    "description": "Test workflow",
+    "phases": [{"title": "Audit", "model": "gpt-5.6-sol"}],
+}
+phase("Audit")
+return await agent("go", {
+    "provider": "openai-codex",
+    "model": "gpt-5.6-luna",
+    "reasoningEffort": "high",
+    "maxTurns": 10,
+    "maxToolCalls": 16,
+    "maxToolOutputChars": 200000,
+})
+"""
+        runner = FakeRunner()
+
+        with self.assertRaises(Exception) as ctx:
+            run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+
+        self.assertIn("meta.phases[].model is not supported", str(ctx.exception))
+        self.assertEqual(runner.requests, [])
 
     def test_runtime_meta_agent_precedes_project_file_agent(self):
         script = """
@@ -394,12 +527,11 @@ meta = {
         "reader": {
             "instructions": "META WINS",
             "toolsets": ["file"],
-            "reasoningEffort": "medium",
         }
     },
 }
 
-return await agent("go", {"agentType": "reader", "label": "reader"})
+return await agent("go", {"agentType": "reader", "label": "reader", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         with tempfile.TemporaryDirectory() as tmp:
             agent_dir = Path(tmp) / ".hermes" / "dynamic-workflows" / "agents"
@@ -427,7 +559,7 @@ return await agent("go", {"agentType": "reader", "label": "reader"})
         script = """
 meta = {"name": "missing-fallback", "description": "Test workflow"}
 
-return await agent("go", {"agentType": "missing-reader", "label": "fallback"})
+return await agent("go", {"agentType": "missing-reader", "label": "fallback", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         runner = FakeRunner()
         result = run_workflow(
@@ -445,15 +577,15 @@ return await agent("go", {"agentType": "missing-reader", "label": "fallback"})
     def test_malformed_runtime_meta_agent_definitions_raise_before_launch(self):
         cases = [
             ("""meta = {"name":"bad","description":"bad","agents": []}
-return await agent("x")""", "meta.agents must be an object"),
+return await agent("x", {"provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})""", "meta.agents must be an object"),
             ("""meta = {"name":"bad","description":"bad","agents": {"../bad": {"instructions":"x"}}}
-return await agent("x")""", "invalid runtime agent name"),
+return await agent("x", {"provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})""", "invalid runtime agent name"),
             ("""meta = {"name":"bad","description":"bad","agents": {"reader": []}}
-return await agent("x", {"agentType":"reader"})""", "meta.agents.reader must be an object"),
+return await agent("x", {"agentType":"reader", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})""", "meta.agents.reader must be an object"),
             ("""meta = {"name":"bad","description":"bad","agents": {"reader": {"instructions":"x", "toolsets": 12}}}
-return await agent("x", {"agentType":"reader"})""", "toolsets must be"),
+return await agent("x", {"agentType":"reader", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})""", "toolsets must be"),
             ("""meta = {"name":"bad","description":"bad","agents": {"reader": {"instructions":"x", "isolation": "bad"}}}
-return await agent("x", {"agentType":"reader"})""", "isolation must be"),
+return await agent("x", {"agentType":"reader", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})""", "isolation must be"),
         ]
         for script, message in cases:
             runner = FakeRunner()
@@ -467,7 +599,7 @@ return await agent("x", {"agentType":"reader"})""", "isolation must be"),
         script = """
 meta = {"name": "empty-allow", "description": "Test workflow"}
 
-return await agent("go", {"label": "deny", "allowedTools": []})
+return await agent("go", {"label": "deny", "allowedTools": [], "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         runner = FakeRunner()
         run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
@@ -489,7 +621,7 @@ return "no agents"
         script = """
 meta = {"name": "direct-failure", "description": "Test workflow"}
 
-return await agent("fail", {"label": "direct"})
+return await agent("fail", {"label": "direct", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         with self.assertRaises(ChildAgentError) as ctx:
             run_workflow(script, WorkflowOptions(child_runner=FailingRunner()))
@@ -501,8 +633,8 @@ meta = {"name": "pipeline-failure", "description": "Test workflow"}
 
 return await pipeline(
     ["a", "b"],
-    lambda item, original, index: agent(item, {"label": item}),
-    lambda prior, original, index: agent("after-" + original, {"label": "after-" + original}),
+    lambda item, original, index: agent(item, {"label": item, "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
+    lambda prior, original, index: agent("after-" + original, {"label": "after-" + original, "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
 )
 """
 
@@ -527,8 +659,8 @@ return await pipeline(
 meta = {"name": "parallel-failure-count", "description": "Test workflow"}
 
 return await parallel([
-    lambda: agent("a", {"label": "a"}),
-    lambda: agent("b", {"label": "b"}),
+    lambda: agent("a", {"label": "a", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
+    lambda: agent("b", {"label": "b", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
 ])
 """
 
@@ -547,7 +679,7 @@ return await parallel([
         script = """
 meta = {"name": "skip", "description": "Test workflow"}
 
-return await agent("skip me", {"label": "skipped"})
+return await agent("skip me", {"label": "skipped", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         result = run_workflow(script, WorkflowOptions(child_runner=SkippingRunner()))
         self.assertIsNone(result.value)
@@ -559,7 +691,7 @@ return await agent("skip me", {"label": "skipped"})
         script = """
 meta = {"name": "missing-agent-type", "description": "Test workflow"}
 
-return await agent("work", {"agentType": "definitely-missing"})
+return await agent("work", {"agentType": "definitely-missing", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         runner = FakeRunner()
         with self.assertRaises(Exception) as ctx:
@@ -571,11 +703,19 @@ return await agent("work", {"agentType": "definitely-missing"})
         self.assertIn("Available agents:", str(ctx.exception))
         self.assertEqual(runner.requests, [])
 
-    def test_agent_type_inherit_model_reaches_child_as_no_override(self):
+    def test_agent_type_preset_routing_fields_rejected(self):
         script = """
-meta = {"name": "inherit-agent-model", "description": "Test workflow"}
+meta = {"name": "preset-routing", "description": "Test workflow"}
 
-return await agent("work", {"agentType": "planner"})
+return await agent("work", {
+    "agentType": "planner",
+    "provider": "openai-codex",
+    "model": "gpt-5.6-luna",
+    "reasoningEffort": "high",
+    "maxTurns": 10,
+    "maxToolCalls": 16,
+    "maxToolOutputChars": 200000,
+})
 """
         with tempfile.TemporaryDirectory() as tmp:
             agent_dir = Path(tmp) / ".hermes" / "dynamic-workflows" / "agents"
@@ -585,69 +725,89 @@ return await agent("work", {"agentType": "planner"})
                 encoding="utf-8",
             )
             runner = FakeRunner()
-            run_workflow(script, WorkflowOptions(cwd=tmp, child_runner=runner))
+            with self.assertRaises(Exception) as ctx:
+                run_workflow(script, WorkflowOptions(cwd=tmp, child_runner=runner))
 
-        self.assertEqual(len(runner.requests), 1)
-        self.assertIsNone(runner.requests[0].model)
+        self.assertIn("model is not supported", str(ctx.exception))
+        self.assertEqual(runner.requests, [])
 
-    def test_phase_model_applies_to_agent_without_explicit_model(self):
+    def test_phase_model_is_rejected_before_child_launch(self):
         script = """
 meta = {
     "name": "phase-model",
     "description": "Test workflow",
-    "phases": [{"title": "Search", "model": "sonnet"}],
+    "phases": [{"title": "Search", "model": "gpt-5.6-luna"}],
 }
-
 phase("Search")
-return await agent("work")
+return await agent("work", {
+    "provider": "openai-codex",
+    "model": "gpt-5.6-luna",
+    "reasoningEffort": "high",
+    "maxTurns": 10,
+    "maxToolCalls": 16,
+    "maxToolOutputChars": 200000,
+})
 """
         runner = FakeRunner()
-        run_workflow(script, WorkflowOptions(child_runner=runner))
+        with self.assertRaises(Exception) as ctx:
+            run_workflow(script, WorkflowOptions(child_runner=runner))
 
-        self.assertEqual(len(runner.requests), 1)
-        self.assertEqual(runner.requests[0].phase, "Search")
-        self.assertEqual(runner.requests[0].model, "sonnet")
+        self.assertIn("meta.phases[].model is not supported", str(ctx.exception))
+        self.assertEqual(runner.requests, [])
 
-    def test_agent_phase_option_uses_matching_phase_model(self):
+    def test_agent_phase_option_does_not_supply_routing(self):
         script = """
 meta = {
     "name": "opts-phase-model",
     "description": "Test workflow",
-    "phases": [{"title": "Verify", "model": "haiku"}],
+    "phases": [{"title": "Verify", "model": "gpt-5.6-luna"}],
 }
-
-return await agent("work", {"phase": "Verify"})
+return await agent("work", {
+    "phase": "Verify",
+    "provider": "openai-codex",
+    "model": "gpt-5.6-luna",
+    "reasoningEffort": "high",
+    "maxTurns": 10,
+    "maxToolCalls": 16,
+    "maxToolOutputChars": 200000,
+})
 """
         runner = FakeRunner()
-        run_workflow(script, WorkflowOptions(child_runner=runner))
+        with self.assertRaises(Exception) as ctx:
+            run_workflow(script, WorkflowOptions(child_runner=runner))
 
-        self.assertEqual(len(runner.requests), 1)
-        self.assertEqual(runner.requests[0].phase, "Verify")
-        self.assertEqual(runner.requests[0].model, "haiku")
+        self.assertIn("meta.phases[].model is not supported", str(ctx.exception))
+        self.assertEqual(runner.requests, [])
 
-    def test_agent_model_overrides_phase_model(self):
+    def test_agent_model_does_not_override_phase_routing(self):
         script = """
 meta = {
     "name": "explicit-model",
     "description": "Test workflow",
-    "phases": [{"title": "Search", "model": "sonnet"}],
+    "phases": [{"title": "Search", "model": "gpt-5.6-luna"}],
 }
-
 phase("Search")
-return await agent("work", {"model": "opus"})
+return await agent("work", {
+    "provider": "openai-codex",
+    "model": "gpt-5.6-luna",
+    "reasoningEffort": "high",
+    "maxTurns": 10,
+    "maxToolCalls": 16,
+    "maxToolOutputChars": 200000,
+})
 """
         runner = FakeRunner()
-        run_workflow(script, WorkflowOptions(child_runner=runner))
+        with self.assertRaises(Exception) as ctx:
+            run_workflow(script, WorkflowOptions(child_runner=runner))
 
-        self.assertEqual(len(runner.requests), 1)
-        self.assertEqual(runner.requests[0].phase, "Search")
-        self.assertEqual(runner.requests[0].model, "opus")
+        self.assertIn("meta.phases[].model is not supported", str(ctx.exception))
+        self.assertEqual(runner.requests, [])
 
     def test_public_isolation_only_accepts_worktree(self):
         script = """
 meta = {"name": "strict-isolation", "description": "Test workflow"}
 
-return await agent("work", {"isolation": "shared"})
+return await agent("work", {"isolation": "shared", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         with self.assertRaises(Exception) as ctx:
             run_workflow(script, WorkflowOptions(child_runner=FakeRunner()))
@@ -684,16 +844,16 @@ meta = {{"name": "no-{name}", "description": "Test workflow"}}
 meta = {"name": "parent", "description": "Test workflow", "phases": [{"title": "Root"}]}
 
 phase("Root")
-first = await agent("root", {"label": "root"})
+first = await agent("root", {"label": "root", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 child = await workflow({"scriptPath": args["child"]})
-last = await agent("after", {"label": "after"})
+last = await agent("after", {"label": "after", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 return [first, child, last]
 """
         child = """
 meta = {"name": "child", "description": "Test workflow", "phases": [{"title": "Child"}]}
 
 phase("Child")
-return await agent("child", {"label": "child"})
+return await agent("child", {"label": "child", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         with tempfile.TemporaryDirectory() as tmp:
             child_path = Path(tmp) / "child.py"
@@ -720,7 +880,7 @@ return await agent("child", {"label": "child"})
         script = """
 meta = {"name": "budget", "description": "Test workflow"}
 
-await agent("a", {"label": "a"})
+await agent("a", {"label": "a", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 return {"total": budget.total, "spent": budget.spent(), "remaining": budget.remaining()}
 """
         result = run_workflow(
@@ -738,8 +898,8 @@ return {"total": budget.total, "spent": budget.spent(), "remaining": budget.rema
         script = """
 meta = {"name": "budget-stop", "description": "Test workflow"}
 
-await agent("a", {"label": "a"})
-return await agent("b", {"label": "b"})
+await agent("a", {"label": "a", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
+return await agent("b", {"label": "b", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         # Budget exhaustion is a hard ceiling: it raises WorkflowLimitExceeded,
         # a WorkflowHalt (BaseException) a script's `except Exception` cannot
@@ -759,7 +919,7 @@ return await agent("b", {"label": "b"})
         script = """
 meta = {"name": "budget-meta", "description": "Test workflow", "token_budget": 100}
 
-await agent("a", {"label": "a"})
+await agent("a", {"label": "a", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 return {"total": budget.total, "remaining": budget.remaining()}
 """
         result = run_workflow(
@@ -786,7 +946,7 @@ return await workflow({"scriptPath": args["grand"]})
         grand = """
 meta = {"name": "grand", "description": "Test workflow"}
 
-return await agent("grand")
+return await agent("grand", {"provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         with tempfile.TemporaryDirectory() as tmp:
             child_path = Path(tmp) / "child.py"
@@ -823,7 +983,7 @@ return await workflow("private-child")
         child = """
 meta = {"name": "private-child", "description": "Test workflow"}
 
-return await agent("child", {"label": "private-child"})
+return await agent("child", {"label": "private-child", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         with tempfile.TemporaryDirectory() as tmp:
             store = WorkflowStore(Path(tmp) / "custom-store")
@@ -866,12 +1026,12 @@ return await workflow("missing-child")
         first_script = """
 meta = {"name": "cache-display-one", "description": "Test workflow"}
 
-return await agent("same prompt", {"label": "first", "phase": "One"})
+return await agent("same prompt", {"label": "first", "phase": "One", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         second_script = """
 meta = {"name": "cache-display-two", "description": "Test workflow"}
 
-return await agent("same prompt", {"label": "second", "phase": "Two"})
+return await agent("same prompt", {"label": "second", "phase": "Two", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         first_runner = FakeRunner()
         first_cache = ResumeCache()
@@ -894,14 +1054,14 @@ return await agent("same prompt", {"label": "second", "phase": "Two"})
         script = """
 meta = {"name": "cache-agent-type", "description": "Test workflow"}
 
-return await agent("same prompt", {"agentType": "researcher"})
+return await agent("same prompt", {"agentType": "researcher", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         with tempfile.TemporaryDirectory() as tmp:
             agent_dir = Path(tmp) / ".hermes" / "dynamic-workflows" / "agents"
             agent_dir.mkdir(parents=True)
             agent_file = agent_dir / "researcher.md"
             agent_file.write_text(
-                "---\nreasoning_effort: medium\n---\nVersion one.\n",
+                "---\nname: researcher\n---\nVersion one.\n",
                 encoding="utf-8",
             )
             first_cache = ResumeCache()
@@ -914,7 +1074,7 @@ return await agent("same prompt", {"agentType": "researcher"})
                 ),
             )
             agent_file.write_text(
-                "---\nreasoning_effort: medium\n---\nVersion two.\n",
+                "---\nname: researcher\n---\nVersion two.\n",
                 encoding="utf-8",
             )
             second_runner = FakeRunner()
@@ -932,7 +1092,7 @@ return await agent("same prompt", {"agentType": "researcher"})
         script = """
 meta = {"name": "cache-workspace", "description": "Test workflow"}
 
-return await agent("same prompt")
+return await agent("same prompt", {"provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         with tempfile.TemporaryDirectory() as first_cwd, tempfile.TemporaryDirectory() as second_cwd:
             first_cache = ResumeCache()
@@ -965,13 +1125,12 @@ meta = {
     "agents": {
         "researcher": {
             "instructions": "Research.",
-            "reasoningEffort": "low",
         }
     },
 }
 return await agent(
     "go",
-    {"agentType": "researcher", "reasoningEffort": "high"},
+    {"agentType": "researcher", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000},
 )
 """
         runner = FakeRunner()
@@ -984,7 +1143,7 @@ return await agent(
         self.assertEqual(request.resolved.reasoning_effort, "high")
         self.assertEqual(result.state.snapshot()["agents"][0]["reasoning_effort"], "high")
 
-    def test_runtime_preset_effort_is_used_when_inline_is_absent(self):
+    def test_runtime_preset_effort_is_rejected(self):
         script = """
 meta = {
     "name": "reasoning-preset",
@@ -996,16 +1155,13 @@ meta = {
         }
     },
 }
-return await agent("go", {"agentType": "researcher"})
+return await agent("go", {"agentType": "researcher", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         runner = FakeRunner()
-        run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
-
-        request = runner.requests[0]
-        self.assertEqual(request.reasoning_effort, "medium")
-        self.assertIsNotNone(request.resolved)
-        assert request.resolved is not None
-        self.assertEqual(request.resolved.reasoning_effort, "medium")
+        with self.assertRaises(Exception) as ctx:
+            run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+        self.assertIn("reasoningEffort is not supported", str(ctx.exception))
+        self.assertEqual(runner.requests, [])
 
     def test_missing_effort_fails_before_child_launch(self):
         script = """
@@ -1014,7 +1170,7 @@ meta = {
     "description": "Test workflow",
     "agents": {"researcher": {"instructions": "Research."}},
 }
-return await agent("go", {"agentType": "researcher"})
+return await agent("go", {"agentType": "researcher", "label": "reader", "provider": "openai-codex", "model": "gpt-5.6-luna", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         runner = FakeRunner()
         with self.assertRaises(Exception) as ctx:
@@ -1022,13 +1178,13 @@ return await agent("go", {"agentType": "researcher"})
 
         self.assertEqual(runner.requests, [])
         self.assertIn("reasoningEffort is required", str(ctx.exception))
-        self.assertIn("meta.agents.researcher", str(ctx.exception))
+        self.assertIn("agent() reasoningEffort is required", str(ctx.exception))
 
     def test_invalid_inline_efforts_fail_before_child_launch(self):
         for value in (None, True, False, "", "none", "HIGH", "minimal ", 1, []):
             script = (
                 'meta = {"name": "reasoning-invalid", "description": "Test workflow"}\n'
-                f'return await agent("go", {{"reasoningEffort": {value!r}}})'
+                f'return await agent("go", {{"provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": {value!r}, "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000}})'
             )
             runner = FakeRunner()
             with self.subTest(value=value), self.assertRaises(Exception) as ctx:
@@ -1048,21 +1204,22 @@ return await agent("go", {"agentType": "researcher"})
                     }
                 },
             }
-            script = f"meta = {meta!r}\nreturn await agent('go', {{'agentType': 'researcher'}})"
+            script = f"meta = {meta!r}\nreturn await agent('go', {{'agentType': 'researcher', 'provider': 'openai-codex', 'model': 'gpt-5.6-luna', 'reasoningEffort': 'medium', 'maxTurns': 10, 'maxToolCalls': 16, 'maxToolOutputChars': 200000}})"
             runner = FakeRunner()
             with self.subTest(value=value), self.assertRaises(Exception) as ctx:
                 run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
             self.assertEqual(runner.requests, [])
             self.assertIn(
-                "meta.agents.researcher reasoningEffort must be one of",
+                "meta.agents.researcher reasoningEffort is not supported",
                 str(ctx.exception),
             )
 
-    def test_effort_changes_cache_identity_and_survives_cache_hit(self):
+    @patch("hermes_dynamic_workflows.child.runner._discoverable_child_toolsets", return_value=[])
+    def test_effort_changes_cache_identity_and_survives_cache_hit(self, _toolsets):
         def script(effort: str) -> str:
             return (
                 'meta = {"name": "reasoning-cache", "description": "Test workflow"}\n'
-                f'return await agent("same prompt", {{"reasoningEffort": "{effort}"}})'
+                f'return await agent("same prompt", {{"provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "{effort}", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000}})'
             )
 
         low_cache = ResumeCache()
@@ -1094,113 +1251,124 @@ return await agent("go", {"agentType": "researcher"})
 
 
 class MaxTurnsRuntimeTests(unittest.TestCase):
-    def test_inline_overrides_runtime_preset(self):
-        script = """
-meta = {
-    "name": "bounded-inline",
-    "description": "Test workflow",
-    "agents": {
-        "researcher": {
-            "instructions": "Research.",
-            "maxTurns": 20,
-            "reasoningEffort": "medium",
-        }
-    },
-}
-return await agent("go", {"agentType": "researcher", "maxTurns": 3})
-"""
-        runner = FakeRunner()
-        run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+    _base = {
+        "provider": "openai-codex",
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "medium",
+        "maxTurns": 10,
+        "maxToolCalls": 16,
+        "maxToolOutputChars": 200000,
+    }
 
+    def _script(self, options):
+        return (
+            'meta = {"name": "budget-contract", "description": "Test workflow"}\n'
+            f"return await agent(\"go\", {options!r})"
+        )
+
+    def test_inline_budgets_are_recorded_and_resolved(self):
+        runner = FakeRunner()
+        result = run_workflow(
+            self._script({**self._base, "maxTurns": 3, "maxToolCalls": 7, "maxToolOutputChars": 1234}),
+            WorkflowOptions(config=PluginConfig(), child_runner=runner),
+        )
         request = runner.requests[0]
         self.assertEqual(request.max_turns, 3)
+        self.assertEqual(request.max_tool_calls, 7)
+        self.assertEqual(request.max_tool_output_chars, 1234)
+        self.assertIsNotNone(request.resolved)
+        assert request.resolved is not None
         self.assertEqual(request.resolved.max_turns, 3)
+        self.assertEqual(request.resolved.max_tool_calls, 7)
+        self.assertEqual(request.resolved.max_tool_output_chars, 1234)
+        agent = result.state.snapshot()["agents"][0]
+        self.assertEqual(agent["max_turns"], 3)
+        self.assertEqual(agent["max_tool_calls"], 7)
+        self.assertEqual(agent["max_tool_output_chars"], 1234)
 
-    def test_inline_boundaries_are_accepted(self):
-        for value in (1, 1000):
-            runner = FakeRunner()
-            script = (
-                'meta = {"name": "bounded", "description": "Test workflow"}\n'
-                f'return await agent("go", {{"maxTurns": {value}}})'
-            )
-            with self.subTest(value=value):
-                run_workflow(
-                    script,
-                    WorkflowOptions(config=PluginConfig(), child_runner=runner),
-                )
-            self.assertEqual(runner.requests[0].max_turns, value)
+    def test_inline_budget_boundaries_are_accepted(self):
+        for key, values in {
+            "maxTurns": (1, 1000),
+            "maxToolCalls": (1, 10000),
+            "maxToolOutputChars": (1, 20_000_000),
+        }.items():
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    runner = FakeRunner()
+                    run_workflow(
+                        self._script({**self._base, key: value}),
+                        WorkflowOptions(config=PluginConfig(), child_runner=runner),
+                    )
+                    self.assertEqual(getattr(runner.requests[0], _request_field(key)), value)
 
-    def test_invalid_inline_values_fail_before_launch(self):
-        for value in [None, True, False, 1.5, "2", 0, -1, 1001]:
+    def test_missing_budget_fields_fail_before_launch(self):
+        for key in ("maxTurns", "maxToolCalls", "maxToolOutputChars"):
+            options = dict(self._base)
+            options.pop(key)
             runner = FakeRunner()
-            script = (
-                'meta = {"name": "bad-cap", "description": "Test workflow"}\n'
-                f'return await agent("go", {{"maxTurns": {value!r}}})'
-            )
-            with self.subTest(value=value), self.assertRaises(Exception) as ctx:
-                run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
-            self.assertIn("agent() maxTurns must be an integer from 1 to 1000", str(ctx.exception))
+            with self.subTest(key=key), self.assertRaises(Exception) as ctx:
+                run_workflow(self._script(options), WorkflowOptions(config=PluginConfig(), child_runner=runner))
+            self.assertIn(f"agent() {key} is required", str(ctx.exception))
             self.assertEqual(runner.requests, [])
 
-    def test_invalid_runtime_preset_values_fail_before_launch(self):
-        for value in [None, True, 1.5, "2", 0, 1001]:
+    def test_invalid_inline_budget_values_fail_before_launch(self):
+        cases = {
+            "maxTurns": (None, True, 1.5, "2", 0, -1, 1001),
+            "maxToolCalls": (None, True, 1.5, "2", 0, -1, 10001),
+            "maxToolOutputChars": (None, True, 1.5, "2", 0, -1, 20_000_001),
+        }
+        for key, values in cases.items():
+            for value in values:
+                options = {**self._base, key: value}
+                runner = FakeRunner()
+                with self.subTest(key=key, value=value), self.assertRaises(Exception) as ctx:
+                    run_workflow(self._script(options), WorkflowOptions(config=PluginConfig(), child_runner=runner))
+                self.assertIn(f"agent() {key} must be an integer", str(ctx.exception))
+                self.assertEqual(runner.requests, [])
+
+    def test_preset_budgets_are_rejected(self):
+        for key in ("maxTurns", "maxToolCalls", "maxToolOutputChars"):
+            script = f"""
+meta = {{
+    "name": "preset-budget",
+    "description": "Test workflow",
+    "agents": {{"researcher": {{"instructions": "Research.", "{key}": 10}}}},
+}}
+return await agent("go", {{"agentType": "researcher", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000}})
+"""
             runner = FakeRunner()
-            script = (
-                'meta = {"name": "bad-preset", "description": "Test workflow", '
-                '"agents": {"researcher": {"instructions": "Research.", "maxTurns": %r}}}\n'
-                'return await agent("go", {"agentType": "researcher"})'
-            ) % (value,)
-            with self.subTest(value=value), self.assertRaises(Exception) as ctx:
+            with self.subTest(key=key), self.assertRaises(Exception) as ctx:
                 run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
-            self.assertIn(
-                "meta.agents.researcher maxTurns must be an integer from 1 to 1000",
-                str(ctx.exception),
-            )
+            self.assertIn(f"{key} is not supported", str(ctx.exception))
             self.assertEqual(runner.requests, [])
 
-    def test_internal_public_alias_is_rejected(self):
-        script = """
-meta = {"name": "bad-alias", "description": "Test workflow"}
-return await agent("go", {"max_turns": 2})
-"""
-        runner = FakeRunner()
-        with self.assertRaises(Exception) as ctx:
-            run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
-        self.assertIn("unsupported agent() option(s): max_turns", str(ctx.exception))
-        self.assertEqual(runner.requests, [])
+    @patch("hermes_dynamic_workflows.child.runner._discoverable_child_toolsets", return_value=[])
+    def test_budget_changes_cache_identity(self, _toolsets):
+        def script(tool_calls):
+            return self._script({**self._base, "maxToolCalls": tool_calls})
 
-    def test_omission_preserves_cache_identity_but_explicit_cap_changes_it(self):
-        uncapped = """
-meta = {"name": "cache-cap-none", "description": "Test workflow"}
-return await agent("same prompt")
-"""
-        capped = """
-meta = {"name": "cache-cap-set", "description": "Test workflow"}
-return await agent("same prompt", {"maxTurns": 2})
-"""
         first_cache = ResumeCache()
-        run_workflow(uncapped, WorkflowOptions(child_runner=FakeRunner(), resume_cache=first_cache))
-
-        omitted_runner = FakeRunner()
+        run_workflow(script(16), WorkflowOptions(child_runner=FakeRunner(), resume_cache=first_cache))
+        changed_runner = FakeRunner()
         run_workflow(
-            uncapped,
-            WorkflowOptions(
-                child_runner=omitted_runner,
-                resume_cache=ResumeCache(first_cache.current),
-            ),
+            script(8),
+            WorkflowOptions(child_runner=changed_runner, resume_cache=ResumeCache(first_cache.current)),
         )
-        capped_runner = FakeRunner()
+        cached_runner = FakeRunner()
         run_workflow(
-            capped,
-            WorkflowOptions(
-                child_runner=capped_runner,
-                resume_cache=ResumeCache(first_cache.current),
-            ),
+            script(16),
+            WorkflowOptions(child_runner=cached_runner, resume_cache=ResumeCache(first_cache.current)),
         )
+        self.assertEqual(len(changed_runner.requests), 1)
+        self.assertEqual(cached_runner.requests, [])
 
-        self.assertEqual(omitted_runner.requests, [])
-        self.assertEqual(len(capped_runner.requests), 1)
-        self.assertEqual(capped_runner.requests[0].max_turns, 2)
+
+def _request_field(key):
+    return {
+        "maxTurns": "max_turns",
+        "maxToolCalls": "max_tool_calls",
+        "maxToolOutputChars": "max_tool_output_chars",
+    }[key]
 
 
 class ResumeCacheTests(unittest.TestCase):
@@ -1231,7 +1399,7 @@ meta = {"name": "while-ok", "description": "Test workflow"}
 results = []
 i = 0
 while i < 3:
-    results.append(await agent("x" + str(i)))
+    results.append(await agent("x" + str(i), {"provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000}))
     i = i + 1
 return results
 """
@@ -1248,7 +1416,7 @@ try:
     y = 1 / 0
 except Exception:
     y = "caught"
-await agent("a")
+await agent("a", {"provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 return y
 """
         result = run_workflow(script, WorkflowOptions(child_runner=TokenRunner(tokens=1)))
@@ -1263,7 +1431,7 @@ meta = {"name": "no-swallow", "description": "Test workflow"}
 out = []
 while True:
     try:
-        out.append(await agent("x"))
+        out.append(await agent("x", {"provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000}))
     except Exception:
         out.append("swallowed")
 return out
@@ -1285,7 +1453,7 @@ return out
         script = """
 meta = {"name": "spin", "description": "Test workflow"}
 
-await agent("a")
+await agent("a", {"provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 while True:
     pass
 return 1
@@ -1326,19 +1494,19 @@ class NestingDepthTests(unittest.TestCase):
         grandchild = """
 meta = {"name": "gc", "description": "grandchild"}
 
-return await agent("gc-work", {"label": "gc"})
+return await agent("gc-work", {"label": "gc", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 """
         child = """
 meta = {"name": "child", "description": "child"}
 
 inner = await workflow({"scriptPath": args["grandchild"]}, args)
-mine = await agent("child-work", {"label": "child"})
+mine = await agent("child-work", {"label": "child", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 return [inner, mine]
 """
         root = """
 meta = {"name": "root", "description": "root"}
 
-mine = await agent("root-work", {"label": "root"})
+mine = await agent("root-work", {"label": "root", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 nested = await workflow({"scriptPath": args["child"]}, args)
 return [mine, nested]
 """
@@ -1357,7 +1525,7 @@ return [mine, nested]
                 """
 meta = {"name": "root", "description": "root"}
 
-mine = await agent("root-work", {"label": "root"})
+mine = await agent("root-work", {"label": "root", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 nested = await workflow({"scriptPath": args["child"]}, args)
 return [mine, nested]
 """,
@@ -1444,7 +1612,7 @@ return await workflow({"scriptPath": args["child"]}, args)
                     """
 meta = {"name": "root", "description": "root"}
 
-mine = await agent("root-work", {"label": "root"})
+mine = await agent("root-work", {"label": "root", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
 nested = await workflow({"scriptPath": args["child"]}, args)
 return [mine, nested]
 """,

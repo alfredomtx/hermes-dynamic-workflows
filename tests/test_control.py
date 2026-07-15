@@ -23,8 +23,18 @@ SEQUENTIAL_SCRIPT = """
 meta = {"name": "controlled", "description": "Exercise workflow controls", "phases": ["Work"]}
 
 phase("Work")
-first = await agent("first", {"label": "first"})
-second = await agent("second", {"label": "second"})
+first = await agent("first", {
+    "label": "first",
+    "provider": "openai-codex",
+    "model": "gpt-5.6-luna",
+    "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000,
+})
+second = await agent("second", {
+    "label": "second",
+    "provider": "openai-codex",
+    "model": "gpt-5.6-luna",
+    "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000,
+})
 result = [first, second]
 """
 
@@ -325,10 +335,15 @@ listener.stop()
                 run_workflow(
                     """
 meta = {"name": "pause-deadline", "description": "Exercise paused deadline accounting"}
-result = await agent("work", {"label": "worker"})
+result = await agent("work", {
+    "label": "worker",
+    "provider": "openai-codex",
+    "model": "gpt-5.6-luna",
+    "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000,
+})
 """,
                     WorkflowOptions(
-                        config=PluginConfig(workflow_timeout_seconds=0.1),
+                        config=PluginConfig(workflow_timeout_seconds=1.0),
                         child_runner=ImmediateRunner(),
                         pause_gate=gate,
                     ),

@@ -218,7 +218,7 @@ class ToolChannelTests(unittest.TestCase):
         script = """
 meta = {"name": "tool-channel", "description": "Test workflow"}
 
-return await agent("return status", {"label": "json", "schema": {"type": "object", "required": ["ok"]}})
+return await agent("return status", {"label": "json", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000, "schema": {"type": "object", "required": ["ok"]}})
 """
         runner = CaptureRunner({"ok": True, "n": 5})
         result = run_workflow(
