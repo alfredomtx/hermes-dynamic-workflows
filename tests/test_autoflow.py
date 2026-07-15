@@ -186,8 +186,9 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         result = pre_gateway_dispatch_handler(event=FakeEvent(msg, src), gateway=gw)
         self.assertIsInstance(result, dict)
         self.assertEqual(result["action"], "rewrite")
+        self.assertEqual(result["position"], "append")
         self.assertIn("[autoflow on]", result["text"])
-        self.assertIn(msg, result["text"])
+        self.assertNotIn(msg, result["text"])
         self.assertEqual(gw.reasoning_overrides, {})
 
     async def test_off_clears_state_without_changing_parent_effort(self):

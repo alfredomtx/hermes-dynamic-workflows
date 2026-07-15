@@ -162,6 +162,8 @@ def pre_gateway_dispatch_handler(
         return {"action": "skip", "reason": "autoflow-toggle"}
 
     if kind == "steer":
-        return {"action": "rewrite", "text": decision.get("text") or text}
+        steered = decision.get("text") or text
+        suffix = steered[len(text):] if steered.startswith(text) else steered
+        return {"action": "rewrite", "position": "append", "text": suffix}
 
     return None
