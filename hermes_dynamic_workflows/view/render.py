@@ -307,6 +307,12 @@ def _render_run_block(
             bits.append(f"{totals['errors']} err")
         lines.append(f"   Status: {' · '.join(bits)}")
 
+        topology = _current_topology(snapshot)
+        if topology is not None:
+            topology_line = _topology_line(topology)
+            if topology_line:
+                lines.append(f"   Topology: {topology_line}")
+
         phases = _phase_names(snapshot, recursive=False)
         current_phase = _current_phase(snapshot) if totals["agents"] else ""
         if current_phase:
@@ -803,6 +809,32 @@ def status_icon(status: Any) -> str:
         "interrupted": "#",
         "skipped": "-",
     }.get(str(status or ""), "?")
+
+
+def _current_topology(snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    """Choose the newest active topology, or the newest completed one."""
+    topologies = [item for item in snapshot.get("topologies") or [] if isinstance(item, dict)]
+    for topology in reversed(topologies):
+        if topology.get("status") == "active":
+            return topology
+    for topology in reversed(topologies):
+        if topology.get("status") in {"done", "completed"}:
+            return topology
+    return None
+
+
+def _topology_line(topology: dict[str, Any]) -> str:
+    kind = str(topology.get("kind") or "").strip().lower()
+    if kind == "pipeline":
+        return (
+            f"Pipeline · {_as_int(topology.get('items'))} items · "
+            f"{_as_int(topology.get('stages'))} stages"
+        )
+    if kind == "parallel":
+        return f"Parallel barrier · {_as_int(topology.get('lanes'))} lanes"
+    if kind == "sequential":
+        return f"Sequential · {_as_int(topology.get('steps'))} steps"
+    return ""
 
 
 def _current_phase(snapshot: dict[str, Any]) -> str:

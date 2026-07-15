@@ -70,6 +70,51 @@ class BoundedProgressRenderTests(unittest.TestCase):
         self.assertIn("Current: Verify", text)
         self.assertIn("Next: write verdict", text)
 
+    def test_detailed_progress_renders_active_runtime_topology(self):
+        cases = [
+            ({"id": 1, "kind": "pipeline", "status": "active", "items": 12, "stages": 2}, "Pipeline · 12 items · 2 stages"),
+            ({"id": 1, "kind": "parallel", "status": "active", "lanes": 4}, "Parallel barrier · 4 lanes"),
+            ({"id": 1, "kind": "sequential", "status": "active", "steps": 3}, "Sequential · 3 steps"),
+        ]
+
+        for topology, expected in cases:
+            with self.subTest(kind=topology["kind"]):
+                run = {
+                    "status": "running",
+                    "workflow": {
+                        "meta": {"name": "topology"},
+                        "topologies": [topology],
+                        "agents": [],
+                    },
+                }
+
+                text = render_module.render_run_progress(run, show_cost=False)
+
+                self.assertIn(f"Topology: {expected}", text)
+
+    def test_nested_active_topology_wins_over_parent_and_latest_completed_is_fallback(self):
+        snapshot = {
+            "meta": {"name": "nested-topology"},
+            "topologies": [
+                {"id": 1, "kind": "pipeline", "status": "active", "items": 12, "stages": 2},
+                {"id": 2, "kind": "parallel", "status": "active", "lanes": 4},
+            ],
+            "agents": [],
+        }
+
+        active_text = render_module.render_run_progress(
+            {"status": "running", "workflow": snapshot},
+            show_cost=False,
+        )
+        self.assertIn("Topology: Parallel barrier · 4 lanes", active_text)
+
+        snapshot["topologies"][1]["status"] = "done"
+        resumed_text = render_module.render_run_progress(
+            {"status": "running", "workflow": snapshot},
+            show_cost=False,
+        )
+        self.assertIn("Topology: Pipeline · 12 items · 2 stages", resumed_text)
+
     def test_large_roster_keeps_bounded_mandatory_fields_within_telegram_limit(self):
         name = "N" * 120
         current = "C" * 120

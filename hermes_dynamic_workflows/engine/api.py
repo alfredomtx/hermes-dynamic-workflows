@@ -7,6 +7,7 @@ import hashlib
 import importlib
 import inspect
 import threading
+from contextvars import ContextVar
 from pathlib import Path
 from time import monotonic
 from typing import Any, Callable
@@ -26,10 +27,15 @@ from ..core.types import (
     ChildAgentRequest,
     ChildAgentResult,
     ResolvedAgentSpec,
+    TopologyRecord,
     WorkflowFrame,
 )
 
 MAX_VM_ARRAY_ITEMS = 4096
+_HELPER_FRAMES: ContextVar[frozenset[str]] = ContextVar(
+    "workflow_helper_frames",
+    default=frozenset(),
+)
 
 
 class BudgetView:
@@ -77,7 +83,14 @@ class WorkflowAPI:
         }
 
     async def agent(self, prompt: str, opts: dict[str, Any] | None = None) -> Any:
-        return await asyncio.to_thread(self._agent_sync, prompt, opts)
+        topology: TopologyRecord | None = None
+        if self.frame.id not in _HELPER_FRAMES.get():
+            topology = self._begin_sequential_step()
+        try:
+            return await asyncio.to_thread(self._agent_sync, prompt, opts)
+        finally:
+            if topology is not None:
+                self._finish_topology(topology)
 
     def _agent_sync(self, prompt: str, opts: dict[str, Any] | None = None) -> Any:
         self._check_deadline()
@@ -307,6 +320,51 @@ class WorkflowAPI:
     def _run_child(self, request: ChildAgentRequest, record: AgentRecord) -> Any:
         return self.runner.run(request)
 
+    def _begin_sequential_step(self) -> TopologyRecord:
+        with self._lock:
+            if self.frame._sequential_chain_open and self.frame.topologies:
+                record = self.frame.topologies[-1]
+                if record.kind == "sequential":
+                    record.steps = int(record.steps or 0) + 1
+                    record.status = "active"
+                else:
+                    record = self.frame.new_topology("sequential", steps=1)
+            else:
+                record = self.frame.new_topology("sequential", steps=1)
+            self.frame._sequential_chain_open = True
+            self._notify()
+            return record
+
+    def _begin_helper_topology(
+        self,
+        kind: str,
+        *,
+        items: int | None = None,
+        stages: int | None = None,
+        lanes: int | None = None,
+    ) -> TopologyRecord:
+        with self._lock:
+            # A helper is a boundary in the observed top-level sequence. Any
+            # direct agent after this helper starts a fresh sequential record.
+            self.frame._sequential_chain_open = False
+            record = self.frame.new_topology(
+                kind,
+                items=items,
+                stages=stages,
+                lanes=lanes,
+            )
+            self._notify()
+            return record
+
+    def _break_sequential_chain(self) -> None:
+        with self._lock:
+            self.frame._sequential_chain_open = False
+
+    def _finish_topology(self, record: TopologyRecord) -> None:
+        with self._lock:
+            record.status = "done"
+            self._notify()
+
     async def parallel(self, thunks: list[Callable[[], Any]]) -> list[Any]:
         self._check_deadline()
         if not isinstance(thunks, list):
@@ -314,28 +372,34 @@ class WorkflowAPI:
         _check_vm_array_length(thunks)
         if not all(callable(item) for item in thunks):
             raise WorkflowRuntimeError("parallel() entries must be callables, e.g. lambda: agent(...)")
-        if not thunks:
-            return []
 
-        results = await asyncio.gather(
-            *(self._run_parallel_thunk(index, thunk) for index, thunk in enumerate(thunks))
-        )
-        self._check_deadline()
-        return results
+        topology = self._begin_helper_topology("parallel", lanes=len(thunks))
+        try:
+            results = await asyncio.gather(
+                *(self._run_parallel_thunk(index, thunk) for index, thunk in enumerate(thunks))
+            )
+            self._check_deadline()
+            return results
+        finally:
+            self._finish_topology(topology)
 
     async def _run_parallel_thunk(self, index: int, thunk: Callable[[], Any]) -> Any:
+        token = _HELPER_FRAMES.set(_HELPER_FRAMES.get() | {self.frame.id})
         try:
-            self._check_deadline()
-            return await _maybe_await(thunk())
-        except WorkflowHalt:
-            raise
-        except Exception as exc:
-            message = f"parallel[{index}] failed: {type(exc).__name__}: {exc}"
-            self.log(message)
-            if not isinstance(exc, ChildAgentError):
-                with self._lock:
-                    self.frame.errors.append(message)
-            return None
+            try:
+                self._check_deadline()
+                return await _maybe_await(thunk())
+            except WorkflowHalt:
+                raise
+            except Exception as exc:
+                message = f"parallel[{index}] failed: {type(exc).__name__}: {exc}"
+                self.log(message)
+                if not isinstance(exc, ChildAgentError):
+                    with self._lock:
+                        self.frame.errors.append(message)
+                return None
+        finally:
+            _HELPER_FRAMES.reset(token)
 
     async def pipeline(self, items: list[Any], *stages: Callable[[Any, Any, int], Any]) -> list[Any]:
         self._check_deadline()
@@ -345,24 +409,37 @@ class WorkflowAPI:
         if not stages or not all(callable(stage) for stage in stages):
             raise WorkflowRuntimeError("pipeline() expects one or more callable stages")
 
+        topology = self._begin_helper_topology(
+            "pipeline",
+            items=len(items),
+            stages=len(stages),
+        )
+
         async def run_one(index: int, original: Any) -> Any:
+            token = _HELPER_FRAMES.set(_HELPER_FRAMES.get() | {self.frame.id})
             current = original
             try:
-                for stage in stages:
-                    self._check_deadline()
-                    current = await _maybe_await(stage(current, original, index))
-            except WorkflowHalt:
-                raise
-            except Exception as exc:
-                message = f"pipeline[{index}] failed: {type(exc).__name__}: {exc}"
-                self.log(message)
-                if not isinstance(exc, ChildAgentError):
-                    with self._lock:
-                        self.frame.errors.append(message)
-                return None
-            return current
+                try:
+                    for stage in stages:
+                        self._check_deadline()
+                        current = await _maybe_await(stage(current, original, index))
+                except WorkflowHalt:
+                    raise
+                except Exception as exc:
+                    message = f"pipeline[{index}] failed: {type(exc).__name__}: {exc}"
+                    self.log(message)
+                    if not isinstance(exc, ChildAgentError):
+                        with self._lock:
+                            self.frame.errors.append(message)
+                    return None
+                return current
+            finally:
+                _HELPER_FRAMES.reset(token)
 
-        return await asyncio.gather(*(run_one(i, item) for i, item in enumerate(items)))
+        try:
+            return await asyncio.gather(*(run_one(i, item) for i, item in enumerate(items)))
+        finally:
+            self._finish_topology(topology)
 
     def phase(self, name: str) -> None:
         if not isinstance(name, str) or not name.strip():
@@ -381,6 +458,7 @@ class WorkflowAPI:
             self._notify()
 
     async def workflow(self, name_or_ref: Any, args: Any = None) -> Any:
+        self._break_sequential_chain()
         return await asyncio.to_thread(self._workflow_sync, name_or_ref, args)
 
     def _workflow_sync(self, name_or_ref: Any, args: Any = None) -> Any:

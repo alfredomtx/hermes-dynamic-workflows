@@ -111,6 +111,31 @@ class PhaseSpec:
 
 
 @dataclass
+class TopologyRecord:
+    """A runtime-observed workflow execution shape."""
+
+    id: int
+    kind: str
+    status: str = "active"
+    items: int | None = None
+    stages: int | None = None
+    lanes: int | None = None
+    steps: int | None = None
+
+    def snapshot(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "id": self.id,
+            "kind": self.kind,
+            "status": self.status,
+        }
+        for key in ("items", "stages", "lanes", "steps"):
+            value = getattr(self, key)
+            if value is not None:
+                data[key] = value
+        return data
+
+
+@dataclass
 class WorkflowFrame:
     id: str
     meta: dict[str, Any]
@@ -120,6 +145,7 @@ class WorkflowFrame:
     current_phase: str | None = None
     logs: list[str] = field(default_factory=list)
     agents: list[AgentRecord] = field(default_factory=list)
+    topologies: list[TopologyRecord] = field(default_factory=list)
     children: list["WorkflowFrame"] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     parent_id: str | None = None
@@ -127,6 +153,8 @@ class WorkflowFrame:
     status: str = "running"
     started_at: float = field(default_factory=monotonic)
     ended_at: float | None = None
+    _topology_counter: int = field(default=0, repr=False)
+    _sequential_chain_open: bool = field(default=False, repr=False)
 
     @property
     def phase_titles(self) -> list[str]:
@@ -141,6 +169,28 @@ class WorkflowFrame:
         end = self.ended_at if self.ended_at is not None else monotonic()
         return round(max(0.0, end - self.started_at), 3)
 
+    def new_topology(
+        self,
+        kind: str,
+        *,
+        items: int | None = None,
+        stages: int | None = None,
+        lanes: int | None = None,
+        steps: int | None = None,
+    ) -> TopologyRecord:
+        """Create a per-frame, monotonically numbered runtime topology."""
+        self._topology_counter += 1
+        record = TopologyRecord(
+            id=self._topology_counter,
+            kind=kind,
+            items=items,
+            stages=stages,
+            lanes=lanes,
+            steps=steps,
+        )
+        self.topologies.append(record)
+        return record
+
     def snapshot(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -151,6 +201,7 @@ class WorkflowFrame:
             "logs": list(self.logs),
             "errors": list(self.errors),
             "agents": [agent.snapshot() for agent in self.agents],
+            "topologies": [topology.snapshot() for topology in self.topologies],
             "children": [child.snapshot() for child in self.children],
             "parent_id": self.parent_id,
             "source_ref": self.source_ref,

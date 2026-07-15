@@ -439,11 +439,43 @@ class RunManagerTests(unittest.TestCase):
             "children": [{"logs": ["nested latest"], "agents": [], "children": []}],
         }
 
-        self.assertEqual(_progress_signal({"workflow": workflow}), ("Verify", "root latest"))
+        self.assertEqual(
+            _progress_signal({"workflow": workflow}),
+            ("Verify", "root latest", "[]"),
+        )
 
     def test_update_state_forces_progress_edit_when_root_log_changes(self):
         old = {"phases": [{"title": "Review"}], "agents": [{"id": 1, "status": "running", "phase": "Review"}], "logs": ["old"]}
         new = {**old, "logs": ["old", "new"]}
+        managed = self._progress_managed(old)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig())
+            state = SimpleNamespace(snapshot=lambda: new)
+            with patch.object(manager_module, "_edit_progress_bubble") as edit:
+                manager._update_state(managed, state, manager.config)
+
+        self.assertTrue(edit.call_args.kwargs["force"])
+
+    def test_update_state_forces_progress_edit_when_topology_changes(self):
+        old = {
+            "phases": [],
+            "agents": [],
+            "logs": [],
+            "topologies": [],
+        }
+        new = {
+            **old,
+            "topologies": [
+                {
+                    "id": 1,
+                    "kind": "pipeline",
+                    "status": "active",
+                    "items": 12,
+                    "stages": 2,
+                }
+            ],
+        }
         managed = self._progress_managed(old)
 
         with tempfile.TemporaryDirectory() as tmp:

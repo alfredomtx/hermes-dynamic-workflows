@@ -161,6 +161,66 @@ return await parallel([
         self.assertEqual(result.value, ["a:a", "b:b", "c:c"])
         self.assertEqual({req.label for req in runner.requests}, {"a", "b", "c"})
 
+    def test_parallel_records_runtime_topology(self):
+        script = """
+meta = {"name": "parallel-topology", "description": "Test workflow"}
+
+return await parallel([
+    lambda: agent("a", {"label": "a", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 3, "maxToolCalls": 4, "maxToolOutputChars": 20000}),
+    lambda: agent("b", {"label": "b", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 3, "maxToolCalls": 4, "maxToolOutputChars": 20000}),
+    lambda: agent("c", {"label": "c", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 3, "maxToolCalls": 4, "maxToolOutputChars": 20000}),
+])
+"""
+        result = run_workflow(
+            script,
+            WorkflowOptions(config=PluginConfig(concurrency=3), child_runner=FakeRunner()),
+        )
+
+        self.assertEqual(
+            result.state.snapshot()["topologies"],
+            [{"id": 1, "kind": "parallel", "status": "done", "lanes": 3}],
+        )
+
+    def test_pipeline_records_items_and_stages_without_counting_inner_agents_as_sequential(self):
+        script = """
+meta = {"name": "pipeline-topology", "description": "Test workflow"}
+
+async def inspect(value, original, index):
+    return await agent("inspect " + value, {"label": "inspect:" + value, "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 3, "maxToolCalls": 4, "maxToolOutputChars": 20000})
+
+async def verify(value, original, index):
+    return await agent("verify " + value, {"label": "verify:" + original, "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 3, "maxToolCalls": 4, "maxToolOutputChars": 20000})
+
+return await pipeline(["a", "b"], inspect, verify)
+"""
+        result = run_workflow(
+            script,
+            WorkflowOptions(config=PluginConfig(concurrency=4), child_runner=FakeRunner()),
+        )
+
+        self.assertEqual(
+            result.state.snapshot()["topologies"],
+            [{"id": 1, "kind": "pipeline", "status": "done", "items": 2, "stages": 2}],
+        )
+
+    def test_direct_agents_record_observed_sequential_steps(self):
+        script = """
+meta = {"name": "sequential-topology", "description": "Test workflow"}
+
+await agent("a", {"label": "a", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 3, "maxToolCalls": 4, "maxToolOutputChars": 20000})
+await agent("b", {"label": "b", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 3, "maxToolCalls": 4, "maxToolOutputChars": 20000})
+return await agent("c", {"label": "c", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 3, "maxToolCalls": 4, "maxToolOutputChars": 20000})
+"""
+        result = run_workflow(
+            script,
+            WorkflowOptions(config=PluginConfig(), child_runner=FakeRunner()),
+        )
+
+        self.assertEqual(
+            result.state.snapshot()["topologies"],
+            [{"id": 1, "kind": "sequential", "status": "done", "steps": 3}],
+        )
+
     def test_parallel_rejects_arrays_over_vm_boundary_before_agent_launch(self):
         script = """
 meta = {"name": "too-many-parallel", "description": "Test workflow"}
@@ -875,6 +935,47 @@ return await agent("child", {"label": "child", "provider": "openai-codex", "mode
         self.assertEqual(snapshot["children"][0]["agents"][0]["id"], 2)
         self.assertEqual(snapshot["agents"][1]["id"], 3)
         self.assertEqual(snapshot["totals"]["agents"], 3)
+        self.assertEqual(
+            snapshot["topologies"],
+            [
+                {"id": 1, "kind": "sequential", "status": "done", "steps": 1},
+                {"id": 2, "kind": "sequential", "status": "done", "steps": 1},
+            ],
+        )
+
+    def test_nested_workflow_tracks_its_own_sequential_topology_inside_parent_pipeline(self):
+        parent = """
+meta = {"name": "parent-pipeline", "description": "Test workflow"}
+
+async def run_child(value, original, index):
+    return await workflow({"scriptPath": args["child"]})
+
+return await pipeline(["one"], run_child)
+"""
+        child = """
+meta = {"name": "child-sequential", "description": "Test workflow"}
+
+return await agent("child", {"label": "child", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 3, "maxToolCalls": 4, "maxToolOutputChars": 20000})
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            child_path = Path(tmp) / "child.py"
+            child_path.write_text(child, encoding="utf-8")
+            result = run_workflow(
+                parent,
+                WorkflowOptions(
+                    args={"child": str(child_path)},
+                    cwd=tmp,
+                    config=PluginConfig(),
+                    child_runner=FakeRunner(),
+                ),
+            )
+
+        snapshot = result.state.snapshot()
+        self.assertEqual(snapshot["topologies"][0]["kind"], "pipeline")
+        self.assertEqual(
+            snapshot["children"][0]["topologies"],
+            [{"id": 1, "kind": "sequential", "status": "done", "steps": 1}],
+        )
 
     def test_budget_is_token_budget(self):
         script = """

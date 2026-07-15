@@ -956,11 +956,18 @@ class WorkflowRunManager:
                 managed.record["journalError"] = f"{type(exc).__name__}: {exc}"
 
 
-def _progress_signal(record: dict[str, Any]) -> tuple[str, str]:
+def _progress_signal(record: dict[str, Any]) -> tuple[str, str, str]:
     workflow = record.get("workflow") or {}
     logs = workflow.get("logs") or []
     latest_root_log = str(logs[-1]) if logs else ""
-    return _current_phase(workflow), latest_root_log
+    topology = json.dumps(
+        workflow.get("topologies") or [],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    )
+    return _current_phase(workflow), latest_root_log, topology
 
 
 def _completion_output_text(record: dict[str, Any]) -> str:
