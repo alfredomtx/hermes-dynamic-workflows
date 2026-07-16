@@ -1009,7 +1009,7 @@ def _apply_child_metadata(record: AgentRecord, metadata: dict[str, Any]) -> None
         return
     record.runner = str(metadata.get("runner") or record.runner)
     record.workspace = _optional_str(metadata.get("workspace"))
-    record.model = _optional_str(metadata.get("model"))
+    record.model = _optional_str(metadata.get("model")) or record.model
     record.task_id = _optional_str(metadata.get("task_id"))
     record.hermes_session_id = _optional_str(
         metadata.get("hermes_session_id") or metadata.get("session_id")

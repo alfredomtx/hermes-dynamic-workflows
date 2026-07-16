@@ -52,7 +52,14 @@ class TokenRunner(ChildAgentRunner):
 class LiveUpdateRunner(ChildAgentRunner):
     def run(self, request: ChildAgentRequest):
         if request.on_start is not None:
-            request.on_start({"task_id": "workflow-live", "session_id": "workflow-live"})
+            request.on_start(
+                {
+                    "task_id": "workflow-live",
+                    "session_id": "workflow-live",
+                    "model": "gpt-5.6-luna",
+                    "reasoning_effort": "medium",
+                }
+            )
         if request.on_update is not None:
             request.on_update(
                 {
@@ -92,6 +99,8 @@ class RuntimeTests(unittest.TestCase):
         agent = result.state.snapshot()["agents"][0]
         self.assertEqual(agent["tokens"], 321)
         self.assertEqual(agent["tool_calls"], 2)
+        self.assertEqual(agent["model"], "gpt-5.6-luna")
+        self.assertEqual(agent["reasoning_effort"], "medium")
         self.assertEqual([event["type"] for event in events], ["started", "activity", "result"])
         self.assertIn("pwd", events[1]["activity"])
 
