@@ -121,12 +121,22 @@ class TopologyRecord:
     stages: int | None = None
     lanes: int | None = None
     steps: int | None = None
+    # Agent IDs are recorded as reservations happen.  Keeping this on the
+    # topology (rather than deriving it from phase/order) preserves the exact
+    # first-seen membership order for live progress rendering.
+    agent_ids: list[int] = field(default_factory=list)
+
+    def add_agent(self, agent_id: int) -> None:
+        """Add a member once, retaining reservation order."""
+        if agent_id not in self.agent_ids:
+            self.agent_ids.append(agent_id)
 
     def snapshot(self) -> dict[str, Any]:
         data: dict[str, Any] = {
             "id": self.id,
             "kind": self.kind,
             "status": self.status,
+            "agent_ids": list(self.agent_ids),
         }
         for key in ("items", "stages", "lanes", "steps"):
             value = getattr(self, key)

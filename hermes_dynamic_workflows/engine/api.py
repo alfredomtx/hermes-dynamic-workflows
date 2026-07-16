@@ -32,10 +32,22 @@ from ..core.types import (
 )
 
 MAX_VM_ARRAY_ITEMS = 4096
-_HELPER_FRAMES: ContextVar[frozenset[str]] = ContextVar(
-    "workflow_helper_frames",
-    default=frozenset(),
+# Context-local topology membership. A copied mapping is installed whenever a
+# helper/direct wrapper enters a topology, so concurrent asyncio tasks can
+# point the same WorkflowFrame at different helper records without races.
+_ACTIVE_TOPOLOGIES: ContextVar[dict[str, TopologyRecord] | None] = ContextVar(
+    "workflow_active_topologies",
+    default=None,
 )
+
+
+def _active_topology(frame: WorkflowFrame) -> TopologyRecord | None:
+    return (_ACTIVE_TOPOLOGIES.get() or {}).get(frame.id)
+
+
+def _bind_topology(frame: WorkflowFrame, topology: TopologyRecord):
+    current = _ACTIVE_TOPOLOGIES.get() or {}
+    return _ACTIVE_TOPOLOGIES.set({**current, frame.id: topology})
 
 
 class BudgetView:
@@ -84,11 +96,18 @@ class WorkflowAPI:
 
     async def agent(self, prompt: str, opts: dict[str, Any] | None = None) -> Any:
         topology: TopologyRecord | None = None
-        if self.frame.id not in _HELPER_FRAMES.get():
+        topology_token = None
+        if _active_topology(self.frame) is None:
             topology = self._begin_sequential_step()
+            # asyncio.to_thread() copies the current context into the worker,
+            # allowing _agent_sync() to associate the reserved ID before its
+            # first live notification.
+            topology_token = _bind_topology(self.frame, topology)
         try:
             return await asyncio.to_thread(self._agent_sync, prompt, opts)
         finally:
+            if topology_token is not None:
+                _ACTIVE_TOPOLOGIES.reset(topology_token)
             if topology is not None:
                 self._finish_topology(topology)
 
@@ -138,6 +157,9 @@ class WorkflowAPI:
                 max_tool_calls=resolved.max_tool_calls,
                 max_tool_output_chars=resolved.max_tool_output_chars,
             )
+            active_topology = _active_topology(self.frame)
+            if active_topology is not None:
+                active_topology.add_agent(agent_id)
             self.frame.agents.append(record)
             self._notify()
 
@@ -374,6 +396,7 @@ class WorkflowAPI:
             raise WorkflowRuntimeError("parallel() entries must be callables, e.g. lambda: agent(...)")
 
         topology = self._begin_helper_topology("parallel", lanes=len(thunks))
+        topology_token = _bind_topology(self.frame, topology)
         try:
             results = await asyncio.gather(
                 *(self._run_parallel_thunk(index, thunk) for index, thunk in enumerate(thunks))
@@ -381,25 +404,22 @@ class WorkflowAPI:
             self._check_deadline()
             return results
         finally:
+            _ACTIVE_TOPOLOGIES.reset(topology_token)
             self._finish_topology(topology)
 
     async def _run_parallel_thunk(self, index: int, thunk: Callable[[], Any]) -> Any:
-        token = _HELPER_FRAMES.set(_HELPER_FRAMES.get() | {self.frame.id})
         try:
-            try:
-                self._check_deadline()
-                return await _maybe_await(thunk())
-            except WorkflowHalt:
-                raise
-            except Exception as exc:
-                message = f"parallel[{index}] failed: {type(exc).__name__}: {exc}"
-                self.log(message)
-                if not isinstance(exc, ChildAgentError):
-                    with self._lock:
-                        self.frame.errors.append(message)
-                return None
-        finally:
-            _HELPER_FRAMES.reset(token)
+            self._check_deadline()
+            return await _maybe_await(thunk())
+        except WorkflowHalt:
+            raise
+        except Exception as exc:
+            message = f"parallel[{index}] failed: {type(exc).__name__}: {exc}"
+            self.log(message)
+            if not isinstance(exc, ChildAgentError):
+                with self._lock:
+                    self.frame.errors.append(message)
+            return None
 
     async def pipeline(self, items: list[Any], *stages: Callable[[Any, Any, int], Any]) -> list[Any]:
         self._check_deadline()
@@ -414,31 +434,29 @@ class WorkflowAPI:
             items=len(items),
             stages=len(stages),
         )
+        topology_token = _bind_topology(self.frame, topology)
 
         async def run_one(index: int, original: Any) -> Any:
-            token = _HELPER_FRAMES.set(_HELPER_FRAMES.get() | {self.frame.id})
             current = original
             try:
-                try:
-                    for stage in stages:
-                        self._check_deadline()
-                        current = await _maybe_await(stage(current, original, index))
-                except WorkflowHalt:
-                    raise
-                except Exception as exc:
-                    message = f"pipeline[{index}] failed: {type(exc).__name__}: {exc}"
-                    self.log(message)
-                    if not isinstance(exc, ChildAgentError):
-                        with self._lock:
-                            self.frame.errors.append(message)
-                    return None
-                return current
-            finally:
-                _HELPER_FRAMES.reset(token)
+                for stage in stages:
+                    self._check_deadline()
+                    current = await _maybe_await(stage(current, original, index))
+            except WorkflowHalt:
+                raise
+            except Exception as exc:
+                message = f"pipeline[{index}] failed: {type(exc).__name__}: {exc}"
+                self.log(message)
+                if not isinstance(exc, ChildAgentError):
+                    with self._lock:
+                        self.frame.errors.append(message)
+                return None
+            return current
 
         try:
             return await asyncio.gather(*(run_one(i, item) for i, item in enumerate(items)))
         finally:
+            _ACTIVE_TOPOLOGIES.reset(topology_token)
             self._finish_topology(topology)
 
     def phase(self, name: str) -> None:

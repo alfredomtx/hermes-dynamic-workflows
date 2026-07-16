@@ -6,7 +6,7 @@
 后台运行时执行它、用 `agent()/parallel()/pipeline()` 编排大量独立子代理——适合代码库
 审计、大规模迁移、交叉验证的研究。参考自 [Dynamic Workflows in Claude Code](https://claude.com/blog/introducing-dynamic-workflows-in-claude-code)。
 
-网关实时进度会显示运行时观察到的执行结构：流水线项目/阶段数、并行屏障通道数，或已观察到的顺序代理步骤。嵌套辅助函数运行时会暂时占用结构行，结束后恢复父级结构。
+网关实时进度会显示运行时观察到的执行结构：流水线项目/阶段数、并行屏障通道数，或已观察到的顺序代理步骤。每个结构会列出所属代理及其使用的模型和推理强度；嵌套辅助函数保持独立可见。
 
 https://github.com/user-attachments/assets/06ef3d0d-4d89-48c4-9851-e1cae690e9b0
 

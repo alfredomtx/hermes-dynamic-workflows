@@ -308,7 +308,8 @@ def _render_run_block(
         lines.append(f"   Status: {' · '.join(bits)}")
 
         topology = _current_topology(snapshot)
-        if topology is not None:
+        has_topology_tree = _has_topology_membership(snapshot)
+        if not has_topology_tree and topology is not None:
             topology_line = _topology_line(topology)
             if topology_line:
                 lines.append(f"   Topology: {topology_line}")
@@ -334,7 +335,23 @@ def _render_run_block(
             root_log = _bounded_text(root_logs[-1], _PROGRESS_LOG_MAX_CHARS)
             if root_log:
                 optional.append(f"   Log: {root_log}")
-        if totals["agents"]:
+        if has_topology_tree:
+            tree_budget = max(
+                0,
+                _PROGRESS_TOTAL_MAX_CHARS
+                - len("\n".join(lines))
+                - sum(len(item) + 1 for item in optional)
+                - 1,
+            )
+            optional.extend(
+                _topology_tree_lines(
+                    snapshot,
+                    agents,
+                    char_budget=tree_budget,
+                    show_cost=show_cost,
+                )
+            )
+        elif totals["agents"]:
             if len(phases) >= 2:
                 optional.extend(_phase_checklist(snapshot, agents, show_cost=show_cost))
             else:
@@ -811,6 +828,86 @@ def status_icon(status: Any) -> str:
     }.get(str(status or ""), "?")
 
 
+def _topology_marker(status: Any) -> str:
+    return "✓" if str(status or "").lower() in {"done", "completed"} else "▶"
+
+
+def _topology_records(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return topology history in frame/tree order."""
+    records: list[dict[str, Any]] = []
+    for topology in snapshot.get("topologies") or []:
+        if isinstance(topology, dict):
+            records.append(topology)
+    for child in snapshot.get("children") or []:
+        if isinstance(child, dict):
+            records.extend(_topology_records(child))
+    return records
+
+
+def _has_topology_membership(snapshot: dict[str, Any]) -> bool:
+    """Use the tree only when the snapshot is new enough to identify members."""
+    records = _topology_records(snapshot)
+    return bool(records) and all("agent_ids" in topology for topology in records)
+
+
+def _topology_tree_lines(
+    snapshot: dict[str, Any],
+    agents: list[dict[str, Any]],
+    *,
+    char_budget: int = _ROSTER_CHAR_BUDGET,
+    max_rows: int = _ROSTER_MAX_ROWS,
+    show_cost: bool = False,
+) -> list[str]:
+    """Render topology history and its members as bounded optional rows."""
+    by_id: dict[Any, dict[str, Any]] = {}
+    for agent in agents:
+        agent_id = agent.get("id")
+        by_id.setdefault(agent_id, agent)
+        by_id.setdefault(str(agent_id), agent)
+
+    entries: list[str] = []
+    for topology in _topology_records(snapshot):
+        label = _topology_line(topology)
+        if not label:
+            continue
+        entries.append(f"   {_topology_marker(topology.get('status'))} {label}")
+        seen_ids: set[Any] = set()
+        for raw_id in topology.get("agent_ids") or []:
+            if raw_id in seen_ids or str(raw_id) in seen_ids:
+                continue
+            seen_ids.add(raw_id)
+            seen_ids.add(str(raw_id))
+            agent = by_id.get(raw_id) or by_id.get(str(raw_id))
+            if agent is not None:
+                row = _bounded_text(
+                    _agent_row_text(agent, show_cost=show_cost),
+                    _PROGRESS_LOG_MAX_CHARS,
+                )
+                entries.append(f"      {row}")
+
+    if not entries:
+        return []
+    rows: list[str] = []
+    used = 0
+    for entry in entries[:max_rows]:
+        separator = 1 if rows else 0
+        if used + separator + len(entry) > char_budget:
+            break
+        rows.append(entry)
+        used += separator + len(entry)
+    hidden = len(entries) - len(rows)
+    if hidden:
+        tail = f"      … +{hidden}"
+        while rows and used + 1 + len(tail) > char_budget:
+            removed = rows.pop()
+            used -= len(removed) + (1 if rows else 0)
+            hidden += 1
+        if not rows and len(tail) > char_budget:
+            return []
+        rows.append(tail)
+    return rows
+
+
 def _current_topology(snapshot: dict[str, Any]) -> dict[str, Any] | None:
     """Choose the newest active topology, or the newest completed one."""
     topologies = [item for item in snapshot.get("topologies") or [] if isinstance(item, dict)]
@@ -827,14 +924,26 @@ def _topology_line(topology: dict[str, Any]) -> str:
     kind = str(topology.get("kind") or "").strip().lower()
     if kind == "pipeline":
         return (
-            f"Pipeline · {_as_int(topology.get('items'))} items · "
-            f"{_as_int(topology.get('stages'))} stages"
+            f"Pipeline · {_as_int(topology.get('items'))} "
+            f"{_plural('item', topology.get('items'))} · "
+            f"{_as_int(topology.get('stages'))} "
+            f"{_plural('stage', topology.get('stages'))}"
         )
     if kind == "parallel":
-        return f"Parallel barrier · {_as_int(topology.get('lanes'))} lanes"
+        return (
+            f"Parallel barrier · {_as_int(topology.get('lanes'))} "
+            f"{_plural('lane', topology.get('lanes'))}"
+        )
     if kind == "sequential":
-        return f"Sequential · {_as_int(topology.get('steps'))} steps"
+        return (
+            f"Sequential · {_as_int(topology.get('steps'))} "
+            f"{_plural('step', topology.get('steps'))}"
+        )
     return ""
+
+
+def _plural(noun: str, value: Any) -> str:
+    return noun if _as_int(value) == 1 else noun + "s"
 
 
 def _current_phase(snapshot: dict[str, Any]) -> str:

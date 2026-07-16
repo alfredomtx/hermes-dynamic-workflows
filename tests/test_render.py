@@ -115,6 +115,40 @@ class BoundedProgressRenderTests(unittest.TestCase):
         )
         self.assertIn("Topology: Pipeline · 12 items · 2 stages", resumed_text)
 
+    def test_detailed_progress_groups_member_agents_under_every_topology_with_model_and_effort(self):
+        snapshot = {
+            "meta": {"name": "topology-tree"},
+            "topologies": [
+                {"id": 1, "kind": "pipeline", "status": "done", "items": 2, "stages": 2, "agent_ids": [1, 2]},
+                {"id": 2, "kind": "parallel", "status": "done", "lanes": 1, "agent_ids": [3]},
+                {"id": 3, "kind": "sequential", "status": "active", "steps": 1, "agent_ids": [4]},
+            ],
+            "agents": [
+                {"id": 1, "label": "inspect:one", "status": "done", "model": "gpt-5.6-luna", "reasoning_effort": "medium"},
+                {"id": 2, "label": "verify:one", "status": "done", "model": "gpt-5.6-luna", "reasoning_effort": "high"},
+                {"id": 3, "label": "lane:one", "status": "done", "model": "gpt-5.6-sol", "reasoning_effort": "medium"},
+                {"id": 4, "label": "step:one", "status": "running", "model": "gpt-5.6-luna", "reasoning_effort": "max"},
+            ],
+        }
+
+        text = render_module.render_run_progress(
+            {"status": "running", "workflow": snapshot},
+            show_cost=False,
+        )
+
+        expected_order = [
+            "✓ Pipeline · 2 items · 2 stages",
+            "✓ inspect:one · gpt-5.6-luna medium",
+            "✓ verify:one · gpt-5.6-luna high",
+            "✓ Parallel barrier · 1 lane",
+            "✓ lane:one · gpt-5.6-sol medium",
+            "▶ Sequential · 1 step",
+            "▶ step:one · gpt-5.6-luna max",
+        ]
+        positions = [text.index(expected) for expected in expected_order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertNotIn("Topology: Sequential", text)
+
     def test_large_roster_keeps_bounded_mandatory_fields_within_telegram_limit(self):
         name = "N" * 120
         current = "C" * 120

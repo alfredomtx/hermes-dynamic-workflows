@@ -11,8 +11,8 @@ audits, large-scale migrations, and cross-validated research. Inspired by
 [Dynamic Workflows in Claude Code](https://claude.com/blog/introducing-dynamic-workflows-in-claude-code).
 
 Live gateway progress reports the runtime-observed execution shape: pipeline item/stage counts,
-parallel barrier lane counts, or observed sequential agent steps. Nested helpers temporarily take
-the topology line, then the parent shape resumes.
+parallel barrier lane counts, or observed sequential agent steps. Each topology lists its member
+agents with the model and reasoning effort used. Nested helpers remain independently visible.
 
 https://github.com/user-attachments/assets/06ef3d0d-4d89-48c4-9851-e1cae690e9b0
 

@@ -187,7 +187,7 @@ return await parallel([
 
         self.assertEqual(
             result.state.snapshot()["topologies"],
-            [{"id": 1, "kind": "parallel", "status": "done", "lanes": 3}],
+            [{"id": 1, "kind": "parallel", "status": "done", "lanes": 3, "agent_ids": [1, 2, 3]}],
         )
 
     def test_pipeline_records_items_and_stages_without_counting_inner_agents_as_sequential(self):
@@ -209,7 +209,7 @@ return await pipeline(["a", "b"], inspect, verify)
 
         self.assertEqual(
             result.state.snapshot()["topologies"],
-            [{"id": 1, "kind": "pipeline", "status": "done", "items": 2, "stages": 2}],
+            [{"id": 1, "kind": "pipeline", "status": "done", "items": 2, "stages": 2, "agent_ids": [1, 2, 3, 4]}],
         )
 
     def test_direct_agents_record_observed_sequential_steps(self):
@@ -227,7 +227,7 @@ return await agent("c", {"label": "c", "provider": "openai-codex", "model": "gpt
 
         self.assertEqual(
             result.state.snapshot()["topologies"],
-            [{"id": 1, "kind": "sequential", "status": "done", "steps": 3}],
+            [{"id": 1, "kind": "sequential", "status": "done", "steps": 3, "agent_ids": [1, 2, 3]}],
         )
 
     def test_parallel_rejects_arrays_over_vm_boundary_before_agent_launch(self):
@@ -947,8 +947,8 @@ return await agent("child", {"label": "child", "provider": "openai-codex", "mode
         self.assertEqual(
             snapshot["topologies"],
             [
-                {"id": 1, "kind": "sequential", "status": "done", "steps": 1},
-                {"id": 2, "kind": "sequential", "status": "done", "steps": 1},
+                {"id": 1, "kind": "sequential", "status": "done", "steps": 1, "agent_ids": [1]},
+                {"id": 2, "kind": "sequential", "status": "done", "steps": 1, "agent_ids": [3]},
             ],
         )
 
@@ -980,10 +980,13 @@ return await agent("child", {"label": "child", "provider": "openai-codex", "mode
             )
 
         snapshot = result.state.snapshot()
-        self.assertEqual(snapshot["topologies"][0]["kind"], "pipeline")
+        self.assertEqual(
+            snapshot["topologies"],
+            [{"id": 1, "kind": "pipeline", "status": "done", "items": 1, "stages": 1, "agent_ids": []}],
+        )
         self.assertEqual(
             snapshot["children"][0]["topologies"],
-            [{"id": 1, "kind": "sequential", "status": "done", "steps": 1}],
+            [{"id": 1, "kind": "sequential", "status": "done", "steps": 1, "agent_ids": [1]}],
         )
 
     def test_budget_is_token_budget(self):
