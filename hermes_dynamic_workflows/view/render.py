@@ -181,7 +181,7 @@ def render_cost_breakdown(
     def _agent_cost_line(agent: dict[str, Any], amount: "Any") -> str:
         label = _chip_label(agent)
         segs = [label]
-        model = _short_model(agent.get("model"))
+        model = _model_segment(agent)
         if model:
             segs.append(model)
         segs.append(_format_cost(amount))
@@ -220,7 +220,27 @@ def render_cost_breakdown(
 
     priced_by_id = {a.get("id"): (a, c) for a, c in priced}
     backstopped = False
-    if len(phases) >= 2:
+    topologies = _topology_records(snapshot)
+    has_topology_membership = bool(topologies) and all(
+        "agent_ids" in topology for topology in topologies
+    )
+    if has_topology_membership:
+        for topology in topologies:
+            members = [
+                priced_by_id[agent_id]
+                for agent_id in topology.get("agent_ids") or []
+                if agent_id in priced_by_id
+            ]
+            if not _emit(members, _topology_line(topology)):
+                backstopped = True
+                break
+        if not backstopped:
+            leftover = [
+                pair for aid, pair in priced_by_id.items() if aid not in rendered_ids
+            ]
+            if not _emit(leftover, "[Other]"):
+                backstopped = True
+    elif len(phases) >= 2:
         for title in phases:
             members = [
                 priced_by_id[a.get("id")]

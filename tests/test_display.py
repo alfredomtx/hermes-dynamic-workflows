@@ -313,6 +313,47 @@ class DisplayTests(unittest.TestCase):
             self.assertIn(f"verify:AC-{i}", text)
         self.assertGreaterEqual(text.count("~$"), 3)  # at least one per agent
 
+    def test_cost_breakdown_uses_topology_headers_and_includes_reasoning_effort(self):
+        from hermes_dynamic_workflows.view.render import render_cost_breakdown
+
+        agents = self._priced_agents()
+        for agent in agents:
+            agent["status"] = "done"
+        run = {
+            "status": "completed",
+            "workflow": {
+                "meta": {"name": "topology-cost"},
+                "phases": [{"title": "Pipeline"}, {"title": "Parallel"}],
+                "agents": agents,
+                "topologies": [
+                    {
+                        "id": 1,
+                        "kind": "pipeline",
+                        "status": "done",
+                        "items": 1,
+                        "stages": 2,
+                        "agent_ids": [1, 2],
+                    },
+                    {
+                        "id": 2,
+                        "kind": "parallel",
+                        "status": "done",
+                        "lanes": 1,
+                        "agent_ids": [3],
+                    },
+                ],
+                "errors": [],
+            },
+        }
+
+        text = render_cost_breakdown(run)
+
+        self.assertIn("Pipeline · 1 item · 2 stages", text)
+        self.assertIn("Parallel barrier · 1 lane", text)
+        self.assertIn("verify:AC-1 · claude-opus-4-8 xhigh", text)
+        self.assertIn("verify:AC-3 · claude-opus-4-8 xhigh", text)
+        self.assertNotIn("   Verify  ", text)
+
     def test_cost_breakdown_empty_when_nothing_priceable(self):
         from hermes_dynamic_workflows.view.render import render_cost_breakdown
 
