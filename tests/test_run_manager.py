@@ -2866,6 +2866,104 @@ class CompletionCardRenderTests(unittest.TestCase):
 
         self.assertEqual(fresh_send, bubble)
 
+    def test_result_rows_preserve_mixed_nested_results_in_order(self):
+        from hermes_dynamic_workflows.view.completion import _result_rows
+
+        rows = _result_rows({
+            "results": [
+                "PASS — zero blockers\nValidated source.",
+                None,
+                {
+                    "label": "Security scan",
+                    "status": "failed",
+                    "summary": "Three blockers remain.",
+                    "findings": ["Secret exposed.", "Unsafe redirect."],
+                    "nextAction": "Rotate credential.",
+                },
+            ]
+        })
+
+        self.assertEqual([row.label for row in rows], ["Result 1", "Result 2", "Security scan"])
+        self.assertEqual(rows[0].heading, "PASS — zero blockers")
+        self.assertEqual(rows[0].summary, "Validated source.")
+        self.assertTrue(rows[1].missing)
+        self.assertEqual(rows[1].heading, "No result returned")
+        self.assertEqual(rows[2].status, "failed")
+        self.assertEqual(rows[2].findings, ("Secret exposed.", "Unsafe redirect."))
+        self.assertEqual(rows[2].next_action, "Rotate credential.")
+
+    def test_result_rows_do_not_promote_verdict_from_plain_string(self):
+        from hermes_dynamic_workflows.view.completion import _result_rows
+
+        row = _result_rows("Example failure text: FAIL does not describe this run.")[0]
+
+        self.assertIsNone(row.status)
+
+    def test_result_rows_normalize_scalars_and_null_as_rows(self):
+        from hermes_dynamic_workflows.view.completion import _result_rows
+
+        scalar = _result_rows(17)[0]
+        missing = _result_rows(None)[0]
+
+        self.assertEqual(scalar.label, "Result 1")
+        self.assertEqual(scalar.heading, "17")
+        self.assertIsNone(scalar.status)
+        self.assertFalse(scalar.missing)
+        self.assertEqual(missing.heading, "No result returned")
+        self.assertTrue(missing.missing)
+
+    def test_result_rows_extract_explicit_title_name_and_label(self):
+        from hermes_dynamic_workflows.view.completion import _result_rows
+
+        rows = _result_rows([
+            {"title": "Title result", "message": "Title details"},
+            {"name": "Named result"},
+            {"label": "Labeled result"},
+        ])
+
+        self.assertEqual(
+            [row.label for row in rows],
+            ["Title result", "Named result", "Labeled result"],
+        )
+        self.assertEqual(rows[0].heading, "Title result")
+        self.assertEqual(rows[0].summary, "Title details")
+
+    def test_result_rows_ignore_malformed_findings_and_keep_recognized_status(self):
+        from hermes_dynamic_workflows.view.completion import _result_rows
+
+        row = _result_rows({
+            "label": "Malformed scan",
+            "status": "passed",
+            "summary": "The scan completed.",
+            "findings": "not a list",
+        })[0]
+
+        self.assertEqual(row.status, "passed")
+        self.assertEqual(row.findings, ())
+
+    def test_result_rows_keep_ordinary_dictionary_fields_and_nested_list_order(self):
+        from hermes_dynamic_workflows.view.completion import _result_rows
+
+        rows = _result_rows([
+            {
+                "label": "Unit tests",
+                "outcome": "success",
+                "title": "Unit tests passed",
+                "summary": "All unit tests passed.",
+                "findings": [{"title": "No failures"}],
+                "next_action": "Publish the report.",
+            },
+            "second result",
+        ])
+
+        self.assertEqual([row.label for row in rows], ["Unit tests", "Result 2"])
+        self.assertEqual(rows[0].status, "completed")
+        self.assertEqual(rows[0].heading, "Unit tests passed")
+        self.assertEqual(rows[0].summary, "All unit tests passed.")
+        self.assertEqual(rows[0].findings, ("No failures",))
+        self.assertEqual(rows[0].next_action, "Publish the report.")
+        self.assertEqual(rows[1].heading, "second result")
+
 
 class StoppedWorkflowRenderTests(unittest.TestCase):
     def _stopped_record(self) -> dict:

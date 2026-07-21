@@ -19,6 +19,17 @@ class _CompletionCard:
     fallback: str = ""
 
 
+@dataclass(frozen=True)
+class _ResultRow:
+    label: str
+    status: str | None
+    heading: str
+    summary: str = ""
+    findings: tuple[str, ...] = ()
+    next_action: str = ""
+    missing: bool = False
+
+
 def content_from_value(value: Any) -> str:
     if isinstance(value, str):
         return value
@@ -158,6 +169,61 @@ def _render_finding_rows(values: list[Any]) -> tuple[str, ...]:
         if text and text not in rendered:
             rendered.append(text)
     return tuple(rendered[:4])
+
+
+def _result_items(result: Any) -> list[Any]:
+    if isinstance(result, dict) and isinstance(result.get("results"), list):
+        return list(result["results"])
+    if isinstance(result, list):
+        return list(result)
+    return [result]
+
+
+def _result_rows(result: Any) -> tuple[_ResultRow, ...]:
+    rows: list[_ResultRow] = []
+    for index, value in enumerate(_result_items(result), start=1):
+        fallback_label = f"Result {index}"
+        if value is None:
+            rows.append(_ResultRow(fallback_label, None, "No result returned", missing=True))
+            continue
+        if isinstance(value, str):
+            lines = [line.strip() for line in value.splitlines() if line.strip()]
+            heading = _bounded_card_text(lines[0] if lines else "No result returned", 120)
+            summary = _bounded_result_text("\n".join(lines[1:]), 480) if len(lines) > 1 else ""
+            rows.append(_ResultRow(fallback_label, None, heading, summary))
+            continue
+        if isinstance(value, dict):
+            label = _bounded_card_text(
+                value.get("label") or value.get("title") or value.get("name") or fallback_label,
+                96,
+            )
+            status = None
+            for key in ("status", "verdict", "outcome"):
+                if value.get(key) is None:
+                    continue
+                recognized = _recognized_outcome(value[key])
+                if recognized is not None:
+                    status = recognized
+                    break
+            heading = _bounded_card_text(
+                value.get("title") or value.get("summary") or value.get("message") or label,
+                120,
+            )
+            summary = _bounded_card_text(value.get("summary") or value.get("message"), 480)
+            findings_value = value.get("findings") if isinstance(value.get("findings"), list) else []
+            rows.append(
+                _ResultRow(
+                    label,
+                    status,
+                    heading,
+                    summary if summary != heading else "",
+                    _render_finding_rows(findings_value),
+                    _bounded_card_text(value.get("nextAction") or value.get("next_action"), 400),
+                )
+            )
+            continue
+        rows.append(_ResultRow(fallback_label, None, _bounded_card_text(value, 120)))
+    return tuple(rows)
 
 
 def _classify_findings(values: list[Any]) -> tuple[int, tuple[str, ...], tuple[str, ...]]:
