@@ -79,6 +79,24 @@ class FailingRunner(ChildAgentRunner):
         raise RuntimeError(f"failed:{request.label}")
 
 
+class FailedMetadataRunner(ChildAgentRunner):
+    def run(self, request: ChildAgentRequest):
+        if request.on_update is not None:
+            request.on_update(
+                {
+                    "tokens": 37,
+                    "input_tokens": 20,
+                    "output_tokens": 10,
+                    "reasoning_tokens": 7,
+                    "cache_read_tokens": 3,
+                    "cache_write_tokens": 2,
+                    "tool_calls": 1,
+                    "stop_reason": "maxToolCalls",
+                }
+            )
+        raise ChildAgentError("child exhausted maxToolCalls=1")
+
+
 class SkippingRunner(ChildAgentRunner):
     def run(self, request: ChildAgentRequest):
         raise ChildAgentSkipped("skipped by user")
@@ -1006,6 +1024,32 @@ return {"total": budget.total, "spent": budget.spent(), "remaining": budget.rema
         )
 
         self.assertEqual(result.value, {"total": 100, "spent": 40, "remaining": 60})
+
+    def test_failed_child_metadata_updates_record_and_spends_tokens_once(self):
+        script = """
+meta = {"name": "failed-child", "description": "Test workflow"}
+
+try:
+    await agent("a", {"label": "a", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
+except Exception:
+    return {"spent": budget.spent()}
+return {"spent": budget.spent()}
+"""
+        result = run_workflow(
+            script,
+            WorkflowOptions(
+                config=PluginConfig(),
+                child_runner=FailedMetadataRunner(),
+            ),
+        )
+
+        snapshot = result.state.snapshot()
+        self.assertEqual(result.value, {"spent": 37})
+        self.assertEqual(snapshot["agents"][0]["status"], "error")
+        self.assertEqual(snapshot["agents"][0]["tokens"], 37)
+        self.assertEqual(snapshot["agents"][0]["cache_read_tokens"], 3)
+        self.assertEqual(snapshot["agents"][0]["cache_write_tokens"], 2)
+        self.assertEqual(snapshot["totals"]["tokens"], 37)
 
     def test_token_budget_blocks_further_agents(self):
         script = """

@@ -261,6 +261,7 @@ class WorkflowAPI:
 
         accumulated_tokens = 0
         for attempt in range(max_attempts):
+            attempt_accounted_tokens = 0
             try:
                 with self.context.agent_slot():
                     raw_result = self._run_child(request, record)
@@ -269,7 +270,9 @@ class WorkflowAPI:
                 _apply_child_metadata(record, metadata)
                 # Count every attempt's tokens toward the budget; record.tokens
                 # reports the run total across attempts.
-                self.context.record_tokens(record.tokens)
+                token_delta = max(0, record.tokens - attempt_accounted_tokens)
+                self.context.record_tokens(token_delta)
+                attempt_accounted_tokens += token_delta
                 accumulated_tokens += record.tokens
                 if schema:
                     if not isinstance(metadata, dict) or not metadata.get("structured_captured"):
@@ -322,6 +325,9 @@ class WorkflowAPI:
                 record.attempts = attempt + 1
                 record.status = "error"
                 record.tokens = max(record.tokens, accumulated_tokens)
+                token_delta = max(0, record.tokens - attempt_accounted_tokens)
+                self.context.record_tokens(token_delta)
+                attempt_accounted_tokens += token_delta
                 record.error = f"{type(exc).__name__}: {exc}"
                 self._journal(
                     {

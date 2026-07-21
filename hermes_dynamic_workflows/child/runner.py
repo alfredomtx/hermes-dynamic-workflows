@@ -469,6 +469,34 @@ class HermesChildAgentRunner(ChildAgentRunner):
         timeout = self.config.child_timeout_seconds
         live_lock = threading.RLock()
         live_tool_calls = 0
+        latest = {
+            "result": {},
+            "tool_calls": 0,
+            "tool_output_chars": 0,
+            "stop_reason": None,
+        }
+
+        def _emit_terminal_metadata() -> None:
+            with live_lock:
+                metadata = _child_metadata(
+                    child,
+                    latest["result"],
+                    lease,
+                    agent_type,
+                    toolsets,
+                )
+                metadata["tool_calls"] = max(
+                    int(metadata.get("tool_calls") or 0),
+                    int(latest["tool_calls"] or 0),
+                    live_tool_calls,
+                )
+                metadata["tool_output_chars"] = max(
+                    int(metadata.get("tool_output_chars") or 0),
+                    int(latest["tool_output_chars"] or 0),
+                )
+                if latest["stop_reason"]:
+                    metadata["stop_reason"] = latest["stop_reason"]
+            _emit_request_update(request, metadata)
 
         def _emit_progress(event: dict[str, Any]) -> None:
             nonlocal live_tool_calls
@@ -485,6 +513,15 @@ class HermesChildAgentRunner(ChildAgentRunner):
                 if event.get("type") == "approval":
                     metadata["approval"] = dict(event)
             _emit_request_update(request, metadata)
+
+        def _record_core_budget_stop_reason(core_budget: Any) -> None:
+            if not isinstance(core_budget, dict) or not core_budget.get("exhausted"):
+                return
+            latest["stop_reason"] = (
+                "maxToolOutputChars"
+                if core_budget.get("exhaustion_reason") == "max_output_chars"
+                else "maxToolCalls"
+            )
 
         interactive_callback = self._approval_coordinator.callback_for(
             lease.task_id,
@@ -554,6 +591,7 @@ class HermesChildAgentRunner(ChildAgentRunner):
                         conversation_history=history,
                         task_id=lease.task_id,
                     )
+                    latest["result"] = result if isinstance(result, dict) else {}
                     core_budget = result.get("tool_budget") if isinstance(result, dict) else None
                     if isinstance(core_budget, dict):
                         tool_calls_used = _nonnegative_int(core_budget.get("calls_used"))
@@ -568,8 +606,11 @@ class HermesChildAgentRunner(ChildAgentRunner):
                         "tool_calls": tool_calls_used,
                         "tool_output_chars": tool_output_chars_used,
                     }
+                    latest["tool_calls"] = tool_calls_used
+                    latest["tool_output_chars"] = tool_output_chars_used
                     _emit_request_update(request, usage)
                     if tool_calls_used > tool_call_limit:
+                        latest["stop_reason"] = "maxToolCalls"
                         _emit_request_update(
                             request,
                             {
@@ -581,6 +622,7 @@ class HermesChildAgentRunner(ChildAgentRunner):
                             f"child exhausted maxToolCalls={tool_call_limit}"
                         )
                     if tool_output_chars_used > tool_output_limit:
+                        latest["stop_reason"] = "maxToolOutputChars"
                         _emit_request_update(
                             request,
                             {
@@ -598,12 +640,14 @@ class HermesChildAgentRunner(ChildAgentRunner):
                         request.max_turns is not None and _capped_child_exhausted(result)
                     )
                     if not request.structured_tool:
+                        _record_core_budget_stop_reason(core_budget)
                         _raise_for_core_tool_budget_exhaustion(
                             core_budget,
                             tool_call_limit,
                             tool_output_limit,
                         )
                         if capped_exhaustion:
+                            latest["stop_reason"] = "maxTurns"
                             raise ChildAgentError(
                                 f"child exhausted maxTurns={request.max_turns} before completing"
                             )
@@ -620,6 +664,7 @@ class HermesChildAgentRunner(ChildAgentRunner):
                     captured, _value, tool_attempts = peek_result(lease.task_id)
                     if captured:
                         return result
+                    _record_core_budget_stop_reason(core_budget)
                     _raise_for_core_tool_budget_exhaustion(
                         core_budget,
                         tool_call_limit,
@@ -628,6 +673,7 @@ class HermesChildAgentRunner(ChildAgentRunner):
                     if capped_exhaustion or (
                         remaining_turns is not None and remaining_turns <= 0
                     ):
+                        latest["stop_reason"] = "maxTurns"
                         raise ChildAgentError(
                             f"child exhausted maxTurns={request.max_turns} before providing "
                             "valid structured output"
@@ -653,6 +699,7 @@ class HermesChildAgentRunner(ChildAgentRunner):
                         )
 
                     if tool_calls_used >= tool_call_limit:
+                        latest["stop_reason"] = "maxToolCalls"
                         _emit_request_update(
                             request,
                             {
@@ -664,6 +711,7 @@ class HermesChildAgentRunner(ChildAgentRunner):
                             f"child exhausted maxToolCalls={tool_call_limit}"
                         )
                     if tool_output_chars_used >= tool_output_limit:
+                        latest["stop_reason"] = "maxToolOutputChars"
                         _emit_request_update(
                             request,
                             {
@@ -722,11 +770,15 @@ class HermesChildAgentRunner(ChildAgentRunner):
                 raise ChildAgentError(failure)
             metadata = _child_metadata(child, result, lease, agent_type, toolsets)
             return ChildAgentResult(content=content, metadata=metadata)
+        except ChildAgentError:
+            _emit_terminal_metadata()
+            raise
         except FuturesTimeoutError as exc:
             try:
                 if hasattr(child, "interrupt"):
                     child.interrupt()
             finally:
+                _emit_terminal_metadata()
                 raise WorkflowTimeout(f"child agent timed out after {timeout:.0f}s") from exc
         finally:
             try:

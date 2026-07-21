@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import types
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1768,6 +1769,53 @@ class MaxTurnsRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ChildAgentError, "maxToolCalls=1"):
             self._run_structured(child, request, "structured-tool-limit")
         self.assertEqual(child.calls, 1)
+
+    def test_failed_structured_child_emits_terminal_token_metadata(self):
+        events = []
+
+        class Child:
+            session_prompt_tokens = 100
+            session_completion_tokens = 20
+            session_reasoning_tokens = 7
+            session_input_tokens = 90
+            session_output_tokens = 20
+            session_cache_read_tokens = 30
+            session_cache_write_tokens = 4
+            model = "test"
+
+            def run_conversation(self, **_kwargs):
+                return {
+                    "final_response": "done",
+                    "messages": [
+                        {"role": "assistant", "tool_calls": [{"id": "one"}]},
+                    ],
+                    "completed": True,
+                    "api_calls": 1,
+                }
+
+        request = replace(
+            self._request(3, max_tool_calls=1),
+            on_update=events.append,
+        )
+        lease = WorkspaceLease(task_id="structured-failed-metadata", cwd="/tmp")
+        register_expectation(lease.task_id, request.schema or {})
+        try:
+            with self.assertRaisesRegex(ChildAgentError, "maxToolCalls=1"):
+                HermesChildAgentRunner(PluginConfig())._run_child_with_timeout(
+                    Child(), request, lease, None, ["workflow_structured"]
+                )
+        finally:
+            clear_expectation(lease.task_id)
+
+        terminal = events[-1]
+        self.assertEqual(terminal["tokens"], 127)
+        self.assertEqual(terminal["input_tokens"], 90)
+        self.assertEqual(terminal["output_tokens"], 20)
+        self.assertEqual(terminal["reasoning_tokens"], 7)
+        self.assertEqual(terminal["cache_read_tokens"], 30)
+        self.assertEqual(terminal["cache_write_tokens"], 4)
+        self.assertEqual(terminal["tool_calls"], 1)
+        self.assertEqual(terminal["stop_reason"], "maxToolCalls")
 
     def test_does_not_continue_after_consuming_output_character_budget(self):
         class Child:
