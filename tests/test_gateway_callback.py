@@ -174,10 +174,24 @@ class StopButtonHelperTests(unittest.TestCase):
         self.assertIn("wf:stop:wg123", callbacks)
         self.assertIn("wf:restart:wf_abc123", callbacks)
 
-    def test_terminal_control_buttons_include_rerun(self):
-        buttons = _control_buttons_for(self._record(status="completed"), PluginConfig())
-        self.assertEqual(buttons[0]["callback_data"], "wf:rerun:wf_abc123")
-        self.assertIn("Rerun", buttons[0]["text"])
+    def test_terminal_control_buttons_do_not_include_rerun(self):
+        for status in ("completed", "failed", "error", "stopped", "interrupted"):
+            buttons = _control_buttons_for(self._record(status=status), PluginConfig())
+            flattened = buttons or []
+            if flattened and isinstance(flattened[0], list):
+                flattened = [button for row in flattened for button in row]
+            self.assertFalse(
+                any(button.get("callback_data", "").startswith("wf:rerun:") for button in flattened)
+            )
+
+    def test_terminal_control_buttons_keep_open_log_only(self):
+        record = self._record(status="completed")
+        record["logUrl"] = "https://example.com/log"
+
+        self.assertEqual(
+            _control_buttons_for(record, PluginConfig()),
+            [{"text": "📄 Open log", "url": "https://example.com/log"}],
+        )
 
     def test_open_log_url_button_when_http_url_exists(self):
         record = self._record(status="running")

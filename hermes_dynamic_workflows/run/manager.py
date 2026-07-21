@@ -1853,7 +1853,6 @@ def _accepts_buttons(method: Any) -> bool:
 # has already been requested, so buttons would render misleading duplicate taps.
 _STOPPABLE_STATES = {"queued", "running", "paused"}
 _ACTIVE_CONTROL_STATES = {"queued", "running", "paused"}
-_TERMINAL_RERUN_STATES = {"completed", "failed", "error", "stopped", "interrupted"}
 
 
 def _https_url(value: Any) -> str | None:
@@ -1894,8 +1893,6 @@ def _control_buttons_for(record: dict[str, Any], config: PluginConfig) -> list |
         controls.append({"text": "⏹ Stop", "callback_data": f"wf:stop:{task_id}"})
     if status in _ACTIVE_CONTROL_STATES and run_id:
         controls.append({"text": "🔄 Restart", "callback_data": f"wf:restart:{run_id}"})
-    if status in _TERMINAL_RERUN_STATES and run_id and record.get("scriptPath"):
-        controls.append({"text": "🔁 Rerun", "callback_data": f"wf:rerun:{run_id}"})
 
     if controls:
         rows.append(controls)
@@ -2093,9 +2090,9 @@ def _edit_progress_bubble(
         managed.progress_last_text = text
         managed.progress_last_edit_ts = now
         # Inline workflow controls: while active show status-appropriate buttons;
-        # on completion show terminal controls (for example Rerun) when possible,
-        # otherwise pass [] to CLEAR active controls. None mid-run when no
-        # controls are valid leaves any existing keyboard untouched.
+        # on completion pass [] to CLEAR stale active controls when no terminal
+        # controls remain. None mid-run when no controls are valid leaves any
+        # existing keyboard untouched.
         control_buttons = _control_buttons_for(managed.record, config)
         if completed:
             edit_buttons: list | None = control_buttons if control_buttons is not None else []

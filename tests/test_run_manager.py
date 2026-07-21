@@ -1180,12 +1180,21 @@ return await agent("do it", {
                 self.sent = []
                 self.edited = []
 
-            async def send(self, chat_id, content, metadata=None):
-                self.sent.append((chat_id, content, metadata))
+            async def send(self, chat_id, content, metadata=None, buttons=None):
+                self.sent.append((chat_id, content, metadata, buttons))
                 return SimpleNamespace(success=True, message_id="msg-100")
 
-            async def edit_message(self, chat_id, message_id, content, *, finalize=False, metadata=None):
-                self.edited.append((chat_id, message_id, content, finalize, metadata))
+            async def edit_message(
+                self,
+                chat_id,
+                message_id,
+                content,
+                *,
+                finalize=False,
+                metadata=None,
+                buttons=None,
+            ):
+                self.edited.append((chat_id, message_id, content, finalize, metadata, buttons))
                 return SimpleNamespace(success=True, message_id=message_id)
 
         adapter = EditAdapter()
@@ -1254,6 +1263,7 @@ return await agent("do it", {
         self.assertEqual(final_edit[0], "chat-1")
         self.assertEqual(final_edit[1], "msg-100")
         self.assertTrue(final_edit[3])  # finalize=True
+        self.assertEqual(final_edit[5], [])  # clear stale active controls
         self.assertIn("worker", final_edit[2])
         self.assertNotIn("Result:", final_edit[2])
 
