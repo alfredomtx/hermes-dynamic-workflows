@@ -267,15 +267,48 @@ def _result_detail_lines(row: _ResultRow) -> tuple[str, ...]:
     return tuple(lines)
 
 
+def _result_row_marker(row: _ResultRow) -> str:
+    if row.missing or row.status == "warning":
+        return "⚠️"
+    if row.status in {"blocked", "failed"}:
+        return "❌"
+    if row.status in {"passed", "completed"}:
+        return "✅"
+    return ""
+
+
+def _result_rows_need_attention(rows: tuple[_ResultRow, ...]) -> bool:
+    return any(
+        row.missing or row.status in {"blocked", "failed", "warning"}
+        for row in rows
+    )
+
+
+def _result_card_status(
+    transport: str,
+    rows: tuple[_ResultRow, ...],
+    status: str | None = None,
+) -> str:
+    card_status = status or transport
+    if (
+        transport == "completed"
+        and card_status in {"completed", "passed"}
+        and _result_rows_need_attention(rows)
+    ):
+        return "warning"
+    return card_status
+
+
 def _render_result_rows(rows: tuple[_ResultRow, ...], *, max_units: int) -> str:
     total = len(rows)
     missing = sum(row.missing for row in rows)
     result_count = total - missing
     aggregate = f"{total} subtasks · {result_count} results · {missing} missing"
-    heading_lines = [
-        f"{index}. {_sanitize_text(row.heading)}"
-        for index, row in enumerate(rows, start=1)
-    ]
+    heading_lines = []
+    for index, row in enumerate(rows, start=1):
+        marker = _result_row_marker(row)
+        prefix = f"{index}. {marker} " if marker else f"{index}. "
+        heading_lines.append(f"{prefix}{_sanitize_text(row.heading)}")
 
     def structural_lines(visible_count: int) -> list[str]:
         lines = [aggregate, *heading_lines[:visible_count]]
@@ -438,10 +471,12 @@ def _build_completion_card(record: dict[str, Any], preview_chars: int) -> _Compl
             summary=_bounded_result_text(result, min(max(preview_chars, 240), 1200)),
         )
     if isinstance(result, list):
+        rows = _result_rows(result)
+        final_status = _result_card_status(transport, rows)
         return _CompletionCard(
-            status=transport,
-            title=_completion_title(transport, is_review=False, workflow_name=workflow_name),
-            result_rows=_result_rows(result),
+            status=final_status,
+            title=_completion_title(final_status, is_review=False, workflow_name=workflow_name),
+            result_rows=rows,
         )
     if not isinstance(result, dict):
         return _raw_completion_card(record, workflow_name, transport, preview_chars)
@@ -529,10 +564,12 @@ def _build_completion_card(record: dict[str, Any], preview_chars: int) -> _Compl
         )
 
     if isinstance(result.get("results"), list):
+        rows = _result_rows(result)
+        final_status = _result_card_status(transport, rows, status)
         return _CompletionCard(
-            status=status or transport,
-            title=_completion_title(status or transport, is_review=False, workflow_name=workflow_name),
-            result_rows=_result_rows(result),
+            status=final_status,
+            title=_completion_title(final_status, is_review=False, workflow_name=workflow_name),
+            result_rows=rows,
         )
 
     top_findings = result.get("findings")

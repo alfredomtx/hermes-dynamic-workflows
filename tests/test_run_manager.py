@@ -2982,11 +2982,62 @@ class CompletionCardRenderTests(unittest.TestCase):
 
         self.assertIn("3 subtasks · 2 results · 1 missing", text)
         self.assertIn("1. PASS — clean", text)
-        self.assertIn("2. No result returned", text)
-        self.assertIn("3. Three blockers.", text)
+        self.assertIn("2. ⚠️ No result returned", text)
+        self.assertIn("3. ❌ Three blockers.", text)
         self.assertNotIn('"results"', text)
         self.assertNotIn("null", text)
         self.assertEqual(text.count("11m 31s · 2 agents · 5.04M tokens"), 1)
+
+    def test_nested_mixed_results_surface_attention_markers_and_warning_card(self):
+        record = self._blocked_review_record()
+        record["result"] = {
+            "results": [
+                {"status": "passed", "summary": "All checks passed."},
+                None,
+                {"status": "failed", "summary": "Three blockers."},
+            ]
+        }
+
+        text = manager_module._progress_bubble_text(
+            record,
+            PluginConfig(notify_progress_cost=False),
+            completed=True,
+        )
+
+        self.assertTrue(text.startswith("⚠️ Final review task 7 needs attention"), text)
+        self.assertIn("1. ✅ All checks passed.", text)
+        self.assertIn("2. ⚠️ No result returned", text)
+        self.assertIn("3. ❌ Three blockers.", text)
+
+    def test_plain_string_fail_text_does_not_change_completed_transport_card(self):
+        record = self._blocked_review_record()
+        record["result"] = "FAIL appears in prose, without a structured status."
+
+        text = manager_module._progress_bubble_text(
+            record,
+            PluginConfig(notify_progress_cost=False),
+            completed=True,
+        )
+
+        self.assertTrue(text.startswith("✅ Final review task 7 completed"), text)
+        self.assertIn("FAIL appears in prose", text)
+        self.assertNotIn("⚠️", text)
+
+    def test_structured_passed_result_row_keeps_completed_card_green(self):
+        record = self._blocked_review_record()
+        record["result"] = {
+            "results": [{"status": "passed", "summary": "All checks passed."}]
+        }
+
+        text = manager_module._progress_bubble_text(
+            record,
+            PluginConfig(notify_progress_cost=False),
+            completed=True,
+        )
+
+        self.assertTrue(text.startswith("✅ Final review task 7 completed"), text)
+        self.assertIn("1. ✅ All checks passed.", text)
+        self.assertNotIn("⚠️", text)
 
     def test_oversized_result_set_keeps_one_card_and_reports_overflow(self):
         record = self._blocked_review_record()
@@ -3063,7 +3114,7 @@ class CompletionCardRenderTests(unittest.TestCase):
             completed=True,
         )
 
-        self.assertIn("1. Security scan failed.", text)
+        self.assertIn("1. ❌ Security scan failed.", text)
         self.assertIn("Secret exposed.", text)
         self.assertIn("Unsafe redirect.", text)
         self.assertIn("Required action", text)
