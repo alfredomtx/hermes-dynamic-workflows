@@ -17,6 +17,7 @@ class _CompletionCard:
     findings: tuple[str, ...] = ()
     next_action: str = ""
     fallback: str = ""
+    result_rows: tuple[_ResultRow, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -96,11 +97,19 @@ def _cautious_outcome(status: str | None) -> str:
     return "warning"
 
 
+def _utf16_units(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
 def _fit_utf16(text: str, max_units: int = 4096) -> str:
-    if len(text.encode("utf-16-le")) // 2 <= max_units:
+    if max_units <= 0:
+        return ""
+    if _utf16_units(text) <= max_units:
         return text
+    if max_units == 1:
+        return "…"
     suffix = "\n…"
-    budget = max_units - (len(suffix.encode("utf-16-le")) // 2)
+    budget = max_units - _utf16_units(suffix)
     used = 0
     chars: list[str] = []
     for char in text:
@@ -110,6 +119,26 @@ def _fit_utf16(text: str, max_units: int = 4096) -> str:
         chars.append(char)
         used += units
     return "".join(chars).rstrip() + suffix
+
+
+def _truncate_utf16_text(text: str, max_units: int) -> str:
+    text = _sanitize_text(text)
+    if max_units <= 0:
+        return ""
+    if _utf16_units(text) <= max_units:
+        return text
+    if max_units == 1:
+        return "…"
+    budget = max_units - 1
+    used = 0
+    chars: list[str] = []
+    for char in text:
+        units = 2 if ord(char) > 0xFFFF else 1
+        if used + units > budget:
+            break
+        chars.append(char)
+        used += units
+    return "".join(chars).rstrip() + "…"
 
 
 def _workflow_card_name(record: dict[str, Any]) -> str:
@@ -224,6 +253,65 @@ def _result_rows(result: Any) -> tuple[_ResultRow, ...]:
             continue
         rows.append(_ResultRow(fallback_label, None, _bounded_card_text(value, 120)))
     return tuple(rows)
+
+
+def _result_detail_lines(row: _ResultRow) -> tuple[str, ...]:
+    lines: list[str] = []
+    if row.summary:
+        lines.extend(f"  {line}" for line in row.summary.splitlines() if line.strip())
+    if row.findings:
+        lines.append("  Findings")
+        lines.extend(f"  • {finding}" for finding in row.findings)
+    if row.next_action:
+        lines.extend(["  Required action", f"  {row.next_action}"])
+    return tuple(lines)
+
+
+def _render_result_rows(rows: tuple[_ResultRow, ...], *, max_units: int) -> str:
+    total = len(rows)
+    missing = sum(row.missing for row in rows)
+    result_count = total - missing
+    aggregate = f"{total} subtasks · {result_count} results · {missing} missing"
+    heading_lines = [
+        f"{index}. {_sanitize_text(row.heading)}"
+        for index, row in enumerate(rows, start=1)
+    ]
+
+    def structural_lines(visible_count: int) -> list[str]:
+        lines = [aggregate, *heading_lines[:visible_count]]
+        hidden = total - visible_count
+        if hidden:
+            lines.append(f"… {hidden} more results in stored report")
+        return lines
+
+    if _utf16_units("\n".join(structural_lines(total))) <= max_units:
+        visible_count = total
+    else:
+        visible_count = 0
+        for candidate in range(total - 1, -1, -1):
+            if _utf16_units("\n".join(structural_lines(candidate))) <= max_units:
+                visible_count = candidate
+                break
+
+    structural = structural_lines(visible_count)
+    remaining = max(0, max_units - _utf16_units("\n".join(structural)))
+    rendered = [aggregate]
+    for index, row in enumerate(rows[:visible_count]):
+        rendered.append(heading_lines[index])
+        for detail in _result_detail_lines(row):
+            if remaining <= 1:
+                break
+            detail = _truncate_utf16_text(detail, remaining - 1)
+            if not detail:
+                continue
+            detail_units = _utf16_units(detail)
+            if detail_units + 1 > remaining:
+                continue
+            rendered.append(detail)
+            remaining -= detail_units + 1
+    if total > visible_count:
+        rendered.append(f"… {total - visible_count} more results in stored report")
+    return _fit_utf16("\n".join(rendered), max_units)
 
 
 def _classify_findings(values: list[Any]) -> tuple[int, tuple[str, ...], tuple[str, ...]]:
@@ -349,6 +437,12 @@ def _build_completion_card(record: dict[str, Any], preview_chars: int) -> _Compl
             title=_completion_title(transport, is_review=False, workflow_name=workflow_name),
             summary=_bounded_result_text(result, min(max(preview_chars, 240), 1200)),
         )
+    if isinstance(result, list):
+        return _CompletionCard(
+            status=transport,
+            title=_completion_title(transport, is_review=False, workflow_name=workflow_name),
+            result_rows=_result_rows(result),
+        )
     if not isinstance(result, dict):
         return _raw_completion_card(record, workflow_name, transport, preview_chars)
 
@@ -434,6 +528,13 @@ def _build_completion_card(record: dict[str, Any], preview_chars: int) -> _Compl
             findings=findings,
         )
 
+    if isinstance(result.get("results"), list):
+        return _CompletionCard(
+            status=status or transport,
+            title=_completion_title(status or transport, is_review=False, workflow_name=workflow_name),
+            result_rows=_result_rows(result),
+        )
+
     top_findings = result.get("findings")
     if top_findings is None:
         top_findings = []
@@ -489,14 +590,29 @@ def render_completion_card(
     if card.fallback:
         lines.extend(["", card.fallback])
     metrics = render_run_metrics(record, show_cost=show_cost)
-    if metrics:
-        lines.extend(["", metrics])
-    base = _sanitize_text("\n".join(lines).rstrip())
+    if card.result_rows is not None:
+        prefix = _sanitize_text("\n".join(lines).rstrip())
+        suffix = _sanitize_text(metrics)
+        fixed_units = _utf16_units(prefix) + 2 + _utf16_units(suffix)
+        if suffix:
+            fixed_units += 2
+        result_budget = max(0, 4096 - fixed_units)
+        result_text = _render_result_rows(card.result_rows, max_units=result_budget)
+        base = prefix
+        if result_text:
+            base = f"{base}\n\n{result_text}"
+        if suffix:
+            base = f"{base}\n\n{suffix}"
+        base = _sanitize_text(base.rstrip())
+    else:
+        if metrics:
+            lines.extend(["", metrics])
+        base = _sanitize_text("\n".join(lines).rstrip())
     if show_cost:
-        remaining = 4096 - (len(base.encode("utf-16-le")) // 2) - 2
+        remaining = 4096 - _utf16_units(base) - 2
         breakdown = render_cost_breakdown(record, char_budget=max(0, remaining))
         if breakdown:
             candidate = _sanitize_text(f"{base}\n\n{breakdown}")
-            if len(candidate.encode("utf-16-le")) // 2 <= 4096:
+            if _utf16_units(candidate) <= 4096:
                 return candidate
     return _fit_utf16(base)

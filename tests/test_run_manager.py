@@ -2964,6 +2964,117 @@ class CompletionCardRenderTests(unittest.TestCase):
         self.assertEqual(rows[0].next_action, "Publish the report.")
         self.assertEqual(rows[1].heading, "second result")
 
+    def test_nested_results_render_human_rows_without_raw_json(self):
+        record = self._blocked_review_record()
+        record["result"] = {
+            "results": [
+                "PASS — clean\nVerified.",
+                None,
+                {"status": "failed", "summary": "Three blockers."},
+            ]
+        }
+
+        text = manager_module._progress_bubble_text(
+            record,
+            PluginConfig(notify_progress_cost=False),
+            completed=True,
+        )
+
+        self.assertIn("3 subtasks · 2 results · 1 missing", text)
+        self.assertIn("1. PASS — clean", text)
+        self.assertIn("2. No result returned", text)
+        self.assertIn("3. Three blockers.", text)
+        self.assertNotIn('"results"', text)
+        self.assertNotIn("null", text)
+        self.assertEqual(text.count("11m 31s · 2 agents · 5.04M tokens"), 1)
+
+    def test_oversized_result_set_keeps_one_card_and_reports_overflow(self):
+        record = self._blocked_review_record()
+        record["result"] = {
+            "results": [f"Result {index} " + ("x" * 180) for index in range(100)]
+        }
+
+        text = manager_module._progress_bubble_text(
+            record,
+            PluginConfig(notify_progress_cost=False),
+            completed=True,
+        )
+
+        self.assertLessEqual(len(text.encode("utf-16-le")) // 2, 4096)
+        self.assertRegex(text, r"… \d+ more results in stored report")
+        self.assertIn("1. Result 0", text)
+
+    def test_five_result_headings_stay_in_original_order(self):
+        record = self._blocked_review_record()
+        headings = ["Alpha", "Bravo", "Charlie", "Delta", "Echo"]
+        record["result"] = {"results": [f"{heading}\nDetail" for heading in headings]}
+
+        text = manager_module._progress_bubble_text(
+            record,
+            PluginConfig(notify_progress_cost=False),
+            completed=True,
+        )
+
+        positions = [text.index(f"{index}. {heading}") for index, heading in enumerate(headings, 1)]
+        self.assertEqual(positions, sorted(positions))
+        for index, heading in enumerate(headings, 1):
+            self.assertIn(f"{index}. {heading}", text)
+
+    def test_result_details_yield_to_later_headings(self):
+        record = self._blocked_review_record()
+        record["result"] = {
+            "results": [
+                {
+                    "title": f"Heading {index}",
+                    "summary": f"Summary {index} " + ("detail " * 160),
+                    "findings": [f"Finding {index} " + ("finding " * 80)],
+                    "nextAction": f"Action {index} " + ("action " * 100),
+                }
+                for index in range(1, 6)
+            ]
+        }
+
+        text = manager_module._progress_bubble_text(
+            record,
+            PluginConfig(notify_progress_cost=False),
+            completed=True,
+        )
+
+        for index in range(1, 6):
+            self.assertIn(f"{index}. Heading {index}", text)
+        self.assertLessEqual(len(text.encode("utf-16-le")) // 2, 4096)
+
+    def test_nested_result_findings_and_required_action_are_readable(self):
+        record = self._blocked_review_record()
+        record["result"] = {
+            "results": [
+                {
+                    "status": "failed",
+                    "summary": "Security scan failed.",
+                    "findings": ["Secret exposed.", "Unsafe redirect."],
+                    "nextAction": "Rotate credential.",
+                }
+            ]
+        }
+
+        text = manager_module._progress_bubble_text(
+            record,
+            PluginConfig(notify_progress_cost=False),
+            completed=True,
+        )
+
+        self.assertIn("1. Security scan failed.", text)
+        self.assertIn("Secret exposed.", text)
+        self.assertIn("Unsafe redirect.", text)
+        self.assertIn("Required action", text)
+        self.assertIn("Rotate credential.", text)
+        self.assertNotIn('"findings"', text)
+
+    def test_utf16_units_counts_non_bmp_characters_as_two_units(self):
+        from hermes_dynamic_workflows.view.completion import _utf16_units
+
+        self.assertEqual(_utf16_units("a😀b"), 4)
+
 
 class StoppedWorkflowRenderTests(unittest.TestCase):
     def _stopped_record(self) -> dict:
