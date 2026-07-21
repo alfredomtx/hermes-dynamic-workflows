@@ -113,6 +113,15 @@ Review code carefully.
         ):
             self.assertIn(text, description)
 
+    def test_dynamic_schema_warns_verification_cannot_upgrade_blocked_execution(self):
+        description = get_dynamic_workflow_schema()["description"]
+
+        self.assertIn(
+            "A verification PASS can validate safe containment, but it cannot upgrade a blocked, stopped, or failed execution to `completed`; "
+            "`presentation.status` must reflect whether the requested outcome happened, not whether verification returned a report.",
+            description,
+        )
+
     def test_denied_launch_returns_clean_tool_error_without_trace(self):
         # A denied top-level launch is expected control flow, not an internal
         # bug — it must return a clean tool_error (no Python traceback leaked).

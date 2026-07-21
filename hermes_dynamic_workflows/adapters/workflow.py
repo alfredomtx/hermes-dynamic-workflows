@@ -223,7 +223,7 @@ _DESCRIPTION = (
     '\n'
     'Use this tool for multi-step orchestration where control flow should be deterministic (loops, conditionals, fan-out) rather than model-driven.\n'
     '\n'
-    'For an outcome-first gateway completion card, return a `result.presentation` envelope as `{"presentation":{"status":"blocked","title":"Review blocked","summary":"...","findings":[...],"nextAction":"..."},"report":...}`. Use `status` for the domain verdict, not transport completion. Keep the full machine-readable result under `report`; the primary chat card shows the concise presentation.\n'
+    'For an outcome-first gateway completion card, return a `result.presentation` envelope as `{"presentation":{"status":"blocked","title":"Review blocked","summary":"...","findings":[...],"nextAction":"..."},"report":...}`. Use `status` for the domain verdict, not transport completion. A verification PASS can validate safe containment, but it cannot upgrade a blocked, stopped, or failed execution to `completed`; `presentation.status` must reflect whether the requested outcome happened, not whether verification returned a report. Keep the full machine-readable result under `report`; the primary chat card shows the concise presentation.\n'
     '\n'
     '## Resume\n'
     '\n'
