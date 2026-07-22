@@ -26,7 +26,9 @@ def register(ctx) -> None:
         handler=_workflow_handler,
         description=(
             "Run deterministic Python workflow scripts that orchestrate "
-            "multiple Hermes child agents with agent(), parallel(), and pipeline()."
+            "multiple Hermes child agents with agent(), parallel(), and pipeline(). "
+            "Broad multi-phase scripts may receive conservative advisory warnings "
+            "for low literal child budgets; warnings never block launch."
         ),
     )
 

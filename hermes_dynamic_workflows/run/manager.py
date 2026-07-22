@@ -23,6 +23,7 @@ from ..core.errors import (
     WorkflowToolUseError,
 )
 from ..engine.sandbox import extract_meta, parse_script
+from ..core.budget_warning import find_budget_warnings
 from ..core.token_budget import parse_token_budget
 from ..storage.store import (
     WorkflowStore,
@@ -170,6 +171,7 @@ class WorkflowRunManager:
         cwd_value = cwd or os.environ.get("TERMINAL_CWD") or os.getcwd()
         source = resolve_workflow_source(params, store=self.store, cwd=cwd)
         meta = extract_meta(parse_script(source.script, config))
+        budget_warnings = list(find_budget_warnings(source.script))
         resume_from = str(params.get("resumeFromRunId") or "").strip() or None
         active_resume = self._active_resume_run(resume_from) if resume_from else None
         if active_resume:
@@ -244,6 +246,7 @@ class WorkflowRunManager:
             "transcriptDir": str(transcript_dir),
             "journalFile": str(journal_path),
             "summary": meta.get("description") or meta.get("name") or "workflow",
+            "budgetWarnings": budget_warnings,
             "source": {
                 "type": source.source_type,
                 "ref": source.source_ref,

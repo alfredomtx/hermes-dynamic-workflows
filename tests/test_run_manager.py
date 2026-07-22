@@ -603,6 +603,32 @@ return "ok"
         self.assertEqual(final["status"], "completed")
         self.assertEqual(final["result"], "ok")
 
+    def test_low_child_budget_warning_is_persisted_without_blocking_launch(self):
+        script = """
+meta = {"name": "budget-warning", "description": "Budget warning", "phases": ["Inspect", "Synthesize"]}
+
+phase("Inspect")
+return await agent("inspect", {"label": "hunter", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 20, "maxToolCalls": 16, "maxToolOutputChars": 200000})
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = WorkflowStore(root / "store")
+            manager = WorkflowRunManager(
+                store=store,
+                config=PluginConfig(require_launch_approval=False),
+            )
+            with patch("hermes_dynamic_workflows.child.runner.HermesChildAgentRunner", return_value=CountingRunner()):
+                record = manager.start_from_params({"script": script}, cwd=str(root))
+                final = manager.wait(record["runId"], timeout=2)
+            persisted = store.load_run(record["runId"])
+
+        if final is None or persisted is None:
+            self.fail("workflow did not finish or persist")
+        self.assertEqual(len(record["budgetWarnings"]), 1)
+        self.assertIn("maxTurns=20", record["budgetWarnings"][0])
+        self.assertEqual(final["status"], "completed")
+        self.assertEqual(persisted["budgetWarnings"], record["budgetWarnings"])
+
     def test_manager_routes_internal_single_agent_skip(self):
         script = """
 meta = {"name": "skip-one", "description": "Test workflow"}

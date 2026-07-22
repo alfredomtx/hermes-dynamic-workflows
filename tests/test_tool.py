@@ -15,9 +15,11 @@ from hermes_dynamic_workflows.core.types import ChildAgentRequest, ChildAgentRun
 from hermes_dynamic_workflows.adapters.task_stop import task_stop
 from hermes_dynamic_workflows.adapters.workflow import (
     DYNAMIC_WORKFLOW_SCHEMA,
+    _launch_message,
     get_dynamic_workflow_schema,
     workflow,
 )
+from hermes_dynamic_workflows import entry as entry_module
 from hermes_dynamic_workflows.storage.store import WorkflowStore
 
 
@@ -101,6 +103,62 @@ Review code carefully.
             "Provider retries",
         ):
             self.assertIn(text, description)
+
+    def test_dynamic_schema_documents_conservative_child_budget_advisory(self):
+        description = get_dynamic_workflow_schema()["description"]
+
+        for text in (
+            "hard ceilings",
+            "reserve a final",
+            "inspect + execute + diagnose + report",
+            "25–40 turns",
+            "50–100 tool calls",
+            "16–30 turns",
+            "20–50 tool calls",
+            "split phases through pipeline",
+            "launch continues",
+            "increase only the limiting dimension",
+        ):
+            self.assertIn(text, description)
+
+    def test_launch_message_appends_budget_warnings(self):
+        launch = _launch_message(
+            {
+                "runId": "wf_12345678-abc",
+                "taskId": "wg1234567",
+                "summary": "Budget check",
+                "transcriptDir": "/tmp/transcript",
+                "scriptPath": "/tmp/workflow.py",
+                "budgetWarnings": ["Advisory child budget warning: maxTurns=20"],
+            }
+        )
+
+        self.assertIn("Advisory child-budget warnings:", launch)
+        self.assertIn("maxTurns=20", launch)
+
+    def test_entry_registry_description_mentions_nonblocking_budget_warning(self):
+        class Context:
+            def __init__(self):
+                self.tools = []
+                self.hooks = []
+                self.commands = []
+
+            def register_tool(self, **kwargs):
+                self.tools.append(kwargs)
+
+            def register_hook(self, *args):
+                self.hooks.append(args)
+
+            def register_command(self, **kwargs):
+                self.commands.append(kwargs)
+
+        context = Context()
+        with patch.object(entry_module, "get_dynamic_workflow_schema", return_value={"parameters": {}}):
+            entry_module.register(context)
+
+        workflow_registration = next(tool for tool in context.tools if tool["name"] == "workflow")
+        self.assertIn("low literal child budgets", workflow_registration["description"])
+        self.assertIn("warnings never block launch", workflow_registration["description"])
 
     def test_dynamic_schema_documents_completion_presentation_contract(self):
         description = get_dynamic_workflow_schema()["description"]
