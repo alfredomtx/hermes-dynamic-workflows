@@ -52,15 +52,28 @@ def _sanitize_text(text: str) -> str:
     return re.sub(r"`{3,}", lambda match: "\u200b".join(match.group()), text)
 
 
+_MARKDOWN_CONTENT_RE = re.compile(r"([\\`*_\[\]~|])")
+
+
+def _escape_markdown_content(text: str) -> str:
+    sanitized = "".join("�" if 0xD800 <= ord(char) <= 0xDFFF else char for char in str(text))
+    return _MARKDOWN_CONTENT_RE.sub(r"\\\1", sanitized)
+
+
+def _inline_code_content(text: str) -> str:
+    sanitized = "".join("�" if 0xD800 <= ord(char) <= 0xDFFF else char for char in str(text))
+    return sanitized.replace("\\", "\\\\").replace("`", "\\`")
+
+
 def _bounded_card_text(value: Any, max_chars: int) -> str:
-    text = _sanitize_text(" ".join(str(value or "").split()))
+    text = " ".join(str(value or "").split())
     if len(text) <= max_chars:
         return text
     return text[: max(0, max_chars - 1)].rstrip() + "…"
 
 
 def _bounded_result_text(value: Any, max_chars: int) -> str:
-    text = _sanitize_text(str(value or "").strip())
+    text = str(value or "").strip()
     if len(text) <= max_chars:
         return text
     remaining = len(text) - max_chars
@@ -122,7 +135,6 @@ def _fit_utf16(text: str, max_units: int = 4096) -> str:
 
 
 def _truncate_utf16_text(text: str, max_units: int) -> str:
-    text = _sanitize_text(text)
     if max_units <= 0:
         return ""
     if _utf16_units(text) <= max_units:
@@ -255,18 +267,6 @@ def _result_rows(result: Any) -> tuple[_ResultRow, ...]:
     return tuple(rows)
 
 
-def _result_detail_lines(row: _ResultRow) -> tuple[str, ...]:
-    lines: list[str] = []
-    if row.summary:
-        lines.extend(f"  {line}" for line in row.summary.splitlines() if line.strip())
-    if row.findings:
-        lines.append("  Findings")
-        lines.extend(f"  • {finding}" for finding in row.findings)
-    if row.next_action:
-        lines.extend(["  Required action", f"  {row.next_action}"])
-    return tuple(lines)
-
-
 def _result_row_marker(row: _ResultRow) -> str:
     if row.missing or row.status == "warning":
         return "⚠️"
@@ -274,7 +274,75 @@ def _result_row_marker(row: _ResultRow) -> str:
         return "❌"
     if row.status in {"passed", "completed"}:
         return "✅"
-    return ""
+    if row.status == "stopped":
+        return "⏹"
+    heading = str(row.heading).lstrip()
+    if re.match(r"^(?:PASS|OK)\s*(?:—|:)\s*", heading, re.IGNORECASE):
+        return "✅"
+    if re.match(r"^(?:WARN|WARNING)\s*(?:—|:)\s*", heading, re.IGNORECASE):
+        return "⚠️"
+    if re.match(r"^(?:FAIL|BLOCK|BLOCKED)\s*(?:—|:)\s*", heading, re.IGNORECASE):
+        return "❌"
+    return "•"
+
+
+def _result_index(rows: tuple[_ResultRow, ...], *, max_units: int) -> tuple[str, int]:
+    if max_units <= 0 or not rows:
+        return "", 0
+    width = max(2, len(str(max(1, len(rows)))))
+    index_lines = [
+        f"{str(index).zfill(width)}  {_result_row_marker(row)}  "
+        f"{_escape_markdown_content(row.heading)}"
+        for index, row in enumerate(rows, start=1)
+    ]
+
+    def candidate(visible_count: int) -> str:
+        fence = "```\n" + "\n".join(index_lines[:visible_count]) + "\n```"
+        hidden = len(rows) - visible_count
+        if hidden:
+            return f"{fence}\n\n*… {hidden} more results in stored report*"
+        return fence
+
+    for visible_count in range(len(rows), -1, -1):
+        rendered = candidate(visible_count)
+        if _utf16_units(rendered) <= max_units:
+            return rendered, visible_count
+    return "", 0
+
+
+def _join_result_blocks(blocks: list[list[str]]) -> str:
+    return "\n\n".join("\n".join(block) for block in blocks if block)
+
+
+def _result_heading_line(ordinal: int, row: _ResultRow) -> str:
+    return (
+        f"**{_result_row_marker(row)} {ordinal} · "
+        f"{_escape_markdown_content(row.heading)}**"
+    )
+
+
+def _result_summary_line(row: _ResultRow) -> str | None:
+    if row.missing or not row.summary:
+        return None
+    return f"*{_escape_markdown_content(row.summary)}*"
+
+
+def _result_action_line(action: str) -> str:
+    if "\n" not in action and "`" not in action:
+        return f"`{_inline_code_content(action)}`"
+    return _escape_markdown_content(action)
+
+
+def _result_extra_sections(row: _ResultRow) -> list[list[str]]:
+    sections: list[list[str]] = []
+    if row.findings:
+        sections.append([
+            "**Findings**",
+            *(f"• {_escape_markdown_content(finding)}" for finding in row.findings),
+        ])
+    if row.next_action:
+        sections.append(["**Required action**", _result_action_line(row.next_action)])
+    return sections
 
 
 def _result_rows_need_attention(rows: tuple[_ResultRow, ...]) -> bool:
@@ -304,47 +372,64 @@ def _render_result_rows(rows: tuple[_ResultRow, ...], *, max_units: int) -> str:
     missing = sum(row.missing for row in rows)
     result_count = total - missing
     aggregate = f"{total} subtasks · {result_count} results · {missing} missing"
-    heading_lines = []
-    for index, row in enumerate(rows, start=1):
-        marker = _result_row_marker(row)
-        prefix = f"{index}. {marker} " if marker else f"{index}. "
-        heading_lines.append(f"{prefix}{_sanitize_text(row.heading)}")
+    aggregate_block = [f"*{_escape_markdown_content(aggregate)}*"]
+    blocks: list[list[str]] = [aggregate_block]
+    used_without_details = _utf16_units(_join_result_blocks(blocks))
 
-    def structural_lines(visible_count: int) -> list[str]:
-        lines = [aggregate, *heading_lines[:visible_count]]
-        hidden = total - visible_count
-        if hidden:
-            lines.append(f"… {hidden} more results in stored report")
-        return lines
+    index_budget = max(0, max_units - used_without_details - 2)
+    index_text, visible_count = _result_index(rows, max_units=index_budget)
+    if index_text:
+        blocks.append([index_text])
 
-    if _utf16_units("\n".join(structural_lines(total))) <= max_units:
-        visible_count = total
-    else:
-        visible_count = 0
-        for candidate in range(total - 1, -1, -1):
-            if _utf16_units("\n".join(structural_lines(candidate))) <= max_units:
-                visible_count = candidate
-                break
+    visible_rows = list(enumerate(rows[:visible_count], start=1))
+    exceptions = [
+        item for item in visible_rows
+        if item[1].missing or item[1].status in {"blocked", "failed", "warning"}
+    ]
+    ordinary = [item for item in visible_rows if item not in exceptions]
+    ordered_rows = exceptions + ordinary
 
-    structural = structural_lines(visible_count)
-    remaining = max(0, max_units - _utf16_units("\n".join(structural)))
-    rendered = [aggregate]
-    for index, row in enumerate(rows[:visible_count]):
-        rendered.append(heading_lines[index])
-        for detail in _result_detail_lines(row):
-            if remaining <= 1:
-                break
-            detail = _truncate_utf16_text(detail, remaining - 1)
-            if not detail:
-                continue
-            detail_units = _utf16_units(detail)
-            if detail_units + 1 > remaining:
-                continue
-            rendered.append(detail)
-            remaining -= detail_units + 1
-    if total > visible_count:
-        rendered.append(f"… {total - visible_count} more results in stored report")
-    return _fit_utf16("\n".join(rendered), max_units)
+    mandatory: dict[int, list[str]] = {}
+    for ordinal, row in ordered_rows:
+        row_block = [_result_heading_line(ordinal, row)]
+        summary = _result_summary_line(row)
+        if summary:
+            row_block.append(summary)
+        candidate = blocks + [*mandatory.values(), row_block]
+        if _utf16_units(_join_result_blocks(candidate)) <= max_units:
+            mandatory[ordinal] = row_block
+
+    extras: dict[int, list[str]] = {ordinal: [] for ordinal in mandatory}
+
+    def rendered_detail_blocks() -> list[list[str]]:
+        return [
+            [*mandatory[ordinal], *extras[ordinal]]
+            for ordinal, _row in ordered_rows
+            if ordinal in mandatory
+        ]
+
+    for ordinal, row in ordered_rows:
+        if ordinal not in mandatory:
+            continue
+        for section in _result_extra_sections(row):
+            section_lines: list[str] = []
+            for line in section:
+                trial_extras = {key: list(value) for key, value in extras.items()}
+                trial_extras[ordinal].extend(section_lines)
+                trial_extras[ordinal].append(line)
+                trial_blocks = [
+                    [*mandatory[key], *trial_extras[key]]
+                    for key, _row in ordered_rows
+                    if key in mandatory
+                ]
+                if _utf16_units(_join_result_blocks(blocks + trial_blocks)) > max_units:
+                    break
+                section_lines.append(line)
+            if len(section_lines) > 1:
+                extras[ordinal].extend(section_lines)
+
+    result = _join_result_blocks(blocks + rendered_detail_blocks())
+    return _fit_utf16(result, max_units)
 
 
 def _classify_findings(values: list[Any]) -> tuple[int, tuple[str, ...], tuple[str, ...]]:
@@ -509,7 +594,7 @@ def _build_completion_card(record: dict[str, Any], preview_chars: int) -> _Compl
         if final_status == "blocked" and blocker_count:
             details_title, findings = "Blocking findings", blockers
         elif findings_value:
-            details_title, findings = "Details", details
+            details_title, findings = "Findings", details
         else:
             details_title, findings = "", ()
         title = _bounded_card_text(explicit.get("title"), 96) or _completion_title(
@@ -616,40 +701,48 @@ def render_completion_card(
     show_cost: bool,
 ) -> str:
     card = _build_completion_card(record, preview_chars)
-    lines = [f"{_completion_icon(card.status)} {card.title}"]
+    lines = [
+        f"**{_completion_icon(card.status)} "
+        f"{_escape_markdown_content(card.title)}**"
+    ]
     if card.summary:
-        lines.extend(["", card.summary])
+        lines.extend(["", f"*{_escape_markdown_content(card.summary)}*"])
     if card.findings:
-        lines.extend(["", card.details_title or "Findings"])
-        lines.extend(f"• {finding}" for finding in card.findings)
+        lines.extend(["", f"**{_escape_markdown_content(card.details_title or 'Findings')}**"])
+        lines.extend(f"• {_escape_markdown_content(finding)}" for finding in card.findings)
     if card.next_action:
-        lines.extend(["", "Required action", card.next_action])
+        lines.extend([
+            "",
+            "**Required action**",
+            _result_action_line(card.next_action),
+        ])
     if card.fallback:
         lines.extend(["", card.fallback])
     metrics = render_run_metrics(record, show_cost=show_cost)
+    metrics_text = f"*{_escape_markdown_content(metrics)}*" if metrics else ""
     if card.result_rows is not None:
-        prefix = _sanitize_text("\n".join(lines).rstrip())
-        suffix = _sanitize_text(metrics)
-        fixed_units = _utf16_units(prefix) + 2 + _utf16_units(suffix)
-        if suffix:
-            fixed_units += 2
+        prefix = "\n".join(lines).rstrip()
+        fixed_units = _utf16_units(prefix) + 2
+        if metrics_text:
+            fixed_units += 2 + _utf16_units(metrics_text)
         result_budget = max(0, 4096 - fixed_units)
         result_text = _render_result_rows(card.result_rows, max_units=result_budget)
         base = prefix
         if result_text:
             base = f"{base}\n\n{result_text}"
-        if suffix:
-            base = f"{base}\n\n{suffix}"
-        base = _sanitize_text(base.rstrip())
+        if metrics_text:
+            base = f"{base}\n\n{metrics_text}"
+        base = base.rstrip()
     else:
-        if metrics:
-            lines.extend(["", metrics])
-        base = _sanitize_text("\n".join(lines).rstrip())
+        if metrics_text:
+            lines.extend(["", metrics_text])
+        base = "\n".join(lines).rstrip()
     if show_cost:
-        remaining = 4096 - _utf16_units(base) - 2
-        breakdown = render_cost_breakdown(record, char_budget=max(0, remaining))
+        remaining = max(0, 4096 - _utf16_units(base) - 2)
+        breakdown = render_cost_breakdown(record, char_budget=remaining)
         if breakdown:
-            candidate = _sanitize_text(f"{base}\n\n{breakdown}")
+            escaped_breakdown = _escape_markdown_content(breakdown)
+            candidate = f"{base}\n\n{escaped_breakdown}"
             if _utf16_units(candidate) <= 4096:
                 return candidate
     return _fit_utf16(base)

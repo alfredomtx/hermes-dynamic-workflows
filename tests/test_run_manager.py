@@ -2512,7 +2512,7 @@ class CompletionCardRenderTests(unittest.TestCase):
             completed=True,
         )
 
-        self.assertTrue(text.startswith("⛔ Review blocked"), text)
+        self.assertTrue(text.startswith("**⛔ Review blocked**"), text)
         self.assertIn("2 blocking findings", text)
         self.assertIn("live storage still contains synthetic test artifacts", text)
         self.assertIn("Durable reporting can be silently omitted", text)
@@ -2545,7 +2545,7 @@ class CompletionCardRenderTests(unittest.TestCase):
             completed=True,
         )
 
-        self.assertTrue(text.startswith("⛔ Final review blocked"), text)
+        self.assertTrue(text.startswith("**⛔ Final review blocked**"), text)
         self.assertIn("No implementation defects were found.", text)
         self.assertIn("Synthetic test records remain in live storage.", text)
         self.assertIn("Required action", text)
@@ -2563,8 +2563,8 @@ class CompletionCardRenderTests(unittest.TestCase):
             completed=True,
         )
 
-        self.assertTrue(text.startswith("✅ Telegram live smoke completed"), text)
-        self.assertIn("LIVE_SMOKE_OK", text)
+        self.assertTrue(text.startswith("**✅ Telegram live smoke completed**"), text)
+        self.assertIn(r"LIVE\_SMOKE\_OK", text)
         self.assertNotIn("Result:", text)
 
     def test_failed_transport_with_string_result_stays_failed(self):
@@ -2578,7 +2578,7 @@ class CompletionCardRenderTests(unittest.TestCase):
             completed=True,
         )
 
-        self.assertTrue(text.startswith("❌ Final review task 7 failed"), text)
+        self.assertTrue(text.startswith("**❌ Final review task 7 failed**"), text)
         self.assertIn("partial diagnostic output", text)
 
     def test_unknown_domain_status_uses_raw_fallback(self):
@@ -2591,7 +2591,7 @@ class CompletionCardRenderTests(unittest.TestCase):
             completed=True,
         )
 
-        self.assertTrue(text.startswith("⚠️ Final review task 7 needs attention"), text)
+        self.assertTrue(text.startswith("**⚠️ Final review task 7 needs attention**"), text)
         self.assertIn("PENDING_APPROVAL", text)
         self.assertIn("Result:", text)
 
@@ -2693,7 +2693,7 @@ class CompletionCardRenderTests(unittest.TestCase):
                     PluginConfig(notify_progress_cost=False),
                     completed=True,
                 )
-                self.assertTrue(text.startswith(prefix), text)
+                self.assertTrue(text.startswith(f"**{prefix}**"), text)
                 if visible:
                     self.assertIn(visible, text)
 
@@ -2775,7 +2775,7 @@ class CompletionCardRenderTests(unittest.TestCase):
             completed=True,
         )
 
-        self.assertTrue(text.startswith("⚠️ Final review task 7 needs attention"), text)
+        self.assertTrue(text.startswith("**⚠️ Final review task 7 needs attention**"), text)
         self.assertIn("Recovered partial output", text)
 
         record["status"] = "PENDING_APPROVAL"
@@ -2785,7 +2785,7 @@ class CompletionCardRenderTests(unittest.TestCase):
             PluginConfig(notify_progress_cost=False),
             completed=True,
         )
-        self.assertTrue(unknown.startswith("⚠️ Final review task 7 needs attention"), unknown)
+        self.assertTrue(unknown.startswith("**⚠️ Final review task 7 needs attention**"), unknown)
 
     def test_false_finding_lists_use_raw_fallback(self):
         cases = {
@@ -2843,7 +2843,7 @@ class CompletionCardRenderTests(unittest.TestCase):
             completed=True,
         )
 
-        self.assertTrue(text.startswith("❌ Final review task 7 failed"), text)
+        self.assertTrue(text.startswith("**❌ Final review task 7 failed**"), text)
         self.assertIn("Everything is fine", text)
 
     def test_completion_card_is_utf16_bounded_and_neutralizes_raw_fences(self):
@@ -2863,7 +2863,7 @@ class CompletionCardRenderTests(unittest.TestCase):
         ):
             text = manager_module._progress_bubble_text(record, PluginConfig(), completed=True)
         self.assertLessEqual(len(text.encode("utf-16-le")) // 2, 4096)
-        self.assertTrue(text.startswith("⛔"), text)
+        self.assertTrue(text.startswith("**⛔"), text)
         self.assertNotIn("💰", text)
 
         record["result"] = "compact result"
@@ -3017,9 +3017,9 @@ class CompletionCardRenderTests(unittest.TestCase):
         )
 
         self.assertIn("3 subtasks · 2 results · 1 missing", text)
-        self.assertIn("1. PASS — clean", text)
-        self.assertIn("2. ⚠️ No result returned", text)
-        self.assertIn("3. ❌ Three blockers.", text)
+        self.assertIn("01  ✅  PASS — clean", text)
+        self.assertIn("02  ⚠️  No result returned", text)
+        self.assertIn("03  ❌  Three blockers.", text)
         self.assertNotIn('"results"', text)
         self.assertNotIn("null", text)
         self.assertEqual(text.count("11m 31s · 2 agents · 5.04M tokens"), 1)
@@ -3040,10 +3040,10 @@ class CompletionCardRenderTests(unittest.TestCase):
             completed=True,
         )
 
-        self.assertTrue(text.startswith("⚠️ Final review task 7 needs attention"), text)
-        self.assertIn("1. ✅ All checks passed.", text)
-        self.assertIn("2. ⚠️ No result returned", text)
-        self.assertIn("3. ❌ Three blockers.", text)
+        self.assertTrue(text.startswith("**⚠️ Final review task 7 needs attention**"), text)
+        self.assertIn("01  ✅  All checks passed.", text)
+        self.assertIn("02  ⚠️  No result returned", text)
+        self.assertIn("03  ❌  Three blockers.", text)
 
     def test_plain_string_fail_text_does_not_change_completed_transport_card(self):
         record = self._blocked_review_record()
@@ -3055,7 +3055,7 @@ class CompletionCardRenderTests(unittest.TestCase):
             completed=True,
         )
 
-        self.assertTrue(text.startswith("✅ Final review task 7 completed"), text)
+        self.assertTrue(text.startswith("**✅ Final review task 7 completed**"), text)
         self.assertIn("FAIL appears in prose", text)
         self.assertNotIn("⚠️", text)
 
@@ -3071,8 +3071,8 @@ class CompletionCardRenderTests(unittest.TestCase):
             completed=True,
         )
 
-        self.assertTrue(text.startswith("✅ Final review task 7 completed"), text)
-        self.assertIn("1. ✅ All checks passed.", text)
+        self.assertTrue(text.startswith("**✅ Final review task 7 completed**"), text)
+        self.assertIn("01  ✅  All checks passed.", text)
         self.assertNotIn("⚠️", text)
 
     def test_oversized_result_set_keeps_one_card_and_reports_overflow(self):
@@ -3089,7 +3089,7 @@ class CompletionCardRenderTests(unittest.TestCase):
 
         self.assertLessEqual(len(text.encode("utf-16-le")) // 2, 4096)
         self.assertRegex(text, r"… \d+ more results in stored report")
-        self.assertIn("1. Result 0", text)
+        self.assertIn("001  •  Result 0", text)
 
     def test_five_result_headings_stay_in_original_order(self):
         record = self._blocked_review_record()
@@ -3102,10 +3102,13 @@ class CompletionCardRenderTests(unittest.TestCase):
             completed=True,
         )
 
-        positions = [text.index(f"{index}. {heading}") for index, heading in enumerate(headings, 1)]
+        positions = [
+            text.index(f"{str(index).zfill(2)}  •  {heading}")
+            for index, heading in enumerate(headings, 1)
+        ]
         self.assertEqual(positions, sorted(positions))
         for index, heading in enumerate(headings, 1):
-            self.assertIn(f"{index}. {heading}", text)
+            self.assertIn(f"{str(index).zfill(2)}  •  {heading}", text)
 
     def test_result_details_yield_to_later_headings(self):
         record = self._blocked_review_record()
@@ -3128,7 +3131,7 @@ class CompletionCardRenderTests(unittest.TestCase):
         )
 
         for index in range(1, 6):
-            self.assertIn(f"{index}. Heading {index}", text)
+            self.assertIn(f"**• {index} · Heading {index}**", text)
         self.assertLessEqual(len(text.encode("utf-16-le")) // 2, 4096)
 
     def test_nested_result_findings_and_required_action_are_readable(self):
@@ -3150,7 +3153,7 @@ class CompletionCardRenderTests(unittest.TestCase):
             completed=True,
         )
 
-        self.assertIn("1. ❌ Security scan failed.", text)
+        self.assertIn("01  ❌  Security scan failed.", text)
         self.assertIn("Secret exposed.", text)
         self.assertIn("Unsafe redirect.", text)
         self.assertIn("Required action", text)
@@ -3161,6 +3164,243 @@ class CompletionCardRenderTests(unittest.TestCase):
         from hermes_dynamic_workflows.view.completion import _utf16_units
 
         self.assertEqual(_utf16_units("a😀b"), 4)
+
+    def test_mixed_results_render_hybrid_markdown_hierarchy(self):
+        record = self._blocked_review_record()
+        record["result"] = {
+            "results": [
+                "PASS — first task complete\nEvidence retained.",
+                None,
+                {
+                    "label": "Third task",
+                    "status": "failed",
+                    "summary": "One blocker remains.",
+                    "findings": ["Synthetic canary blocker."],
+                    "nextAction": "Confirm this card is readable.",
+                },
+            ]
+        }
+
+        text = manager_module._progress_bubble_text(
+            record, PluginConfig(notify_progress_cost=False), completed=True,
+        )
+
+        self.assertTrue(text.startswith("**⚠️ Final review task 7 needs attention**"), text)
+        self.assertIn("*3 subtasks · 2 results · 1 missing*", text)
+        self.assertIn("```\n01  ✅  PASS — first task complete", text)
+        self.assertIn("02  ⚠️  No result returned", text)
+        self.assertIn("03  ❌  One blocker remains.", text)
+        self.assertIn("**✅ 1 · PASS — first task complete**", text)
+        self.assertIn("*Evidence retained.*", text)
+        self.assertIn("**Findings**\n• Synthetic canary blocker.", text)
+        self.assertIn("**Required action**\n`Confirm this card is readable.`", text)
+        self.assertRegex(text, r"\*11m 31s · 2 agents · 5\.04M tokens\*$")
+        self.assertEqual(text.count("*Evidence retained.*"), 1)
+        self.assertEqual(text.count("```"), 2)
+
+    def test_plain_heading_verdict_is_row_marker_only(self):
+        record = self._blocked_review_record()
+        record["result"] = {
+            "results": [
+                "PASS — explicit row label",
+                "Example failure text: FAIL does not describe this run.",
+                "Quoted `BLOCK` is diagnostic text, not a verdict.",
+            ]
+        }
+
+        from hermes_dynamic_workflows.view.completion import _result_rows
+
+        rows = _result_rows(record["result"])
+        text = manager_module._progress_bubble_text(
+            record, PluginConfig(notify_progress_cost=False), completed=True,
+        )
+
+        self.assertIsNone(rows[0].status)
+        self.assertIn("01  ✅  PASS — explicit row label", text)
+        self.assertIn("02  •  Example failure text: FAIL", text)
+        self.assertIn("03  •  Quoted", text)
+
+    def test_index_ordinal_width_matches_largest_ordinal(self):
+        from hermes_dynamic_workflows.view.completion import _ResultRow, _result_index
+
+        for count, first_ordinal in ((9, "01"), (10, "01"), (99, "01"), (100, "001")):
+            width = max(2, len(str(count)))
+            rows = tuple(
+                _ResultRow(f"Task {index}", None, f"Task {index}")
+                for index in range(1, count + 1)
+            )
+            index_text, visible_count = _result_index(rows, max_units=4096)
+
+            self.assertEqual(visible_count, count)
+            self.assertIn(f"{first_ordinal}  •  Task 1", index_text)
+            self.assertIn(
+                f"{str(count).zfill(width)}  •  Task {count}",
+                index_text,
+            )
+
+    def test_model_markdown_cannot_break_card_structure(self):
+        record = self._blocked_review_record()
+        record["result"] = {
+            "results": [{
+                "status": "failed",
+                "title": "**fake title** ```",
+                "summary": "_fake summary_ [link](https://example.com) ~~fake strike~~ ||fake spoiler||",
+                "findings": ["`fake code` and **fake bold**"],
+                "nextAction": "run `unsafe` \\ now",
+            }]
+        }
+
+        text = manager_module._progress_bubble_text(
+            record, PluginConfig(notify_progress_cost=False), completed=True,
+        )
+
+        self.assertEqual(text.count("```"), 2)
+        self.assertIn(r"\*\*fake title\*\*", text)
+        self.assertIn(r"\_fake summary\_", text)
+        self.assertIn(r"\[link\]", text)
+        self.assertIn(r"\~\~fake strike\~\~", text)
+        self.assertIn(r"\|\|fake spoiler\|\|", text)
+        self.assertLessEqual(len(text.encode("utf-16-le")) // 2, 4096)
+
+    def test_valid_presentation_remains_authoritative_and_report_stays_hidden(self):
+        record = self._blocked_review_record()
+        record["result"] = {
+            "presentation": {
+                "status": "blocked",
+                "title": "Final review blocked",
+                "summary": "No implementation defects were found.",
+                "findings": ["Synthetic test records remain in live storage."],
+                "nextAction": "Remove stale artifacts, then rerun the review.",
+            },
+            "report": {"secret_internal_key": "must stay out of the card"},
+        }
+
+        text = manager_module._progress_bubble_text(
+            record, PluginConfig(notify_progress_cost=False), completed=True,
+        )
+
+        self.assertTrue(text.startswith("**⛔ Final review blocked**"), text)
+        self.assertIn("*No implementation defects were found.*", text)
+        self.assertIn("**Findings**", text)
+        self.assertIn("`Remove stale artifacts, then rerun the review.`", text)
+        self.assertNotIn("secret_internal_key", text)
+        self.assertEqual(text.count("5.04M tokens"), 1)
+
+    def test_malformed_presentation_uses_bounded_raw_fallback(self):
+        record = self._blocked_review_record()
+        record["result"] = {
+            "presentation": {"status": "blocked", "findings": False},
+            "report": {"opaque": "retained"},
+        }
+
+        text = manager_module._progress_bubble_text(
+            record, PluginConfig(notify_progress_cost=False), completed=True,
+        )
+
+        self.assertIn("Result:", text)
+        self.assertLessEqual(len(text.encode("utf-16-le")) // 2, 4096)
+
+    def test_each_visible_returned_summary_is_italic_once(self):
+        record = self._blocked_review_record()
+        record["result"] = {
+            "results": [
+                {
+                    "title": "First successful task",
+                    "status": "passed",
+                    "summary": "First summary.",
+                },
+                {
+                    "title": "Second successful task",
+                    "status": "completed",
+                    "summary": "Second summary.",
+                },
+            ]
+        }
+
+        text = manager_module._progress_bubble_text(
+            record, PluginConfig(notify_progress_cost=False), completed=True,
+        )
+
+        self.assertEqual(text.count("*First summary.*"), 1)
+        self.assertEqual(text.count("*Second summary.*"), 1)
+        self.assertLess(text.index("**✅ 1 · First successful task**"), text.index("**✅ 2 · Second successful task**"))
+
+    def test_exception_details_precede_success_details_without_reordering_index(self):
+        record = self._blocked_review_record()
+        record["result"] = {
+            "results": [
+                {
+                    "title": "Successful task",
+                    "status": "passed",
+                    "summary": "Success summary.",
+                    "findings": ["Success extra."],
+                    "nextAction": "Keep going.",
+                },
+                {
+                    "title": "Failed task",
+                    "status": "failed",
+                    "summary": "Failure summary.",
+                    "findings": ["Exception detail."],
+                    "nextAction": "Fix the failure.",
+                },
+            ]
+        }
+
+        text = manager_module._progress_bubble_text(
+            record, PluginConfig(notify_progress_cost=False), completed=True,
+        )
+
+        index = text.index("```")
+        self.assertLess(text.index("01  ✅  Successful task", index), text.index("02  ❌  Failed task", index))
+        self.assertLess(text.index("**❌ 2 · Failed task**"), text.index("**✅ 1 · Successful task**"))
+        self.assertLess(text.index("Exception detail."), text.index("Success extra."))
+
+    def test_missing_rows_have_no_invented_summary(self):
+        record = self._blocked_review_record()
+        record["result"] = {
+            "results": [None, {"title": "Returned task", "status": "passed", "summary": "Returned summary."}]
+        }
+
+        text = manager_module._progress_bubble_text(
+            record, PluginConfig(notify_progress_cost=False), completed=True,
+        )
+
+        self.assertIn("02  ✅  Returned task", text)
+        self.assertIn("*Returned summary.*", text)
+        self.assertNotIn("*No result returned*", text)
+
+    def test_italic_overflow_precedes_italic_metrics(self):
+        record = self._blocked_review_record()
+        record["result"] = {
+            "results": [f"Result {index} " + ("x" * 180) for index in range(100)]
+        }
+
+        text = manager_module._progress_bubble_text(
+            record, PluginConfig(notify_progress_cost=False), completed=True,
+        )
+
+        self.assertIn("*… ", text)
+        self.assertLess(text.index("*… "), text.rindex("*11m 31s"))
+        self.assertLessEqual(len(text.encode("utf-16-le")) // 2, 4096)
+
+    def test_unsafe_required_action_stays_outside_inline_code(self):
+        record = self._blocked_review_record()
+        record["result"] = {
+            "results": [{
+                "status": "failed",
+                "title": "Unsafe action",
+                "summary": "Needs a manual step.",
+                "nextAction": "run `unsafe` \\ now",
+            }]
+        }
+
+        text = manager_module._progress_bubble_text(
+            record, PluginConfig(notify_progress_cost=False), completed=True,
+        )
+
+        self.assertIn("**Required action**", text)
+        self.assertNotIn("`run `unsafe`", text)
+        self.assertIn(r"run \`unsafe\` \\ now", text)
 
 
 class StoppedWorkflowRenderTests(unittest.TestCase):
