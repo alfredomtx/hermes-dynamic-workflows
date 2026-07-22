@@ -13,7 +13,7 @@ Also prevent clarification responses from referring to choices that appeared onl
 - Generic completion rendering for scalar, list, dictionary, nested `results`, and null values.
 - Explicit presentation-envelope rendering.
 - A visible row for every top-level subtask result while the Telegram card fits.
-- An explicit overflow count linked conceptually to the persisted report when headings alone exceed the card limit.
+- An explicit overflow count linked conceptually to the persisted report when compact index rows exceed the card limit.
 - Bounded summaries that respect Telegram's UTF-16 4096-character limit.
 - One metrics line for duration, agent count, estimated cost, and tokens.
 - Removal of terminal workflow Rerun buttons.
@@ -78,32 +78,50 @@ The renderer may display verdict words already present in plain-string headings,
 
 ## Telegram Card Layout
 
+Use a hybrid summary-index plus detail layout. Telegram has no reliable native Markdown-table rendering, so the compact index uses a monospace block for stable narrow columns. Rich result sections remain outside the code block so bold, italic, inline-code, and bullet formatting still render.
+
 Normal generic completion shape:
 
-```text
-⚠️ Workflow completed with missing output
+````text
+**⚠️ Workflow needs attention**
+_3 subtasks · 2 results · 1 missing_
 
-3 subtasks · 2 results · 1 missing
-
-1. ✅ PASS · zero blockers
-   Validated live frontend behavioral skill.
-
-2. ⚠️ No result returned
-
-3. ❌ FAIL · 3 blockers
-   Canonical source differs.
-   Frontend references remain unresolved.
-
-7m 31s · 3 agents · ~$1.10 · 2.18M tokens
 ```
+01  ✅  First task
+02  ⚠️  No result returned
+03  ❌  Third task
+```
+
+**✅ 1 · First task**
+_Evidence retained._
+
+**⚠️ 2 · No result returned**
+
+**❌ 3 · Third task**
+_One blocker remains._
+
+**Findings**
+• Synthetic canary blocker.
+
+**Required action**
+`Confirm this card is readable.`
+
+_7m 31s · 3 agents · ~$1.10 · 2.18M tokens_
+````
 
 Rules:
 
-- Show every top-level subtask while the card fits.
-- Preserve original result order.
-- Keep headings scan-friendly and summaries bounded.
-- Show explicit findings and required action when present.
+- Render the outcome title and section labels in bold.
+- Render aggregate metadata, result summaries, overflow text, and metrics in italics.
+- Render required actions, identifiers, paths, and commands as inline code when they fit safely.
+- Render a compact monospace index before details; use zero-padded ordinals while the result count is below 100, then width-match the largest ordinal.
+- Keep the index narrow: ordinal, status marker, and bounded title only. Do not put summaries, findings, paths, or commands into table columns.
+- Every returned result gets a titled detail section and one bounded summary line while the card budget permits.
+- Missing results get an index row and detail heading but no invented summary.
+- Warning, failed, blocked, and missing details receive budget before successful details. Within each priority class, preserve original result order and retain original ordinal labels.
+- Show explicit findings as bullets and required action as its own labeled section.
 - Render metrics once at the bottom.
+- Do not use pipe tables, HTML tables, or wide columns; Telegram mobile rendering is not stable enough.
 - Do not emit raw JSON punctuation as the normal user-facing representation.
 - Do not repeat a separate cost section when the metrics line already carries cost unless per-subtask cost data is intentionally rendered and fits the character budget.
 
@@ -113,13 +131,14 @@ Telegram counts UTF-16 code units and limits text messages to 4096 units. Comple
 
 Budget policy:
 
-1. Reserve space for title, aggregate counts, as many ordered subtask headings as fit, an overflow marker, and metrics.
-2. Allocate remaining space across visible subtask summaries.
-3. Truncate verbose details before headings.
-4. If one subtask exceeds its allocation, append a clear truncation marker.
-5. If all headings fit, retain every heading and replace omitted detail with a per-row truncation marker.
-6. If headings alone cannot fit, retain the largest ordered prefix that fits and append `… N more results in stored report`.
-7. Apply a final UTF-16 fit guard as defense in depth.
+1. Reserve space for bold title, italic aggregate metadata, compact index, overflow marker, and italic metrics.
+2. Keep as many ordered index rows as fit; if all index rows cannot fit, append `_… N more results in stored report_`.
+3. Allocate remaining detail budget to warning, failed, blocked, and missing sections first, then successful and unknown sections.
+4. Within each priority class, preserve original result order and display the original ordinal in every detail heading.
+5. Give each visible returned result one bounded summary line before allocating extra findings or action text.
+6. Truncate detail text before index rows, overflow marker, or metrics.
+7. Escape or sanitize model-provided Markdown control characters so result content cannot break the renderer's own formatting.
+8. Apply a final UTF-16 fit guard as defense in depth.
 
 Full output remains available in the persisted workflow artifact.
 
@@ -192,8 +211,15 @@ Test:
 - list result;
 - nested `results` list;
 - mixed strings, dictionaries, and nulls;
-- every subtask retained in original order when headings fit;
-- explicit overflow count when headings alone exceed the card limit;
+- every subtask retained in original order in the compact index when it fits;
+- explicit italic overflow count when index rows exceed the card limit;
+- compact index uses a fenced monospace block with aligned ordinal and status columns;
+- outcome title, result headings, findings label, and required-action label render bold;
+- aggregate metadata, summaries, overflow text, and metrics render italic;
+- required action renders inline code when safe;
+- every returned result receives one summary line while detail budget permits;
+- warning, failure, blocked, and missing details receive budget before successful details;
+- model-provided Markdown punctuation cannot break card structure;
 - explicit labels and ordinal fallback labels;
 - valid presentation envelope remains authoritative;
 - malformed presentation falls back safely;
@@ -201,7 +227,7 @@ Test:
 - raw JSON syntax absent from normal cards;
 - metrics rendered exactly once;
 - long inputs remain within 4096 UTF-16 units;
-- truncation removes details before subtask headings.
+- truncation removes detail sections before compact index rows, overflow marker, or metrics.
 
 ### Controls
 
@@ -234,10 +260,12 @@ After implementation and focused tests:
 ## Acceptance Criteria
 
 - Arbitrary workflow result structures produce a readable completion card.
-- Every top-level subtask is visible when headings fit; oversized result sets show an explicit overflow count and remain complete in the stored report.
+- Every top-level subtask is visible when compact index rows fit; oversized result sets show an explicit overflow count and remain complete in the stored report.
 - Missing values are shown honestly without invented failure semantics.
 - Explicit presentation envelopes remain authoritative.
 - Full machine-readable output remains persisted.
+- Telegram card uses the approved hybrid hierarchy: bold title/labels, italic metadata/summaries/metrics, compact monospace result index, and rich detail sections.
+- Every returned result gets one bounded summary line while detail budget permits; exception details receive priority.
 - Telegram card contains one metrics line and no default raw JSON dump.
 - Terminal workflow cards contain no Rerun button.
 - Active workflow controls continue working.
