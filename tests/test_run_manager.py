@@ -3420,6 +3420,41 @@ class CompletionCardRenderTests(unittest.TestCase):
             if added:
                 sys.path.remove(root_text)
 
+    def test_result_rows_budget_real_formatter_and_preserve_trusted_boundaries(self):
+        from hermes_dynamic_workflows.view.completion import render_completion_card
+
+        controls = "*_[]()~`>#+-=|{}.!\\"
+
+        def pressured(prefix: str, repeat: int) -> str:
+            return prefix + " " + (controls * repeat)
+
+        record = self._blocked_review_record()
+        record["result"] = {
+            "results": [
+                {
+                    "status": "failed" if index == 1 else "passed",
+                    "title": pressured(f"Row {index} title", 20),
+                    "summary": pressured(f"Row {index} summary", 70),
+                    "findings": [pressured(f"Row {index} finding", 40)],
+                    "nextAction": pressured(f"Row {index} next action", 60),
+                }
+                for index in range(1, 101)
+            ]
+        }
+        record["workflow"]["totals"].update({"agents": 100, "done": 99, "errors": 1})
+
+        raw = render_completion_card(record, preview_chars=6000, show_cost=False)
+        formatted = self._installed_telegram_format(raw)
+
+        self.assertLessEqual(len(raw.encode("utf-16-le")) // 2, 4096)
+        self.assertLessEqual(len(formatted.encode("utf-16-le")) // 2, 4096)
+        self.assertEqual(raw.count("```") % 2, 0)
+        self.assertEqual(formatted.count("```") % 2, 0)
+        self.assertRegex(raw, r"… \d+ more results in stored report")
+        self.assertRegex(formatted, r"… \d+ more results in stored report")
+        self.assertIn("5.04M tokens", raw)
+        self.assertIn(r"5\.04M tokens", formatted)
+
     def test_raw_fallback_escapes_hostile_markdown_at_trusted_shell_boundary(self):
         record = self._blocked_review_record()
         record["result"] = {

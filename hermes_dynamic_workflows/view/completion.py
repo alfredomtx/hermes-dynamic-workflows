@@ -320,7 +320,7 @@ def _result_index(rows: tuple[_ResultRow, ...], *, max_units: int) -> tuple[str,
 
     for visible_count in range(len(rows), -1, -1):
         rendered = candidate(visible_count)
-        if _utf16_units(rendered) <= max_units:
+        if _card_text_fits(rendered, max_units):
             return rendered, visible_count
     return "", 0
 
@@ -389,7 +389,7 @@ def _render_result_rows(rows: tuple[_ResultRow, ...], *, max_units: int) -> str:
     aggregate = f"{total} subtasks · {result_count} results · {missing} missing"
     aggregate_block = [f"*{_escape_markdown_content(aggregate)}*"]
     blocks: list[list[str]] = [aggregate_block]
-    used_without_details = _utf16_units(_join_result_blocks(blocks))
+    used_without_details = _card_formatter_units(_join_result_blocks(blocks))
 
     index_budget = max(0, max_units - used_without_details - 2)
     index_text, visible_count = _result_index(rows, max_units=index_budget)
@@ -411,7 +411,7 @@ def _render_result_rows(rows: tuple[_ResultRow, ...], *, max_units: int) -> str:
         if summary:
             row_block.append(summary)
         candidate = blocks + [*mandatory.values(), row_block]
-        if _utf16_units(_join_result_blocks(candidate)) <= max_units:
+        if _card_text_fits(_join_result_blocks(candidate), max_units):
             mandatory[ordinal] = row_block
 
     extras: dict[int, list[str]] = {ordinal: [] for ordinal in mandatory}
@@ -437,14 +437,14 @@ def _render_result_rows(rows: tuple[_ResultRow, ...], *, max_units: int) -> str:
                     for key, _row in ordered_rows
                     if key in mandatory
                 ]
-                if _utf16_units(_join_result_blocks(blocks + trial_blocks)) > max_units:
+                if not _card_text_fits(_join_result_blocks(blocks + trial_blocks), max_units):
                     break
                 section_lines.append(line)
             if len(section_lines) > 1:
                 extras[ordinal].extend(section_lines)
 
     result = _join_result_blocks(blocks + rendered_detail_blocks())
-    return _fit_utf16(result, max_units)
+    return result
 
 
 def _classify_findings(values: list[Any]) -> tuple[int, tuple[str, ...], tuple[str, ...]]:
@@ -728,16 +728,16 @@ def _card_formatter_units(text: str) -> int:
     )
 
 
+def _card_text_fits(text: str, max_units: int = _CARD_MAX_UNITS) -> bool:
+    return _utf16_units(text) <= max_units and _card_formatter_units(text) <= max_units
+
+
 def _card_blocks_text(blocks: list[str]) -> str:
     return "\n\n".join(block for block in blocks if block).rstrip()
 
 
 def _card_blocks_fit(blocks: list[str]) -> bool:
-    text = _card_blocks_text(blocks)
-    return (
-        _utf16_units(text) <= _CARD_MAX_UNITS
-        and _card_formatter_units(text) <= _CARD_MAX_UNITS
-    )
+    return _card_text_fits(_card_blocks_text(blocks))
 
 
 def _fit_italic_card_block(
@@ -908,26 +908,25 @@ def render_completion_card(
             lines.extend(["", _escape_fallback_content(card.fallback)])
         metrics_text = f"*{_escape_markdown_content(metrics)}*" if metrics else ""
         prefix = "\n".join(lines).rstrip()
-        fixed_units = _utf16_units(prefix) + 2
-        if metrics_text:
-            fixed_units += 2 + _utf16_units(metrics_text)
-        result_budget = max(0, 4096 - fixed_units)
+        fixed_blocks = [prefix, metrics_text] if metrics_text else [prefix]
+        fixed_units = _card_formatter_units(_card_blocks_text(fixed_blocks))
+        result_budget = max(0, _CARD_MAX_UNITS - fixed_units - 2)
         result_text = _render_result_rows(card.result_rows, max_units=result_budget)
-        base = prefix
+        base_blocks = [prefix]
         if result_text:
-            base = f"{base}\n\n{result_text}"
+            base_blocks.append(result_text)
         if metrics_text:
-            base = f"{base}\n\n{metrics_text}"
-        base = base.rstrip()
+            base_blocks.append(metrics_text)
+        base = _card_blocks_text(base_blocks)
         if show_cost:
             remaining = max(0, 4096 - _utf16_units(base) - 2)
             breakdown = render_cost_breakdown(record, char_budget=remaining)
             if breakdown:
                 escaped_breakdown = _escape_markdown_content(breakdown)
                 candidate = f"{base}\n\n{escaped_breakdown}"
-                if _utf16_units(candidate) <= 4096:
+                if _card_text_fits(candidate):
                     return candidate
-        return _fit_utf16(base)
+        return base
 
     base = _render_non_result_card(card, metrics)
     if show_cost:
