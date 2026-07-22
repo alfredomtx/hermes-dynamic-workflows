@@ -3402,6 +3402,110 @@ class CompletionCardRenderTests(unittest.TestCase):
         self.assertNotIn("`run `unsafe`", text)
         self.assertIn(r"run \`unsafe\` \\ now", text)
 
+    @staticmethod
+    def _installed_telegram_format(text: str) -> str:
+        installed_root = Path("/Users/atorres/.hermes/hermes-agent")
+        adapter_path = installed_root / "plugins/platforms/telegram/adapter.py"
+        if not adapter_path.is_file():
+            raise AssertionError(f"installed Telegram adapter is missing: {adapter_path}")
+        root_text = str(installed_root)
+        added = root_text not in sys.path
+        if added:
+            sys.path.insert(0, root_text)
+        try:
+            from plugins.platforms.telegram.adapter import TelegramAdapter
+
+            return TelegramAdapter.__new__(TelegramAdapter).format_message(text)
+        finally:
+            if added:
+                sys.path.remove(root_text)
+
+    def test_raw_fallback_escapes_hostile_markdown_at_trusted_shell_boundary(self):
+        record = self._blocked_review_record()
+        record["result"] = {
+            "status": "PENDING_APPROVAL",
+            "opaque": (
+                "**fake bold** _fake italic_ [fake link](https://example.com) "
+                "~~fake strike~~ ||fake spoiler|| `fake code`"
+            ),
+        }
+
+        text = manager_module._progress_bubble_text(
+            record, PluginConfig(notify_progress_cost=False), completed=True,
+        )
+
+        self.assertTrue(text.startswith("**⚠️ Final review task 7 needs attention**"), text)
+        self.assertIn("Result:\n", text)
+        self.assertNotIn("**fake bold**", text)
+        self.assertNotIn("_fake italic_", text)
+        self.assertNotIn("[fake link](https://example.com)", text)
+        self.assertNotIn("~~fake strike~~", text)
+        self.assertNotIn("||fake spoiler||", text)
+        self.assertNotIn("`fake code`", text)
+        self.assertIn(r"\*\*fake bold\*\*", text)
+        self.assertIn(r"\_fake italic\_", text)
+        self.assertIn(r"\[fake link\](https://example.com)", text)
+        self.assertIn(r"\~\~fake strike\~\~", text)
+        self.assertIn(r"\|\|fake spoiler\|\|", text)
+        self.assertIn(r"\`fake code\`", text)
+
+        try:
+            formatted = self._installed_telegram_format(text)
+        except Exception as exc:  # pragma: no cover - assertion documents the real adapter contract
+            self.fail(f"installed TelegramAdapter.format_message() raised: {exc!r}")
+        self.assertNotEqual(formatted, text, "formatter failure/plain fallback must not be mistaken for success")
+        self.assertIn("Result:", formatted)
+        for active_markdown in (
+            "*fake bold*",
+            "_fake italic_",
+            "[fake link](https://example.com)",
+            "~fake strike~",
+            "||fake spoiler||",
+            "`fake code`",
+        ):
+            self.assertNotIn(active_markdown, formatted)
+
+    def test_non_row_card_budget_keeps_trusted_blocks_complete_for_real_formatter(self):
+        from hermes_dynamic_workflows.view.completion import _CompletionCard
+
+        record = self._blocked_review_record()
+        oversized_card = _CompletionCard(
+            status="blocked",
+            title="T" * 96,
+            summary="S" * 6000,
+            details_title="Findings",
+            findings=("F" * 6000,),
+            next_action="A" * 6000,
+        )
+        with patch(
+            "hermes_dynamic_workflows.view.completion._build_completion_card",
+            return_value=oversized_card,
+        ):
+            text = manager_module._progress_bubble_text(
+                record, PluginConfig(notify_progress_cost=False), completed=True,
+            )
+
+        self.assertLessEqual(len(text.encode("utf-16-le")) // 2, 4096)
+        self.assertTrue(text.startswith("**⛔ " + "T" * 96 + "**"), text)
+        self.assertIn("5.04M tokens", text)
+
+        def unescaped_count(character: str) -> int:
+            return sum(
+                1
+                for index, value in enumerate(text)
+                if value == character and (index == 0 or text[index - 1] != "\\")
+            )
+
+        self.assertEqual(unescaped_count("`") % 2, 0)
+        self.assertEqual(unescaped_count("*") % 2, 0)
+        self.assertEqual(text.count("```") % 2, 0)
+
+        try:
+            formatted = self._installed_telegram_format(text)
+        except Exception as exc:  # pragma: no cover - assertion documents the real adapter contract
+            self.fail(f"installed TelegramAdapter.format_message() raised: {exc!r}")
+        self.assertLessEqual(len(formatted.encode("utf-16-le")) // 2, 4096)
+
 
 class StoppedWorkflowRenderTests(unittest.TestCase):
     def _stopped_record(self) -> dict:

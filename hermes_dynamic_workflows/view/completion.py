@@ -60,6 +60,21 @@ def _escape_markdown_content(text: str) -> str:
     return _MARKDOWN_CONTENT_RE.sub(r"\\\1", sanitized)
 
 
+_FALLBACK_MARKDOWN_CONTENT_RE = re.compile(r"([\\`*~|])")
+_FALLBACK_LINK_RE = re.compile(r"\[([^\]\n]+)\]\(")
+
+
+def _escape_fallback_content(text: str) -> str:
+    """Escape raw fallback syntax while keeping ordinary JSON punctuation visible."""
+    sanitized = "".join("�" if 0xD800 <= ord(char) <= 0xDFFF else char for char in str(text))
+    escaped = _FALLBACK_MARKDOWN_CONTENT_RE.sub(r"\\\1", sanitized)
+    escaped = _FALLBACK_LINK_RE.sub(
+        lambda match: f"\\[{match.group(1)}\\](",
+        escaped,
+    )
+    return re.sub(r"(?<![A-Za-z0-9])_|_(?![A-Za-z0-9])", r"\\_", escaped)
+
+
 def _inline_code_content(text: str) -> str:
     sanitized = "".join("�" if 0xD800 <= ord(char) <= 0xDFFF else char for char in str(text))
     return sanitized.replace("\\", "\\\\").replace("`", "\\`")
@@ -694,6 +709,177 @@ def _completion_icon(status: str) -> str:
     }.get(status, "✅")
 
 
+_TELEGRAM_MARKDOWN_SPECIALS = frozenset("_*[]()~`>#+-=|{}.!\\\\")
+_CARD_MAX_UNITS = 4096
+
+
+def _card_formatter_units(text: str) -> int:
+    """Conservatively budget the installed Telegram MarkdownV2 conversion.
+
+    The workflow plugin emits standard Markdown, while the Telegram adapter
+    escapes MarkdownV2 controls (including the backslashes this renderer uses
+    to protect model content).  Counting one possible adapter escape for every
+    MarkdownV2 control keeps the source and the final formatted message within
+    Telegram's UTF-16 limit without importing a gateway adapter into the
+    plugin.
+    """
+    return _utf16_units(text) + sum(
+        1 for char in text if char in _TELEGRAM_MARKDOWN_SPECIALS
+    )
+
+
+def _card_blocks_text(blocks: list[str]) -> str:
+    return "\n\n".join(block for block in blocks if block).rstrip()
+
+
+def _card_blocks_fit(blocks: list[str]) -> bool:
+    text = _card_blocks_text(blocks)
+    return (
+        _utf16_units(text) <= _CARD_MAX_UNITS
+        and _card_formatter_units(text) <= _CARD_MAX_UNITS
+    )
+
+
+def _fit_italic_card_block(
+    value: Any,
+    fixed_blocks: list[str],
+    *,
+    max_chars: int,
+    preserve_result_overflow: bool = False,
+) -> str:
+    normalized = (
+        " ".join(_bounded_result_text(value, max_chars).split())
+        if preserve_result_overflow
+        else _bounded_card_text(value, max_chars)
+    )
+    if not normalized:
+        return ""
+
+    def candidate(limit: int) -> str:
+        content = normalized if len(normalized) <= limit else _truncate_utf16_text(normalized, limit)
+        return f"*{_escape_markdown_content(content)}*"
+
+    if _card_blocks_fit([*fixed_blocks, candidate(len(normalized))]):
+        return candidate(len(normalized))
+
+    low, high = 1, len(normalized)
+    best = ""
+    while low <= high:
+        limit = (low + high) // 2
+        rendered = candidate(limit)
+        if _card_blocks_fit([*fixed_blocks, rendered]):
+            best = rendered
+            low = limit + 1
+        else:
+            high = limit - 1
+    return best
+
+
+def _fit_escaped_card_block(
+    value: Any,
+    fixed_blocks: list[str],
+    *,
+    max_chars: int,
+) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return ""
+
+    def candidate(limit: int) -> str:
+        content = normalized if len(normalized) <= limit else _truncate_utf16_text(normalized, limit)
+        return _escape_fallback_content(content)
+
+    limit = min(max_chars, len(normalized))
+    if limit <= 0:
+        return ""
+    rendered = candidate(limit)
+    if _card_blocks_fit([*fixed_blocks, rendered]):
+        return rendered
+
+    low, high = 1, limit
+    best = ""
+    while low <= high:
+        current = (low + high) // 2
+        rendered = candidate(current)
+        if _card_blocks_fit([*fixed_blocks, rendered]):
+            best = rendered
+            low = current + 1
+        else:
+            high = current - 1
+    return best
+
+
+def _render_non_result_card(card: _CompletionCard, metrics: str) -> str:
+    title = _bounded_card_text(card.title, 96)
+    title_block = f"**{_completion_icon(card.status)} {_escape_markdown_content(title)}**"
+
+    metric_block = _fit_italic_card_block(metrics, [title_block], max_chars=1200) if metrics else ""
+    suffix = [metric_block] if metric_block else []
+    selected = [title_block]
+
+    if card.summary:
+        summary = _fit_italic_card_block(
+            card.summary,
+            [*selected, *suffix],
+            max_chars=1200,
+            preserve_result_overflow=True,
+        )
+        if summary:
+            selected.append(summary)
+
+    findings = [
+        _bounded_card_text(value, 240)
+        for value in tuple(card.findings or ())[:4]
+    ]
+    findings = [value for value in findings if value]
+    if findings:
+        details_title = _bounded_card_text(card.details_title or "Findings", 96)
+        for count in range(len(findings), 0, -1):
+            findings_block = "\n".join([
+                f"**{_escape_markdown_content(details_title)}**",
+                *(f"• {_escape_markdown_content(value)}" for value in findings[:count]),
+            ])
+            if _card_blocks_fit([*selected, findings_block, *suffix]):
+                selected.append(findings_block)
+                break
+
+    if card.next_action:
+        action = _bounded_card_text(card.next_action, 400)
+        if action:
+            action_block = "\n".join([
+                "**Required action**",
+                _result_action_line(action),
+            ])
+            if _card_blocks_fit([*selected, action_block, *suffix]):
+                selected.append(action_block)
+            else:
+                for limit in range(len(action) - 1, 0, -1):
+                    shortened = _truncate_utf16_text(action, limit)
+                    action_block = "\n".join([
+                        "**Required action**",
+                        _result_action_line(shortened),
+                    ])
+                    if _card_blocks_fit([*selected, action_block, *suffix]):
+                        selected.append(action_block)
+                        break
+
+    if card.fallback:
+        fallback = _fit_escaped_card_block(
+            card.fallback,
+            [*selected, *suffix],
+            max_chars=1800,
+        )
+        if fallback:
+            selected.append(fallback)
+
+    base_blocks = [*selected, *suffix]
+    if not _card_blocks_fit(base_blocks):
+        # The title and the generated metric block are complete trusted blocks;
+        # never repair an over-budget card by slicing through their delimiters.
+        base_blocks = [title_block, *suffix]
+    return _card_blocks_text(base_blocks)
+
+
 def render_completion_card(
     record: dict[str, Any],
     *,
@@ -716,11 +902,11 @@ def render_completion_card(
             "**Required action**",
             _result_action_line(card.next_action),
         ])
-    if card.fallback:
-        lines.extend(["", card.fallback])
     metrics = render_run_metrics(record, show_cost=show_cost)
-    metrics_text = f"*{_escape_markdown_content(metrics)}*" if metrics else ""
     if card.result_rows is not None:
+        if card.fallback:
+            lines.extend(["", _escape_fallback_content(card.fallback)])
+        metrics_text = f"*{_escape_markdown_content(metrics)}*" if metrics else ""
         prefix = "\n".join(lines).rstrip()
         fixed_units = _utf16_units(prefix) + 2
         if metrics_text:
@@ -733,16 +919,23 @@ def render_completion_card(
         if metrics_text:
             base = f"{base}\n\n{metrics_text}"
         base = base.rstrip()
-    else:
-        if metrics_text:
-            lines.extend(["", metrics_text])
-        base = "\n".join(lines).rstrip()
+        if show_cost:
+            remaining = max(0, 4096 - _utf16_units(base) - 2)
+            breakdown = render_cost_breakdown(record, char_budget=remaining)
+            if breakdown:
+                escaped_breakdown = _escape_markdown_content(breakdown)
+                candidate = f"{base}\n\n{escaped_breakdown}"
+                if _utf16_units(candidate) <= 4096:
+                    return candidate
+        return _fit_utf16(base)
+
+    base = _render_non_result_card(card, metrics)
     if show_cost:
-        remaining = max(0, 4096 - _utf16_units(base) - 2)
+        remaining = max(0, _CARD_MAX_UNITS - _card_formatter_units(base) - 2)
         breakdown = render_cost_breakdown(record, char_budget=remaining)
         if breakdown:
             escaped_breakdown = _escape_markdown_content(breakdown)
             candidate = f"{base}\n\n{escaped_breakdown}"
-            if _utf16_units(candidate) <= 4096:
+            if _card_blocks_fit([base, escaped_breakdown]):
                 return candidate
-    return _fit_utf16(base)
+    return base
