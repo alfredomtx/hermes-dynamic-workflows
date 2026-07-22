@@ -277,6 +277,10 @@ share the cache prefix. Inline `instructions` and `meta["agents"]` runtime prese
   number of items, but only about slot-many run at once and the rest queue.
 - **Agent cap** `max_agents` (default 1000): a runaway fallback gate, far above any real
   workflow.
+- **Default child turns** `max_turns` (default 150): supplies `maxTurns` when an inline
+  `agent()` call omits it, clamped to 1..1000 by config loading. The environment override
+  is `HERMES_DYNAMIC_WORKFLOWS_MAX_TURNS`; an explicit inline `maxTurns` always wins and
+  this setting is not inherited from role presets.
 - **Nesting depth** `max_nesting_depth` (default 2): the maximum `workflow()` nesting
   depth — root plus N nested levels. `workflow()` past this depth raises
   `WorkflowRuntimeError`. The depth is plumbed `WorkflowAPI.depth → _workflow_sync →
