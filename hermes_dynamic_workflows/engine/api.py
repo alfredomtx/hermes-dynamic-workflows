@@ -620,8 +620,9 @@ def _validate_agent_opts(opts: dict[str, Any]) -> None:
         )
     if effort is None:
         raise WorkflowRuntimeError("agent() reasoningEffort is required")
+    if "maxTurns" in opts:
+        _required_limit(opts, "maxTurns", 1000)
     for key, upper in (
-        ("maxTurns", 1000),
         ("maxToolCalls", 10000),
         ("maxToolOutputChars", 20_000_000),
     ):
@@ -637,6 +638,13 @@ def _required_limit(opts: dict[str, Any], key: str, upper: int) -> int:
             f"agent() {key} must be an integer from 1 to {upper}"
         )
     return value
+
+
+def _resolve_max_turns(opts: dict[str, Any], config: Any) -> int:
+    if "maxTurns" in opts:
+        return _required_limit(opts, "maxTurns", 1000)
+    configured = getattr(config, "max_turns", 150)
+    return _required_limit({"maxTurns": configured}, "maxTurns", 1000)
 
 
 def _check_vm_array_length(items: list[Any]) -> None:
@@ -742,7 +750,12 @@ def _resolve_agent_spec(
             or generic_agent_type()
         )
 
-    effective_spec = _compose_effective_agent_type(agent_type_spec, opts)
+    max_turns = _resolve_max_turns(opts, config)
+    effective_spec = _compose_effective_agent_type(
+        agent_type_spec,
+        opts,
+        max_turns=max_turns,
+    )
     from ..child.presets import _reasoning_effort_from
 
     reasoning_effort = _reasoning_effort_from(
@@ -756,7 +769,6 @@ def _resolve_agent_spec(
     )
     provider = str(opts["provider"]).strip()
     model = str(opts["model"]).strip()
-    max_turns = _required_limit(opts, "maxTurns", 1000)
     max_tool_calls = _required_limit(opts, "maxToolCalls", 10000)
     max_tool_output_chars = _required_limit(opts, "maxToolOutputChars", 20_000_000)
     _prepare_mcp_tool_registry(config)
@@ -802,7 +814,12 @@ def _resolve_agent_spec(
     )
 
 
-def _compose_effective_agent_type(base_spec: Any, opts: dict[str, Any]) -> Any:
+def _compose_effective_agent_type(
+    base_spec: Any,
+    opts: dict[str, Any],
+    *,
+    max_turns: int,
+) -> Any:
     from ..child.presets import AgentTypeSpec, _reasoning_effort_from
 
     inline_instructions = _inline_instructions(opts)
@@ -813,7 +830,6 @@ def _compose_effective_agent_type(base_spec: Any, opts: dict[str, Any]) -> Any:
     inline_disallowed, inline_disallowed_explicit = _tuple_option(
         opts, "disallowedTools", "disallowed_tools", field_name="disallowedTools"
     )
-    inline_max_turns = _required_limit(opts, "maxTurns", 1000)
     inline_reasoning_effort = _reasoning_effort_from(
         opts,
         source="agent()",
@@ -871,7 +887,7 @@ def _compose_effective_agent_type(base_spec: Any, opts: dict[str, Any]) -> Any:
         isolation=getattr(base_spec, "isolation", None),
         toolsets_explicit=toolsets_explicit,
         allowed_tools_explicit=allowed_tools_explicit,
-        max_turns=inline_max_turns,
+        max_turns=max_turns,
         reasoning_effort=inline_reasoning_effort,
     )
 

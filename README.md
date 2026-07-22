@@ -55,6 +55,7 @@ plugins:
         concurrency: 8                # Max concurrent agents (default: min(16, cpu-2))
         max_concurrency: 16           # Hard cap on concurrency
         max_agents: 1000              # Max total agents per run (runaway guard)
+        max_turns: 150                # Default logical turns when agent() omits maxTurns (HERMES_DYNAMIC_WORKFLOWS_MAX_TURNS; clamped to 1..1000)
         max_nesting_depth: 2          # Max workflow() nesting depth (root + N levels); run-wide caps still bind across all levels
         workflow_timeout_seconds: 900 # Wall-clock timeout for the whole run (excludes paused time)
         child_timeout_seconds: 300    # Timeout for a single child agent
@@ -171,8 +172,10 @@ return await agent("Synthesize the verified findings:\n" + json.dumps(findings),
 ```
 
 - `agent(prompt, opts)` spawns a child agent. Every call requires inline `provider`,
-  canonical `model`, `reasoningEffort`, `maxTurns`, `maxToolCalls`, and
-  `maxToolOutputChars`. Missing or invalid values fail before reservation and launch.
+  canonical `model`, `reasoningEffort`, `maxToolCalls`, and `maxToolOutputChars`.
+  `maxTurns` is optional: when omitted, it resolves from the plugin's `max_turns`
+  setting (default 150, clamped to 1..1000); an explicit inline `maxTurns` overrides
+  that setting. Malformed or invalid explicit values fail before reservation and launch.
   Presets define role instructions and tool permissions only; routing and budgets cannot
   come from presets. Current Bedrock and `codex_app_server` transports do not forward
   workflow reasoning effort, so those runtimes fail before child launch.

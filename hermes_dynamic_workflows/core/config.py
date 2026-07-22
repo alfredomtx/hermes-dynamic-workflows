@@ -16,6 +16,9 @@ class PluginConfig:
     concurrency: int = field(default_factory=default_concurrency)
     max_concurrency: int = 16
     max_agents: int = 1000
+    # Default logical-turn ceiling for workflow child agents when agent() omits
+    # its inline maxTurns value. Inline values still take precedence.
+    max_turns: int = 150
     # Maximum workflow() nesting depth. depth=0 is the top-level run; each
     # nested workflow() call goes one deeper. A value of N allows the root plus
     # N nested levels (N+1 total), so the default 2 permits root -> child ->
@@ -238,6 +241,12 @@ def load_config() -> PluginConfig:
         concurrency=min(concurrency, max_concurrency),
         max_concurrency=max_concurrency,
         max_agents=_as_int(raw.get("max_agents"), default.max_agents, minimum=1, maximum=1000),
+        max_turns=_as_int(
+            os.getenv("HERMES_DYNAMIC_WORKFLOWS_MAX_TURNS", raw.get("max_turns")),
+            default.max_turns,
+            minimum=1,
+            maximum=1000,
+        ),
         max_nesting_depth=_as_int(
             os.getenv(
                 "HERMES_DYNAMIC_WORKFLOWS_MAX_NESTING_DEPTH",

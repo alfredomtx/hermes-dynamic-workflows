@@ -53,6 +53,7 @@ plugins:
         concurrency: 8                # エージェントの最大同時実行数（デフォルト: min(16, cpu-2)）
         max_concurrency: 16           # 同時実行数のハードキャップ
         max_agents: 1000              # 1 回の実行あたりのエージェント総数の上限（暴走防止）
+        max_turns: 150                # agent() が maxTurns を省略した場合のデフォルト論理ターン数（HERMES_DYNAMIC_WORKFLOWS_MAX_TURNS、1..1000 に制限）
         max_nesting_depth: 2          # workflow() の最大ネスト深度（ルート + N 階層）。実行全体の上限は全階層に適用される
         workflow_timeout_seconds: 900 # 実行全体のウォールクロックタイムアウト（一時停止時間を除く）
         child_timeout_seconds: 300    # 単一の子エージェントのタイムアウト
@@ -130,7 +131,9 @@ return await agent("検証済みの結果を統合する:\n" + json.dumps(findin
 ```
 
 - `agent(prompt, opts)` は子エージェントを起動します。各呼び出しは `provider`、正規の `model`、
-  `reasoningEffort`、`maxTurns`、`maxToolCalls`、`maxToolOutputChars` をインラインで必ず宣言します。欠落または無効な値はエージェント予約・起動前に失敗します。
+  `reasoningEffort`、`maxToolCalls`、`maxToolOutputChars` をインラインで必ず宣言します。`maxTurns` は省略可能で、
+  省略時はプラグインの `max_turns` 設定（デフォルト 150、1..1000 に制限）から解決されます。明示的なインライン
+  `maxTurns` はこの設定を上書きします。形式不正または明示的な無効値は、エージェント予約・起動前に失敗します。
   preset はロール指示とツール権限だけを定義し、ルーティングや予算を提供できません。Bedrock と `codex_app_server` は workflow reasoning effort を転送しないため、子エージェント起動前に失敗します。
 - `pipeline`（デフォルト、バリアなし）／`parallel`（バリアあり）が並行処理を扱います。
   `phase`／`log` は進捗を報告し、`workflow()` は名前付きワークフローをインラインで実行し、`args` /

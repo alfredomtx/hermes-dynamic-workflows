@@ -500,7 +500,7 @@ return await agent("go", {"agentType": "reader", "label": "reader", "provider": 
         self.assertEqual(request.resolved.allowed_tools, ("read_file",))
         self.assertTrue(request.resolved.allowed_tools_explicit)
 
-    def test_agent_requires_inline_provider_model_and_effort_before_launch(self):
+    def test_agent_requires_inline_provider_model_effort_and_tool_budgets_before_launch(self):
         complete = {
             "provider": "openai-codex",
             "model": "gpt-5.6-luna",
@@ -509,7 +509,7 @@ return await agent("go", {"agentType": "reader", "label": "reader", "provider": 
             "maxToolCalls": 16,
             "maxToolOutputChars": 200000,
         }
-        for missing in complete:
+        for missing in (key for key in complete if key != "maxTurns"):
             opts = {key: value for key, value in complete.items() if key != missing}
             script = (
                 'meta = {"name": "missing-routing", "description": "Test workflow"}\n'
@@ -1423,6 +1423,51 @@ class MaxTurnsRuntimeTests(unittest.TestCase):
             f"return await agent(\"go\", {options!r})"
         )
 
+    def test_plugin_max_turns_default_is_150(self):
+        self.assertEqual(PluginConfig().max_turns, 150)
+
+    def test_max_turns_env_override_is_clamped_to_workflow_range(self):
+        for raw, expected in (("275", 275), ("0", 1), ("1001", 1000), ("not-an-int", 150)):
+            with self.subTest(raw=raw), patch.dict(
+                os.environ,
+                {"HERMES_DYNAMIC_WORKFLOWS_MAX_TURNS": raw},
+            ):
+                self.assertEqual(load_config().max_turns, expected)
+
+    def test_omitted_inline_max_turns_uses_config_default(self):
+        options = dict(self._base)
+        options.pop("maxTurns")
+        runner = FakeRunner()
+
+        run_workflow(
+            self._script(options),
+            WorkflowOptions(config=PluginConfig(), child_runner=runner),
+        )
+
+        self.assertEqual(runner.requests[0].max_turns, 150)
+
+    def test_omitted_inline_max_turns_uses_config_override(self):
+        options = dict(self._base)
+        options.pop("maxTurns")
+        runner = FakeRunner()
+
+        run_workflow(
+            self._script(options),
+            WorkflowOptions(config=PluginConfig(max_turns=42), child_runner=runner),
+        )
+
+        self.assertEqual(runner.requests[0].max_turns, 42)
+
+    def test_inline_max_turns_overrides_config_default(self):
+        runner = FakeRunner()
+
+        run_workflow(
+            self._script({**self._base, "maxTurns": 7}),
+            WorkflowOptions(config=PluginConfig(max_turns=42), child_runner=runner),
+        )
+
+        self.assertEqual(runner.requests[0].max_turns, 7)
+
     def test_inline_budgets_are_recorded_and_resolved(self):
         runner = FakeRunner()
         result = run_workflow(
@@ -1459,7 +1504,7 @@ class MaxTurnsRuntimeTests(unittest.TestCase):
                     self.assertEqual(getattr(runner.requests[0], _request_field(key)), value)
 
     def test_missing_budget_fields_fail_before_launch(self):
-        for key in ("maxTurns", "maxToolCalls", "maxToolOutputChars"):
+        for key in ("maxToolCalls", "maxToolOutputChars"):
             options = dict(self._base)
             options.pop(key)
             runner = FakeRunner()
