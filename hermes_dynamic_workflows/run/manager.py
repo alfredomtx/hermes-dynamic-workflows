@@ -1934,9 +1934,6 @@ def _control_buttons_for(record: dict[str, Any], config: PluginConfig) -> list |
         controls.append({"text": "▶️ Resume", "callback_data": f"wf:resume:{run_id}"})
     if status in _STOPPABLE_STATES and task_id:
         controls.append({"text": "⏹ Stop", "callback_data": f"wf:stop:{task_id}"})
-    if status in _ACTIVE_CONTROL_STATES and run_id:
-        controls.append({"text": "🔄 Restart", "callback_data": f"wf:restart:{run_id}"})
-
     if controls:
         rows.append(controls)
 
@@ -1993,8 +1990,8 @@ def _seed_progress_bubble(managed: "ManagedRun", config: PluginConfig) -> bool:
         with managed.lock:
             text = _progress_bubble_text(managed.record, config, completed=False)
             # Mark synchronously (before the async send resolves) so completion
-            # knows a bubble is pending and waits for its id rather than racing
-            # ahead and sending a separate completion message.
+            # knows a bubble is pending and waits for its id before finalizing
+            # the execution snapshot and sending the separate result message.
             managed.progress_requested = True
             control_buttons = _control_buttons_for(managed.record, config)
         send_kwargs: dict[str, Any] = {"metadata": metadata}
@@ -2145,11 +2142,11 @@ def _edit_progress_bubble(
     edit could not be confirmed delivered — no active bubble, no gateway
     target, an exception, or (the bug this guards) the adapter reporting
     failure such as ``SendResult(success=False, error="flood_control:N")`` on a
-    long Telegram flood wait. The completion caller uses this to decide whether
-    to fall back to a fresh completion SEND so the result is never silently
-    lost. A non-blocking call (``block=False``, fire-and-forget) returns False
-    because delivery cannot be confirmed synchronously; the seed done-callback
-    owns that path's fallback instead.
+    long Telegram flood wait. The execution snapshot and rich result are
+    separate deliveries, so callers must still schedule the result send when
+    this returns False. A non-blocking call (``block=False``, fire-and-forget)
+    returns False because delivery cannot be confirmed synchronously; the seed
+    done-callback owns that path's result delivery.
     """
     with managed.lock:
         if not managed.progress_active or not managed.progress_message_id:

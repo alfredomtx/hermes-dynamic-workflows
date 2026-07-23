@@ -102,7 +102,7 @@ class GatewayCallbackHandlerTests(unittest.TestCase):
         self.assertEqual(fake.called_with, "wf_abc123")
         self.assertIn("Resumed", directive["answer"])
 
-    def test_authorized_restart_calls_manager_restart_and_strips(self):
+    def test_restart_callbacks_remain_supported_without_a_telegram_button(self):
         class FakeManager:
             def restart(self, run_id):
                 self.called_with = run_id
@@ -160,29 +160,37 @@ class StopButtonHelperTests(unittest.TestCase):
         buttons = _stop_buttons_for(self._record(task_id="wg8nxqxzq"), PluginConfig())
         self.assertLessEqual(len(buttons[0]["callback_data"].encode("utf-8")), 64)
 
-    def test_running_control_buttons_include_pause_stop_restart(self):
+    def test_running_control_buttons_keep_pause_and_stop_but_no_restart(self):
         buttons = _control_buttons_for(self._record(status="running"), PluginConfig())
         callbacks = [button["callback_data"] for button in buttons]
         self.assertIn("wf:pause:wf_abc123", callbacks)
         self.assertIn("wf:stop:wg123", callbacks)
-        self.assertIn("wf:restart:wf_abc123", callbacks)
+        self.assertFalse(any("restart" in callback or "rerun" in callback for callback in callbacks))
 
-    def test_paused_control_buttons_include_resume_stop_restart(self):
+    def test_paused_control_buttons_keep_resume_and_stop_but_no_restart(self):
         buttons = _control_buttons_for(self._record(status="paused"), PluginConfig())
         callbacks = [button["callback_data"] for button in buttons]
         self.assertIn("wf:resume:wf_abc123", callbacks)
         self.assertIn("wf:stop:wg123", callbacks)
-        self.assertIn("wf:restart:wf_abc123", callbacks)
+        self.assertFalse(any("restart" in callback or "rerun" in callback for callback in callbacks))
 
-    def test_terminal_control_buttons_do_not_include_rerun(self):
-        for status in ("completed", "failed", "error", "stopped", "interrupted"):
-            buttons = _control_buttons_for(self._record(status=status), PluginConfig())
-            flattened = buttons or []
-            if flattened and isinstance(flattened[0], list):
-                flattened = [button for row in flattened for button in row]
-            self.assertFalse(
-                any(button.get("callback_data", "").startswith("wf:rerun:") for button in flattened)
-            )
+    def test_no_restart_or_rerun_button_in_any_telegram_state(self):
+        statuses = (
+            "queued",
+            "running",
+            "paused",
+            "stopping",
+            "completed",
+            "failed",
+            "error",
+            "stopped",
+            "interrupted",
+        )
+        for status in statuses:
+            buttons = _control_buttons_for(self._record(status=status), PluginConfig()) or []
+            rows = buttons if buttons and isinstance(buttons[0], list) else [buttons]
+            callbacks = [button.get("callback_data", "") for row in rows for button in row]
+            self.assertFalse(any("restart" in callback or "rerun" in callback for callback in callbacks), status)
 
     def test_terminal_control_buttons_keep_open_log_only(self):
         record = self._record(status="completed")
