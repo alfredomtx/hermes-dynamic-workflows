@@ -722,6 +722,76 @@ class CostAndCompletionTests(unittest.TestCase):
         text = render_run_progress(run)
         self.assertLess(len(text), 4000)
 
+    def test_stable_workflow_header_is_shared_shape_for_active_and_terminal_progress(self):
+        from hermes_dynamic_workflows.view.render import render_run_progress, render_workflow_header
+
+        run = {
+            "status": "running",
+            "workflow": {
+                "meta": {"name": "consolidate-delegation-policy"},
+                "duration_seconds": 597,
+                "totals": {"agents": 2, "done": 1, "running": 1, "errors": 0, "tokens": 1_860_000},
+                "agents": [
+                    {"id": 1, "label": "policy", "status": "done", "model": "gpt-5.6-luna", "tokens": 930_000},
+                    {"id": 2, "label": "delegation", "status": "running", "model": "gpt-5.6-luna", "tokens": 930_000},
+                ],
+            },
+        }
+
+        from unittest.mock import patch
+
+        header = render_workflow_header(run, show_cost=False)
+        progress_header = render_run_progress(run, show_cost=False).splitlines()[0]
+        with patch("hermes_dynamic_workflows.view.render._format_cost", return_value="~$1.05"):
+            priced_header = render_workflow_header(run, show_cost=True)
+
+        self.assertEqual(header, "🔄 consolidate-delegation-policy · 9m 57s · ~1.86M tok")
+        self.assertEqual(progress_header, header)
+        self.assertEqual(priced_header, "🔄 consolidate-delegation-policy · 9m 57s · ~$1.05 · ~1.86M tok")
+        self.assertFalse(progress_header.startswith("✅"))
+        self.assertFalse(progress_header.startswith("❌"))
+
+    def test_terminal_task_snapshot_uses_tree_glyphs_and_has_no_result_card(self):
+        from hermes_dynamic_workflows.view.render import render_terminal_task_snapshot
+
+        run = {
+            "status": "failed",
+            "workflow": {
+                "meta": {"name": "glyph-canary"},
+                "duration_seconds": 2,
+                "totals": {"agents": 2, "done": 1, "running": 0, "errors": 1, "tokens": 0},
+                "agents": [
+                    {"id": 1, "label": "completed task", "status": "done"},
+                    {"id": 2, "label": "failed task", "status": "failed"},
+                ],
+            },
+        }
+
+        text = render_terminal_task_snapshot(run, show_cost=False)
+
+        self.assertTrue(text.startswith("🔄 glyph-canary · 2s"))
+        self.assertIn("✓ completed task", text)
+        self.assertIn("✗ failed task", text)
+        self.assertNotIn("✅", text)
+        self.assertNotIn("❌", text)
+        self.assertNotIn("**", text)
+
+    def test_failed_topology_row_uses_tree_failure_glyph(self):
+        from hermes_dynamic_workflows.view.render import render_terminal_task_snapshot
+
+        run = {
+            "status": "failed",
+            "workflow": {
+                "meta": {"name": "topology-glyph-canary"},
+                "duration_seconds": 1,
+                "totals": {"agents": 0, "done": 0, "running": 0, "errors": 1, "tokens": 0},
+                "agents": [],
+                "topologies": [{"kind": "pipeline", "status": "failed", "items": 1, "stages": 1, "agent_ids": []}],
+            },
+        }
+
+        self.assertIn("✗ pipeline", render_terminal_task_snapshot(run, show_cost=False))
+
 
 if __name__ == "__main__":
     unittest.main()

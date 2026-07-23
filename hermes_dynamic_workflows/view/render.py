@@ -118,6 +118,31 @@ def render_run_progress(run: dict[str, Any], *, max_chips: int = 8, verbose: boo
     return _render_run_block(run, max_chips=max_chips, verbose=verbose, include_ids=False, detailed=True, show_cost=show_cost)
 
 
+def render_workflow_header(run: dict[str, Any], *, show_cost: bool = True) -> str:
+    snapshot = run.get("workflow") or {}
+    meta = snapshot.get("meta") or {}
+    name = _bounded_text(
+        meta.get("name") or run.get("source", {}).get("ref") or "workflow",
+        _PROGRESS_NAME_MAX_CHARS,
+    )
+    parts: list[str] = []
+    duration = _duration(run, snapshot)
+    if duration:
+        parts.append(_format_duration(duration))
+    if show_cost:
+        cost = _format_cost(_total_cost(_all_agents(snapshot)))
+        if cost:
+            parts.append(cost)
+    tokens = _totals(snapshot).get("tokens")
+    if tokens:
+        parts.append(f"~{_format_tokens(tokens)} tok")
+    return f"🔄 {name}" + (f" · {' · '.join(parts)}" if parts else "")
+
+
+def render_terminal_task_snapshot(run: dict[str, Any], *, show_cost: bool = True) -> str:
+    return render_run_progress(run, show_cost=show_cost)
+
+
 def render_run_summary(run: dict[str, Any], *, show_cost: bool = True) -> str:
     """One-line collapsed completion head for compact run listings."""
     snapshot = run.get("workflow") or {}
@@ -297,22 +322,18 @@ def _render_run_block(
     totals = _totals(snapshot)
     agents = _all_agents(snapshot)
 
-    # Line 1: status emoji, name, elapsed, terminal status word.
-    head = f"{status_emoji(status)} {name}"
-    duration = _duration(run, snapshot)
-    if duration:
-        head += f" · {_format_duration(duration)}"
-    # Estimated dollar cost + aggregate tokens: bubble (detailed) only — keeps
-    # the /workflows overview a compact one-liner and out of the no-telemetry
-    # contract. Cost goes BEFORE tokens and is omitted when nothing is priced.
-    if detailed and show_cost:
-        cost = _format_cost(_total_cost(agents))
-        if cost:
-            head += f" · {cost}"
-    if detailed and totals.get("tokens"):
-        head += f" · ~{_format_tokens(totals['tokens'])} tok"
-    if status and status not in {"running", "queued"}:
-        head += f" · {status}"
+    # Detailed progress uses a stable identity header across active and terminal
+    # snapshots. The compact /workflows overview intentionally keeps its
+    # status-specific presentation unchanged.
+    if detailed:
+        head = render_workflow_header(run, show_cost=show_cost)
+    else:
+        head = f"{status_emoji(status)} {name}"
+        duration = _duration(run, snapshot)
+        if duration:
+            head += f" · {_format_duration(duration)}"
+        if status and status not in {"running", "queued"}:
+            head += f" · {status}"
     lines = [head]
 
     if detailed:
@@ -849,7 +870,12 @@ def status_icon(status: Any) -> str:
 
 
 def _topology_marker(status: Any) -> str:
-    return "✓" if str(status or "").lower() in {"done", "completed"} else "▶"
+    normalized = str(status or "").lower()
+    if normalized in {"failed", "error", "blocked"}:
+        return "✗"
+    if normalized in {"done", "completed"}:
+        return "✓"
+    return "▶"
 
 
 def _topology_records(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
@@ -888,6 +914,10 @@ def _topology_tree_lines(
     entries: list[str] = []
     for topology in _topology_records(snapshot):
         label = _topology_line(topology)
+        kind = str(topology.get("kind") or "").strip().lower()
+        status = str(topology.get("status") or "").strip().lower()
+        if label and kind and status in {"failed", "error", "blocked"}:
+            label = f"{kind}{label[len(kind):]}"
         if not label:
             continue
         entries.append(f"   {_topology_marker(topology.get('status'))} {label}")
