@@ -1280,18 +1280,25 @@ return await agent("do it", {
                 final = manager.wait(rec["runId"], timeout=2)
 
         self.assertEqual(final["status"], "completed")
-        # Exactly one send (the seed) — NOT a launch marker plus a completion.
-        self.assertEqual(len(adapter.sent), 1)
+        # The seed and rich result are distinct sends; the execution message is
+        # finalized with the compact terminal snapshot before the result send.
+        self.assertEqual(len(adapter.sent), 2)
         self.assertNotIn("Workflow started", adapter.sent[0][1])
-        # At least one edit, and the LAST edit is the finalize carrying the result.
+        self.assertTrue(adapter.sent[1][1].startswith("🔄 bubble"))
+        self.assertIsNone(adapter.sent[1][3])
         self.assertTrue(adapter.edited)
         final_edit = adapter.edited[-1]
         self.assertEqual(final_edit[0], "chat-1")
         self.assertEqual(final_edit[1], "msg-100")
-        self.assertTrue(final_edit[3])  # finalize=True
-        self.assertEqual(final_edit[5], [])  # clear stale active controls
-        self.assertIn("worker", final_edit[2])
+        self.assertTrue(final_edit[3])
+        self.assertEqual(final_edit[5], [])
+        self.assertTrue(final_edit[2].startswith("🔄 bubble"))
+        self.assertNotIn("**", final_edit[2])
         self.assertNotIn("Result:", final_edit[2])
+        self.assertEqual(adapter.sent[1][1].splitlines()[0], final_edit[2].splitlines()[0])
+        self.assertEqual(adapter.sent[1][1].splitlines()[1], "")
+        self.assertIn("**", adapter.sent[1][1])
+        self.assertNotIn("Result:", adapter.sent[1][1])
 
     def test_completion_edit_flood_failure_falls_back_to_fresh_send(self):
         # Regression for the verdict-never-posted bug: when the FINAL completion
@@ -1600,15 +1607,14 @@ return await agent("do it", {
                 final = manager.wait(rec["runId"], timeout=2)
 
         self.assertEqual(final["status"], "completed")
-        self.assertTrue(any(e[3] for e in adapter.edited))  # finalize edit happened
-        # Happy path + notify_on_complete=False: bubble carried the result, so
-        # NO separate completion send.
-        completion_sends = [s for s in adapter.sent if "worker" in s[1]]
+        self.assertTrue(any(e[3] for e in adapter.edited))
+        completion_sends = [s for s in adapter.sent if "**" in s[1]]
         self.assertEqual(
             len(completion_sends),
-            0,
-            f"expected no fresh send on successful finalize, got sends={adapter.sent}",
+            1,
+            f"expected one separate result send, got sends={adapter.sent}",
         )
+        self.assertNotIn("Result:", completion_sends[0][1])
 
     def test_live_progress_bubble_slow_seed_finalizes_via_callback_no_duplicate(self):
         # Regression for the slow-seed-under-flood path (review finding M1):
@@ -1716,15 +1722,15 @@ return await agent("do it", {
                 # Now the slow seed resolves -> done-callback finalizes the bubble.
                 seed_future.set_result(SimpleNamespace(success=True, message_id="msg-slow"))
 
-        # Exactly one seed send, no separate "Workflow completed" send.
-        self.assertEqual(len(adapter.sent), 1)
-        self.assertFalse(any("worker" in s[1] for s in adapter.sent))
-        # The callback delivered exactly the finalize edit carrying the result.
+        # The seed remains the only send until its callback can finalize the
+        # execution message; the separate result send follows that edit.
+        self.assertEqual(len(adapter.sent), 2)
+        self.assertTrue(any("**" in s[1] for s in adapter.sent[1:]))
         self.assertEqual(len(adapter.edited), 1)
         final_edit = adapter.edited[-1]
         self.assertEqual(final_edit[1], "msg-slow")
-        self.assertTrue(final_edit[3])  # finalize=True
-        self.assertIn("worker", final_edit[2])
+        self.assertTrue(final_edit[3])
+        self.assertNotIn("**", final_edit[2])
         self.assertNotIn("Result:", final_edit[2])
 
     def test_notify_progress_disabled_falls_back_to_markers(self):
@@ -2463,6 +2469,178 @@ return await agent("do it", {
         self.assertEqual(final["result"], "1:worker")
 
 
+class GatewayResultDeliveryTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+
+    def _gateway_result_record(self, *, status="completed"):
+        return {
+            "runId": "wf_result-delivery",
+            "taskId": "wg-result-delivery",
+            "status": status,
+            "summary": "Result delivery test",
+            "result": "stable workflow result",
+            "error": None,
+            "workflow": {
+                "meta": {"name": "result-delivery"},
+                "duration_seconds": 597.0,
+                "totals": {"agents": 2, "done": 2, "running": 0, "tokens": 1_860_000},
+            },
+            "resultMessageId": None,
+            "resultMessageDelivered": False,
+            "resultMessageError": None,
+        }
+
+    def _managed_gateway_result_fixture(self, adapter, *, status="completed"):
+        store = WorkflowStore(Path(self._tmp.name))
+        record = self._gateway_result_record(status=status)
+        store.save_run(record)
+        runner = SimpleNamespace(
+            adapters={"telegram": adapter},
+            _gateway_loop=object(),
+            _session_sources={
+                "agent:main:telegram:dm:result-chat": SimpleNamespace(
+                    platform="telegram",
+                    chat_id="result-chat",
+                    thread_id=None,
+                    message_id="source-message",
+                )
+            },
+            _thread_metadata_for_source=lambda source, reply_to_message_id=None: {
+                "reply": reply_to_message_id,
+            },
+        )
+
+        def schedule(coro, loop, **kwargs):
+            result = asyncio.run(coro)
+            future = Future()
+            future.set_result(result)
+            return future
+
+        agent_pkg = ModuleType("agent")
+        async_utils = ModuleType("agent.async_utils")
+        async_utils.safe_schedule_threadsafe = schedule
+        agent_pkg.async_utils = async_utils
+        patchers = (
+            patch("hermes_dynamic_workflows.host.gateway.gateway_runner_ref", return_value=runner),
+            patch.dict(sys.modules, {"agent": agent_pkg, "agent.async_utils": async_utils}),
+        )
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        context = {
+            "platform": "telegram",
+            "chat_id": "result-chat",
+            "session_key": "agent:main:telegram:dm:result-chat",
+            "message_id": "source-message",
+        }
+        managed = ManagedRun(
+            run_id=record["runId"],
+            stop_event=threading.Event(),
+            pause_gate=manager_module.PauseGate(),
+            record=record,
+            session_context=context,
+        )
+        managed.store = store
+        return managed, PluginConfig(notify_progress_cost=True), context, store
+
+    @staticmethod
+    def _successful_send_only_adapter(message_id):
+        class Adapter:
+            def __init__(self):
+                self.sent_count = 0
+
+            async def send(self, chat_id, content, metadata=None, buttons=None):
+                self.sent_count += 1
+                self.last = (chat_id, content, metadata, buttons)
+                return SimpleNamespace(success=True, message_id=message_id)
+
+        return Adapter()
+
+    @staticmethod
+    def _failure_then_success_send_adapter():
+        class Adapter:
+            def __init__(self):
+                self.sent_count = 0
+
+            async def send(self, chat_id, content, metadata=None, buttons=None):
+                self.sent_count += 1
+                if self.sent_count == 1:
+                    return SimpleNamespace(success=False, error="flood_control:30")
+                return SimpleNamespace(success=True, message_id="retry-result")
+
+        return Adapter()
+
+    @staticmethod
+    def _exception_then_success_send_adapter():
+        class Adapter:
+            def __init__(self):
+                self.sent_count = 0
+
+            async def send(self, chat_id, content, metadata=None, buttons=None):
+                self.sent_count += 1
+                if self.sent_count == 1:
+                    raise RuntimeError("gateway unavailable")
+                return SimpleNamespace(success=True, message_id="exception-retry-result")
+
+        return Adapter()
+
+    def test_duplicate_completion_callbacks_send_one_result(self):
+        adapter = self._successful_send_only_adapter(message_id="stable-result")
+        managed, config, context, store = self._managed_gateway_result_fixture(adapter)
+
+        self.assertTrue(manager_module._deliver_result_message(managed, config, context, block=True))
+        self.assertTrue(manager_module._deliver_result_message(managed, config, context, block=True))
+
+        self.assertEqual(adapter.sent_count, 1)
+        self.assertEqual(store.load_run(managed.run_id)["resultMessageId"], "stable-result")
+
+    def test_success_without_message_id_uses_durable_delivered_marker(self):
+        adapter = self._successful_send_only_adapter(message_id=None)
+        managed, config, context, store = self._managed_gateway_result_fixture(adapter)
+
+        self.assertTrue(manager_module._deliver_result_message(managed, config, context, block=True))
+        self.assertTrue(manager_module._deliver_result_message(managed, config, context, block=True))
+
+        persisted = store.load_run(managed.run_id)
+        self.assertIsNone(persisted["resultMessageId"])
+        self.assertTrue(persisted["resultMessageDelivered"])
+        self.assertEqual(adapter.sent_count, 1)
+
+    def test_result_send_failure_keeps_terminal_record_retryable(self):
+        adapter = self._failure_then_success_send_adapter()
+        managed, config, context, store = self._managed_gateway_result_fixture(adapter, status="failed")
+
+        self.assertFalse(manager_module._deliver_result_message(managed, config, context, block=True))
+        failed = store.load_run(managed.run_id)
+        self.assertEqual(failed["status"], "failed")
+        self.assertIsNone(failed["resultMessageId"])
+        self.assertFalse(failed["resultMessageDelivered"])
+        self.assertIsNotNone(failed["resultMessageError"])
+
+        self.assertTrue(manager_module._deliver_result_message(managed, config, context, block=True))
+        self.assertEqual(adapter.sent_count, 2)
+        self.assertEqual(store.load_run(managed.run_id)["resultMessageId"], "retry-result")
+
+    def test_result_send_exception_is_retryable(self):
+        adapter = self._exception_then_success_send_adapter()
+        managed, config, context, store = self._managed_gateway_result_fixture(adapter)
+
+        self.assertFalse(manager_module._deliver_result_message(managed, config, context, block=True))
+        self.assertIsNone(store.load_run(managed.run_id)["resultMessageId"])
+        self.assertTrue(manager_module._deliver_result_message(managed, config, context, block=True))
+        self.assertEqual(store.load_run(managed.run_id)["resultMessageId"], "exception-retry-result")
+
+    def test_result_send_does_not_pass_buttons(self):
+        adapter = self._successful_send_only_adapter(message_id="no-buttons")
+        managed, config, context, _store = self._managed_gateway_result_fixture(adapter)
+
+        self.assertTrue(manager_module._deliver_result_message(managed, config, context, block=True))
+        self.assertIsNone(adapter.last[3])
+
+
 class CompletionCardRenderTests(unittest.TestCase):
     def _blocked_review_record(self) -> dict:
         return {
@@ -2504,6 +2682,35 @@ class CompletionCardRenderTests(unittest.TestCase):
                 },
             },
         }
+
+    def test_wrapped_renderer_suppresses_metrics_and_cost_breakdown(self):
+        from hermes_dynamic_workflows.view import completion as completion_module
+
+        record = self._blocked_review_record()
+        with patch.object(completion_module, "render_run_metrics") as render_metrics, \
+                patch.object(completion_module, "render_cost_breakdown") as render_breakdown:
+            text = completion_module.render_completion_card(
+                record,
+                preview_chars=1200,
+                show_cost=True,
+                max_units=4096,
+                include_metrics=False,
+            )
+
+        render_metrics.assert_not_called()
+        render_breakdown.assert_not_called()
+        self.assertNotIn("5.04M tokens", text)
+
+    def test_default_renderer_retains_metrics_footer(self):
+        from hermes_dynamic_workflows.view import completion as completion_module
+
+        text = completion_module.render_completion_card(
+            self._blocked_review_record(),
+            preview_chars=1200,
+            show_cost=False,
+        )
+
+        self.assertIn("5.04M tokens", text)
 
     def test_block_result_drives_outcome_first_completion_card(self):
         text = manager_module._progress_bubble_text(
@@ -2900,7 +3107,31 @@ class CompletionCardRenderTests(unittest.TestCase):
         bubble = manager_module._progress_bubble_text(record, config, completed=True)
         fresh_send = manager_module._render_gateway_completion_message(record, config)
 
-        self.assertEqual(fresh_send, bubble)
+        from hermes_dynamic_workflows.view import completion as completion_module
+        from hermes_dynamic_workflows.view.render import render_workflow_header
+
+        header = render_workflow_header(record, show_cost=config.notify_progress_cost)
+        remaining = max(0, 4096 - manager_module._card_formatter_units(f"{header}\n\n"))
+        expected_body = completion_module.render_completion_card(
+            record,
+            preview_chars=config.notify_result_preview_chars,
+            show_cost=config.notify_progress_cost,
+            max_units=remaining,
+            include_metrics=False,
+        )
+        standalone = completion_module.render_completion_card(
+            record,
+            preview_chars=config.notify_result_preview_chars,
+            show_cost=config.notify_progress_cost,
+        )
+
+        self.assertNotEqual(fresh_send, bubble)
+        self.assertTrue(fresh_send.startswith("🔄 final-review-task-7"))
+        self.assertEqual(fresh_send.splitlines()[1], "")
+        self.assertEqual(fresh_send.split("\n\n", 1)[1], expected_body)
+        self.assertEqual(fresh_send.count("11m 31s"), 1)
+        self.assertEqual(fresh_send.count("~5.04M tok"), 1)
+        self.assertIn("5.04M tokens", standalone)
 
     def test_result_rows_preserve_mixed_nested_results_in_order(self):
         from hermes_dynamic_workflows.view.completion import _result_rows

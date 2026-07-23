@@ -736,8 +736,8 @@ def _card_blocks_text(blocks: list[str]) -> str:
     return "\n\n".join(block for block in blocks if block).rstrip()
 
 
-def _card_blocks_fit(blocks: list[str]) -> bool:
-    return _card_text_fits(_card_blocks_text(blocks))
+def _card_blocks_fit(blocks: list[str], max_units: int = _CARD_MAX_UNITS) -> bool:
+    return _card_text_fits(_card_blocks_text(blocks), max_units)
 
 
 def _fit_italic_card_block(
@@ -745,6 +745,7 @@ def _fit_italic_card_block(
     fixed_blocks: list[str],
     *,
     max_chars: int,
+    max_units: int = _CARD_MAX_UNITS,
     preserve_result_overflow: bool = False,
 ) -> str:
     normalized = (
@@ -759,7 +760,7 @@ def _fit_italic_card_block(
         content = normalized if len(normalized) <= limit else _truncate_utf16_text(normalized, limit)
         return f"*{_escape_markdown_content(content)}*"
 
-    if _card_blocks_fit([*fixed_blocks, candidate(len(normalized))]):
+    if _card_blocks_fit([*fixed_blocks, candidate(len(normalized))], max_units):
         return candidate(len(normalized))
 
     low, high = 1, len(normalized)
@@ -767,7 +768,7 @@ def _fit_italic_card_block(
     while low <= high:
         limit = (low + high) // 2
         rendered = candidate(limit)
-        if _card_blocks_fit([*fixed_blocks, rendered]):
+        if _card_blocks_fit([*fixed_blocks, rendered], max_units):
             best = rendered
             low = limit + 1
         else:
@@ -780,6 +781,7 @@ def _fit_escaped_card_block(
     fixed_blocks: list[str],
     *,
     max_chars: int,
+    max_units: int = _CARD_MAX_UNITS,
 ) -> str:
     normalized = str(value or "").strip()
     if not normalized:
@@ -793,7 +795,7 @@ def _fit_escaped_card_block(
     if limit <= 0:
         return ""
     rendered = candidate(limit)
-    if _card_blocks_fit([*fixed_blocks, rendered]):
+    if _card_blocks_fit([*fixed_blocks, rendered], max_units):
         return rendered
 
     low, high = 1, limit
@@ -801,7 +803,7 @@ def _fit_escaped_card_block(
     while low <= high:
         current = (low + high) // 2
         rendered = candidate(current)
-        if _card_blocks_fit([*fixed_blocks, rendered]):
+        if _card_blocks_fit([*fixed_blocks, rendered], max_units):
             best = rendered
             low = current + 1
         else:
@@ -809,11 +811,25 @@ def _fit_escaped_card_block(
     return best
 
 
-def _render_non_result_card(card: _CompletionCard, metrics: str) -> str:
+def _render_non_result_card(
+    card: _CompletionCard,
+    metrics: str,
+    *,
+    max_units: int = _CARD_MAX_UNITS,
+) -> str:
     title = _bounded_card_text(card.title, 96)
     title_block = f"**{_completion_icon(card.status)} {_escape_markdown_content(title)}**"
 
-    metric_block = _fit_italic_card_block(metrics, [title_block], max_chars=1200) if metrics else ""
+    metric_block = (
+        _fit_italic_card_block(
+            metrics,
+            [title_block],
+            max_chars=1200,
+            max_units=max_units,
+        )
+        if metrics
+        else ""
+    )
     suffix = [metric_block] if metric_block else []
     selected = [title_block]
 
@@ -822,6 +838,7 @@ def _render_non_result_card(card: _CompletionCard, metrics: str) -> str:
             card.summary,
             [*selected, *suffix],
             max_chars=1200,
+            max_units=max_units,
             preserve_result_overflow=True,
         )
         if summary:
@@ -839,7 +856,7 @@ def _render_non_result_card(card: _CompletionCard, metrics: str) -> str:
                 f"**{_escape_markdown_content(details_title)}**",
                 *(f"• {_escape_markdown_content(value)}" for value in findings[:count]),
             ])
-            if _card_blocks_fit([*selected, findings_block, *suffix]):
+            if _card_blocks_fit([*selected, findings_block, *suffix], max_units):
                 selected.append(findings_block)
                 break
 
@@ -850,7 +867,7 @@ def _render_non_result_card(card: _CompletionCard, metrics: str) -> str:
                 "**Required action**",
                 _result_action_line(action),
             ])
-            if _card_blocks_fit([*selected, action_block, *suffix]):
+            if _card_blocks_fit([*selected, action_block, *suffix], max_units):
                 selected.append(action_block)
             else:
                 for limit in range(len(action) - 1, 0, -1):
@@ -859,7 +876,7 @@ def _render_non_result_card(card: _CompletionCard, metrics: str) -> str:
                         "**Required action**",
                         _result_action_line(shortened),
                     ])
-                    if _card_blocks_fit([*selected, action_block, *suffix]):
+                    if _card_blocks_fit([*selected, action_block, *suffix], max_units):
                         selected.append(action_block)
                         break
 
@@ -868,12 +885,13 @@ def _render_non_result_card(card: _CompletionCard, metrics: str) -> str:
             card.fallback,
             [*selected, *suffix],
             max_chars=1800,
+            max_units=max_units,
         )
         if fallback:
             selected.append(fallback)
 
     base_blocks = [*selected, *suffix]
-    if not _card_blocks_fit(base_blocks):
+    if not _card_blocks_fit(base_blocks, max_units):
         # The title and the generated metric block are complete trusted blocks;
         # never repair an over-budget card by slicing through their delimiters.
         base_blocks = [title_block, *suffix]
@@ -885,7 +903,10 @@ def render_completion_card(
     *,
     preview_chars: int,
     show_cost: bool,
+    max_units: int = _CARD_MAX_UNITS,
+    include_metrics: bool = True,
 ) -> str:
+    max_units = max(0, int(max_units))
     card = _build_completion_card(record, preview_chars)
     lines = [
         f"**{_completion_icon(card.status)} "
@@ -902,7 +923,7 @@ def render_completion_card(
             "**Required action**",
             _result_action_line(card.next_action),
         ])
-    metrics = render_run_metrics(record, show_cost=show_cost)
+    metrics = render_run_metrics(record, show_cost=show_cost) if include_metrics else ""
     if card.result_rows is not None:
         if card.fallback:
             lines.extend(["", _escape_fallback_content(card.fallback)])
@@ -910,7 +931,7 @@ def render_completion_card(
         prefix = "\n".join(lines).rstrip()
         fixed_blocks = [prefix, metrics_text] if metrics_text else [prefix]
         fixed_units = _card_formatter_units(_card_blocks_text(fixed_blocks))
-        result_budget = max(0, _CARD_MAX_UNITS - fixed_units - 2)
+        result_budget = max(0, max_units - fixed_units - 2)
         result_text = _render_result_rows(card.result_rows, max_units=result_budget)
         base_blocks = [prefix]
         if result_text:
@@ -918,23 +939,23 @@ def render_completion_card(
         if metrics_text:
             base_blocks.append(metrics_text)
         base = _card_blocks_text(base_blocks)
-        if show_cost:
-            remaining = max(0, 4096 - _utf16_units(base) - 2)
+        if include_metrics and show_cost:
+            remaining = max(0, max_units - _card_formatter_units(base) - 2)
             breakdown = render_cost_breakdown(record, char_budget=remaining)
             if breakdown:
                 escaped_breakdown = _escape_markdown_content(breakdown)
                 candidate = f"{base}\n\n{escaped_breakdown}"
-                if _card_text_fits(candidate):
+                if _card_text_fits(candidate, max_units):
                     return candidate
         return base
 
-    base = _render_non_result_card(card, metrics)
-    if show_cost:
-        remaining = max(0, _CARD_MAX_UNITS - _card_formatter_units(base) - 2)
+    base = _render_non_result_card(card, metrics, max_units=max_units)
+    if include_metrics and show_cost:
+        remaining = max(0, max_units - _card_formatter_units(base) - 2)
         breakdown = render_cost_breakdown(record, char_budget=remaining)
         if breakdown:
             escaped_breakdown = _escape_markdown_content(breakdown)
             candidate = f"{base}\n\n{escaped_breakdown}"
-            if _card_blocks_fit([base, escaped_breakdown]):
+            if _card_blocks_fit([base, escaped_breakdown], max_units):
                 return candidate
     return base
