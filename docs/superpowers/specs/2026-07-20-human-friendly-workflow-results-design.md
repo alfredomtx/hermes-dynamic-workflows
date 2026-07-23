@@ -15,7 +15,7 @@ Also prevent clarification responses from referring to choices that appeared onl
 - A visible row for every top-level subtask result while the Telegram card fits.
 - An explicit overflow count linked conceptually to the persisted report when compact index rows exceed the card limit.
 - Bounded summaries that respect Telegram's UTF-16 4096-character limit.
-- One metrics line for duration, agent count, estimated cost, and tokens.
+- One metrics presentation per complete Telegram message: standalone/default completion cards retain their existing metrics footer and optional cost-breakdown behavior, while a wrapped result message uses its stable workflow header as the sole source of duration, cost, and token metrics.
 - Removal of terminal workflow Rerun buttons.
 - Regression coverage for self-contained final clarification responses.
 
@@ -95,7 +95,7 @@ Delivery rules:
 
 - Finalize the original execution message before sending the result message.
 - The terminal execution message contains the completed task tree and no result body.
-- The new result message repeats the exact current workflow header as its first line, then a blank line, then the rich result card.
+- The new result message repeats the exact current workflow header as its first line, then a blank line, then the rich result card rendered without its internal metrics footer or cost breakdown; the header is the sole metrics line in that result message.
 - Store or reuse enough run metadata to render the same workflow name, duration, cost, and token totals in both headers.
 - Result-send failure must not roll the execution message back to a running state. Report/send fallback errors through existing delivery protection while preserving the terminal snapshot.
 - A completion retry must not create duplicate result messages after a successful send; persist the result message ID or an equivalent idempotency marker.
@@ -104,7 +104,12 @@ Delivery rules:
 
 Use a hybrid summary-index plus detail layout. Telegram has no reliable native Markdown-table rendering, so the compact index uses a monospace block for stable narrow columns. Rich result sections remain outside the code block so bold, italic, inline-code, and bullet formatting still render.
 
-Normal generic completion shape:
+Completion cards have two rendering modes:
+
+- **Standalone/default card:** `render_completion_card(..., include_metrics=True)` preserves the existing metrics footer and optional cost-breakdown behavior for compatibility.
+- **Wrapped result card:** the gateway prepends the stable workflow header and calls `render_completion_card(..., include_metrics=False)`. The card keeps its rich content and budget behavior, but emits neither the internal metrics footer nor the cost breakdown; the header is the sole source of duration, cost, and token metrics.
+
+Standalone/default generic completion shape (compatibility):
 
 ````text
 **⚠️ Workflow needs attention**
@@ -144,10 +149,10 @@ Rules:
 - Missing results get an index row and detail heading but no invented summary.
 - Warning, failed, blocked, and missing details receive budget before successful details. Within each priority class, preserve original result order and retain original ordinal labels.
 - Show explicit findings as bullets and required action as its own labeled section.
-- Render metrics once at the bottom.
+- In standalone/default cards, retain the existing metrics footer at the bottom and preserve the optional cost breakdown. In a wrapped result card, suppress both the internal metrics footer and cost breakdown; the stable header is the first and only metrics line.
 - Do not use pipe tables, HTML tables, or wide columns; Telegram mobile rendering is not stable enough.
 - Do not emit raw JSON punctuation as the normal user-facing representation.
-- Do not repeat a separate cost section when the metrics line already carries cost unless per-subtask cost data is intentionally rendered and fits the character budget.
+- Do not repeat a separate cost section in a wrapped result card: `include_metrics=False` suppresses `render_cost_breakdown` as well as `render_run_metrics`. Standalone/default cards retain their existing optional per-subtask cost behavior for compatibility.
 
 ## Length Budget
 
@@ -155,12 +160,12 @@ Telegram counts UTF-16 code units and limits text messages to 4096 units. Comple
 
 Budget policy:
 
-1. Reserve space for bold title, italic aggregate metadata, compact index, overflow marker, and italic metrics.
+1. In standalone/default mode, reserve space for bold title, italic aggregate metadata, compact index, overflow marker, italic metrics, and any optional cost breakdown. In wrapped-result mode, the caller reserves the stable header outside the card budget; the card reserves no internal metrics or cost-breakdown block.
 2. Keep as many ordered index rows as fit; if all index rows cannot fit, append `_… N more results in stored report_`.
 3. Allocate remaining detail budget to warning, failed, blocked, and missing sections first, then successful and unknown sections.
 4. Within each priority class, preserve original result order and display the original ordinal in every detail heading.
 5. Give each visible returned result one bounded summary line before allocating extra findings or action text.
-6. Truncate detail text before index rows, overflow marker, or metrics.
+6. Truncate detail text before index rows, overflow marker, or the metrics/footer block when that block is enabled.
 7. Escape or sanitize model-provided Markdown control characters so result content cannot break the renderer's own formatting.
 8. Apply a final UTF-16 fit guard as defense in depth.
 
@@ -218,7 +223,7 @@ Extend the completion view with pure helpers that:
 - summarize strings and structured values cautiously;
 - calculate aggregate returned/missing counts;
 - allocate the Telegram character budget across all rows;
-- render one metrics line.
+- render the default metrics footer when enabled; wrapped result delivery disables that footer and its cost breakdown so the stable header owns the metrics.
 
 Keep normalization separate from string rendering so tests can verify semantic decisions without asserting entire formatted messages.
 
@@ -264,9 +269,10 @@ Test:
 - malformed presentation falls back safely;
 - quoted or negated verdict words do not alter task outcome;
 - raw JSON syntax absent from normal cards;
-- metrics rendered exactly once;
+- standalone/default `render_completion_card` retains its existing metrics footer and cost-breakdown behavior;
+- wrapped result delivery renders duration, cost, and token segments exactly once, all in the first stable header, with no internal metrics footer or cost breakdown in the card body;
 - long inputs remain within 4096 UTF-16 units;
-- truncation removes detail sections before compact index rows, overflow marker, or metrics.
+- truncation removes detail sections before compact index rows, overflow marker, or the metrics/footer block when enabled.
 
 ### Delivery and controls
 
@@ -275,7 +281,7 @@ Test:
 - active execution message keeps the stable `🔄` workflow header;
 - completion first edits the original execution message into a terminal task-tree snapshot;
 - completion then sends a distinct result message rather than editing result content into the execution message;
-- result message repeats the exact workflow header before the rich card;
+- result message repeats the exact workflow header before the rich card, and the header is the sole source of its duration/cost/token metrics;
 - successful execution rows use `✓` and failed rows use `✗`;
 - task-tree rows do not use `✅` or `❌`;
 - no Telegram state contains a Restart button;
@@ -303,7 +309,7 @@ After implementation and focused tests:
 1. Restart the gateway because plugin code is loaded by the gateway process.
 2. Run a generic workflow canary that returns mixed strings, a dictionary, and null.
 3. Confirm the original Telegram execution message remains as a terminal task-tree snapshot with the stable `🔄` header, `✓` / `✗` task glyphs, optional Open log, and no Restart/Rerun/stale active controls.
-4. Confirm a separate result message appears with the same stable workflow header, rich result card, one metrics line, no raw JSON dump, and no buttons.
+4. Confirm a separate result message appears with the same stable workflow header first, rich result card, and no internal metrics footer or cost breakdown. Count each duration, cost, and token segment exactly once in the whole result message; the header must be the sole source. Confirm no raw JSON dump and no buttons.
 5. Run an overflow canary and confirm the execution snapshot and separate bounded result message both remain available.
 6. Confirm one post-change gateway process is serving.
 7. Send a clarification canary with choices and confirm the final Telegram message is self-contained.
@@ -315,9 +321,10 @@ After implementation and focused tests:
 - Missing values are shown honestly without invented failure semantics.
 - Explicit presentation envelopes remain authoritative.
 - Full machine-readable output remains persisted.
-- Telegram card uses the approved hybrid hierarchy: bold title/labels, italic metadata/summaries/metrics, compact monospace result index, and rich detail sections.
+- Standalone/default Telegram cards use the approved hybrid hierarchy: bold title/labels, italic metadata/summaries/metrics, compact monospace result index, and rich detail sections.
 - Every returned result gets one bounded summary line while detail budget permits; exception details receive priority.
-- Telegram card contains one metrics line and no default raw JSON dump.
+- Standalone/default completion-card rendering retains its existing metrics footer and optional cost breakdown, with no default raw JSON dump.
+- Separate result messages use the stable `🔄 workflow · duration · cost · tokens` header as their sole metrics line: duration, cost, and token segments each occur exactly once, and the wrapped card contains neither an internal metrics footer nor a cost breakdown.
 - Original execution message remains visible as a terminal task-tree snapshot; result content arrives in a separate message.
 - Both execution and result messages begin with the same stable `🔄` workflow header.
 - Workflow task trees use `✓` for completed and `✗` for failed rows, not check/X emoji.

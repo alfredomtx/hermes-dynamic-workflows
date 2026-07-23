@@ -18,7 +18,7 @@
 - Keep one bounded summary line for each visible returned result while detail budget permits; give exception sections priority for additional findings and actions.
 - Keep final Telegram content within 4096 UTF-16 units.
 - Preserve complete machine-readable workflow output.
-- Render metrics once.
+- Preserve the existing standalone/default completion-card metrics footer and optional cost-breakdown behavior; for a wrapped result message, render duration/cost/token metrics exactly once in the stable header and suppress the card's internal metrics and cost breakdown.
 - Compose Markdown from trusted static delimiters only; escape model- and workflow-provided content before inserting it, and never sanitize the composed Markdown as plain text.
 - Remove Telegram Restart and terminal Rerun buttons from every workflow message; preserve active Pause, Resume, Stop, and valid Open log URL.
 - Commentary is progress-only; final clarification responses contain the complete question and every referenced option.
@@ -218,7 +218,7 @@ git commit -m "feat: normalize generic workflow results"
 
 **Interfaces:**
 - Consumes: `_result_rows(result) -> tuple[_ResultRow, ...]`, `_fit_utf16(text, max_units=4096) -> str`, `render_run_metrics()`.
-- Produces: `_render_result_rows(rows: tuple[_ResultRow, ...], *, max_units: int) -> str` and updated `render_completion_card(...) -> str`.
+- Produces: `_render_result_rows(rows: tuple[_ResultRow, ...], *, max_units: int) -> str` and `render_completion_card(record: dict[str, Any], *, preview_chars: int, show_cost: bool, max_units: int = 4096, include_metrics: bool = True) -> str`.
 
 - [ ] **Step 1: Write failing card tests**
 
@@ -254,7 +254,7 @@ def test_oversized_result_set_keeps_one_card_and_reports_overflow(self):
     self.assertIn("Result 0", text)
 ```
 
-Also assert all five item titles appear in original order in the structural output, details truncate before structural rows, findings/required action render, and metrics appear exactly once. These are semantic and budget assertions; Task 6 replaces the baseline plain-text shape with the approved hybrid Markdown hierarchy and updates exact formatting assertions.
+Also assert all five item titles appear in original order in the structural output, details truncate before structural rows, findings/required action render, and the standalone/default metrics footer appears exactly once. These are semantic and budget assertions; Task 6 replaces the baseline plain-text shape with the approved hybrid Markdown hierarchy and updates exact formatting assertions.
 
 - [ ] **Step 2: Run tests and verify RED**
 
@@ -278,7 +278,7 @@ def _utf16_units(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 ```
 
-Route generic list and nested `results` values through this path in `_build_completion_card()`/`render_completion_card()`. Keep explicit valid `presentation`, review aggregation, transport errors, and intentional stop behavior unchanged. Render `render_run_metrics()` once after result rows. Keep `render_cost_breakdown()` only when it adds per-subtask priced-agent information; do not duplicate the same total metrics line.
+Route generic list and nested `results` values through this path in `_build_completion_card()`/`render_completion_card()`. Keep explicit valid `presentation`, review aggregation, transport errors, and intentional stop behavior unchanged. With the default `include_metrics=True`, render `render_run_metrics()` once after result rows and preserve `render_cost_breakdown()` only when it adds per-subtask priced-agent information; do not duplicate the same total metrics line.
 
 - [ ] **Step 4: Run focused tests and verify GREEN**
 
@@ -542,11 +542,11 @@ return {
 }
 ```
 
-Verify Telegram shows the approved two-message delivery: the original execution message is a terminal task-tree snapshot, while the separate result card has a bold warning title, italic aggregate metadata, one fenced compact index with three ordered rows, titled detail sections, exactly one italic summary for the successful first result, exception findings/action hierarchy, one italic metrics line, no raw JSON dump, no Telegram Restart/Rerun button, and no stale active controls.
+Verify Telegram shows the approved two-message delivery: the original execution message is a terminal task-tree snapshot, while the separate result begins with the stable workflow header and uses that header as the sole source of duration/cost/token metrics. Its card body has a bold warning title, italic aggregate metadata, one fenced compact index with three ordered rows, titled detail sections, exactly one italic summary for the successful first result, exception findings/action hierarchy, no internal metrics footer or cost breakdown, no raw JSON dump, no Telegram Restart/Rerun button, and no stale active controls.
 
 - [ ] **Step 6: Run overflow canary**
 
-Render or run enough long results to exceed the compact-index budget. Verify the separate result card has an aligned index prefix, an italic `… N more results in stored report` marker before italic metrics, exception detail priority, raw and post-formatter lengths within 4096 UTF-16 units, while the terminal execution snapshot remains a distinct task-tree message and persisted full output contains every returned result.
+Render or run enough long results to exceed the compact-index budget. Verify the separate result card has an aligned index prefix and an italic `… N more results in stored report` marker before its detail content, while the stable header remains the sole duration/cost/token metrics line outside the card. Verify exception detail priority, raw and post-formatter lengths within 4096 UTF-16 units, the terminal execution snapshot remains a distinct task-tree message, and persisted full output contains every returned result.
 
 - [ ] **Step 7: Run clarification canary**
 
@@ -565,7 +565,7 @@ Parent reviews both final diffs and test evidence. Commit/push each repository t
 - Test: `tests/test_run_manager.py::CompletionCardRenderTests`
 
 **Interfaces:**
-- Consumes: `_ResultRow`, `_result_row_marker(row: _ResultRow) -> str`, `_utf16_units()`, `_fit_utf16()`, `render_run_metrics()`.
+- Consumes: `_ResultRow`, `_result_row_marker(row: _ResultRow) -> str`, `_utf16_units()`, `_fit_utf16()`, and the default `render_run_metrics()` path.
 - Produces: `_escape_markdown_content(text: str) -> str`, `_inline_code_content(text: str) -> str`, `_result_index(rows: tuple[_ResultRow, ...], *, max_units: int) -> tuple[str, int]`, and updated `_render_result_rows()` / `render_completion_card()` output.
 - Trusted renderer Markdown is composed only from static delimiters. Every model-provided title, summary, finding, action, metric fragment, and workflow name passes through `_escape_markdown_content()` or `_inline_code_content()` before entering trusted formatting. `_sanitize_text()` remains only for plain/raw fallback content; never apply it to a composed card because it inserts zero-width characters into trusted fences and emphasis. The real Telegram adapter remains the final MarkdownV2 conversion boundary.
 
@@ -779,7 +779,7 @@ prefix = f"**{_completion_icon(card.status)} {_escape_markdown_content(card.titl
 metrics_text = f"*{_escape_markdown_content(metrics)}*" if metrics else ""
 ```
 
-Existing explicit presentation/review branches also receive bold title/labels, italic summaries/metrics, escaped findings, and inline-code required action when safe. Preserve plain/raw fallback delivery if semantic normalization fails, preserve the one metrics line, and do not duplicate total cost when `render_cost_breakdown()` has no per-subtask priced-agent data.
+Existing explicit presentation/review branches also receive bold title/labels, italic summaries/metrics, escaped findings, and inline-code required action when safe. Preserve plain/raw fallback delivery if semantic normalization fails. The default `include_metrics=True` path keeps the existing metrics footer and optional cost-breakdown behavior; the wrapped-result path added in Task 9 passes `include_metrics=False` and emits neither metrics nor cost breakdown from the card.
 
 - [ ] **Step 7: Run focused and full suites**
 
@@ -893,7 +893,7 @@ Restart from a separate controlling shell with `hermes gateway restart` followed
 
 - [ ] **Step 3: Run live mixed-result canary**
 
-Verify the two-message edited completion delivery, not only a direct helper call: the terminal execution edit has only the stable task-tree snapshot and optional Open log, the separate result has the bold warning title, italic aggregate metadata, aligned fenced compact index, bold result headings, exactly one italic success summary, exception findings/action hierarchy, italic metrics exactly once, no raw Markdown punctuation or raw JSON, no Telegram Restart/Rerun button, and the result send has no buttons.
+- Verify the two-message edited completion delivery, not only a direct helper call: the terminal execution edit has only the stable task-tree snapshot and optional Open log, the separate result starts with the stable workflow header, each duration/cost/token segment occurs exactly once in that header, the card has the bold warning title, italic aggregate metadata, aligned fenced compact index, bold result headings, exactly one italic success summary, exception findings/action hierarchy, no internal metrics footer or cost breakdown, no raw Markdown punctuation or raw JSON, no Telegram Restart/Rerun button, and the result send has no buttons.
 
 - [ ] **Step 4: Run live overflow canary**
 
@@ -1068,7 +1068,7 @@ git commit -m "feat: add stable workflow task headers"
 
 **Files:**
 - Modify: `hermes_dynamic_workflows/run/manager.py:70-106,235-286,842-877,1525-1628,1719-1771,1925-2143,2263-2269`
-- Modify: `hermes_dynamic_workflows/view/completion.py:712-940` only to thread an optional `max_units: int = 4096` budget through the existing card renderer; the default renderer and its rich hierarchy remain unchanged.
+- Modify: `hermes_dynamic_workflows/view/completion.py:712-940` to add `max_units: int = 4096` and `include_metrics: bool = True` to `render_completion_card`; default rendering and its rich hierarchy remain unchanged.
 - Test: `tests/test_run_manager.py` existing gateway progress tests around lines 1189-1819, plus new send/idempotency tests
 
 **Interfaces:**
@@ -1078,7 +1078,7 @@ git commit -m "feat: add stable workflow task headers"
 - Adds `_deliver_result_message(managed, config, session_context, *, block: bool) -> bool`. It reserves the send under `managed.lock`, releases the lock before scheduling or waiting on the adapter, writes `resultMessageId` or `resultMessageDelivered` only after confirmed success, and clears the reservation on failure so a later completion callback can retry.
 - Changes `_edit_progress_bubble(..., completed=True)` to render only `render_terminal_task_snapshot`; it never receives or emits `render_completion_card` output. A nonblocking final edit callback invokes `_deliver_result_message(..., block=False)` only after the edit future resolves, while the worker-thread path uses `block=True` outside any managed lock.
 - Replaces `_send_gateway_completion_notification(...)` with a thin compatibility wrapper around `_deliver_result_message(..., block=True)` or removes its only call site; no completion path may call `_send_gateway_text` directly for the result card. `_notify_completion` and the slow-seed callback both go through the idempotent helper.
-- Changes `_render_gateway_completion_message` to import and use `render_workflow_header` plus the existing `_card_formatter_units` budget helper, returning `render_workflow_header(record) + "\\n\\n" + render_completion_card(...)`; the existing card renderer receives only the remaining budget so the combined source and adapter-formatted message remains within 4096 UTF-16 units.
+- Changes `_render_gateway_completion_message` to import and use `render_workflow_header` plus the existing `_card_formatter_units` budget helper, returning `render_workflow_header(record) + "\\n\\n" + render_completion_card(..., max_units=remaining, include_metrics=False)`; the card receives only the remaining budget, keeps all rich content/budget behavior, and emits neither `render_run_metrics` nor `render_cost_breakdown`, so the combined source and adapter-formatted message remains within 4096 UTF-16 units.
 
 - [ ] **Step 1: Write failing delivery, persistence, and failure-path tests**
 
@@ -1097,8 +1097,8 @@ def test_terminal_edit_precedes_distinct_result_send_and_persists_message_id(sel
             events.append(("edit", content, buttons, finalize))
             return SimpleNamespace(success=True, message_id=message_id)
 
-    # Use the existing gateway-run harness and wait for the terminal record.
-    final, store = self._run_gateway_fixture(Adapter(), notify_progress=True)
+    # Use the existing gateway-run harness with notify_progress_cost=True and wait for the terminal record.
+    final, store = self._run_gateway_fixture(Adapter(), notify_progress=True, notify_progress_cost=True)
 
     self.assertEqual(final["status"], "completed")
     self.assertEqual([event[0] for event in events], ["send", "edit", "send"])
@@ -1115,6 +1115,12 @@ def test_terminal_edit_precedes_distinct_result_send_and_persists_message_id(sel
     self.assertEqual(result_lines[1], "")
     self.assertIn("**", result[1])
     self.assertIsNone(result[2])
+    header = result_lines[0]
+    card_body = "\n".join(result_lines[2:])
+    for segment in ("9m 57s", "~$1.05", "~1.86M tok"):
+        self.assertEqual(header.count(segment), 1)
+        self.assertEqual(result[1].count(segment), 1)
+        self.assertNotIn(segment, card_body)
     persisted = store.load_run(final["runId"])
     self.assertEqual(persisted["resultMessageId"], "result-3")
     self.assertTrue(persisted["resultMessageDelivered"] is False)
@@ -1197,7 +1203,42 @@ def test_result_send_exception_is_retryable(self):
     self.assertEqual(store.load_run(managed.run_id)["resultMessageId"], "exception-retry-result")
 ```
 
-Define the adapter fixtures as test-only helpers in `tests/test_run_manager.py`: `_successful_send_only_adapter(message_id)` records sends and returns `SimpleNamespace(success=True, message_id=message_id)`; `_failure_then_success_send_adapter()` returns `SimpleNamespace(success=False, error="flood_control:30")` once and then `SimpleNamespace(success=True, message_id="retry-result")`; `_exception_then_success_send_adapter()` raises `RuntimeError("gateway unavailable")` once and then returns `SimpleNamespace(success=True, message_id="exception-retry-result")`; `_send_only_adapter_without_message_id()` exposes `async def send(...)`, no `edit_message`, and returns `SimpleNamespace(success=True)`; `_terminal_edit_failure_adapter()` returns `SimpleNamespace(success=False, error="flood_control:30")` only for `finalize=True` and a successful result for the result send. `_managed_gateway_result_fixture` must create a temporary `WorkflowStore`, save a terminal record with the three result-delivery fields, construct `ManagedRun(..., store=store)`, install the existing fake gateway runner/synchronous `safe_schedule_threadsafe` from the surrounding tests, and return `(managed, PluginConfig(...), session_context, store)`. `_run_gateway_fixture(adapter, notify_progress)` must reuse the existing `WorkflowRunManager.start_from_params` harness in the neighboring gateway tests, pass the supplied adapter and `notify_progress`, wait for the run, and return `(final_record, store)`.
+Define the adapter fixtures as test-only helpers in `tests/test_run_manager.py`: `_successful_send_only_adapter(message_id)` records sends and returns `SimpleNamespace(success=True, message_id=message_id)`; `_failure_then_success_send_adapter()` returns `SimpleNamespace(success=False, error="flood_control:30")` once and then `SimpleNamespace(success=True, message_id="retry-result")`; `_exception_then_success_send_adapter()` raises `RuntimeError("gateway unavailable")` once and then returns `SimpleNamespace(success=True, message_id="exception-retry-result")`; `_send_only_adapter_without_message_id()` exposes `async def send(...)`, no `edit_message`, and returns `SimpleNamespace(success=True)`; `_terminal_edit_failure_adapter()` returns `SimpleNamespace(success=False, error="flood_control:30")` only for `finalize=True` and a successful result for the result send. `_managed_gateway_result_fixture` must create a temporary `WorkflowStore`, save a terminal record with the three result-delivery fields, construct `ManagedRun(..., store=store)`, install the existing fake gateway runner/synchronous `safe_schedule_threadsafe` from the surrounding tests, and return `(managed, PluginConfig(...), session_context, store)`. `_run_gateway_fixture(adapter, notify_progress, notify_progress_cost)` must reuse the existing `WorkflowRunManager.start_from_params` harness in the neighboring gateway tests, pass the supplied adapter, progress flags, and cost-display setting, wait for the run, and return `(final_record, store)`.
+
+Add these renderer-level assertions to `CompletionCardRenderTests` so the wrapper contract is independent of gateway delivery:
+
+```python
+def test_wrapped_renderer_suppresses_metrics_and_cost_breakdown(self):
+    from unittest.mock import patch
+    from hermes_dynamic_workflows.view import completion as completion_module
+
+    record = self._blocked_review_record()
+    with patch.object(completion_module, "render_run_metrics") as render_metrics, \
+            patch.object(completion_module, "render_cost_breakdown") as render_breakdown:
+        text = completion_module.render_completion_card(
+            record,
+            preview_chars=1200,
+            show_cost=True,
+            max_units=4096,
+            include_metrics=False,
+        )
+
+    render_metrics.assert_not_called()
+    render_breakdown.assert_not_called()
+    self.assertNotIn("5.04M tokens", text)
+
+
+def test_default_renderer_retains_metrics_footer(self):
+    from hermes_dynamic_workflows.view import completion as completion_module
+
+    text = completion_module.render_completion_card(
+        self._blocked_review_record(),
+        preview_chars=1200,
+        show_cost=False,
+    )
+
+    self.assertIn("5.04M tokens", text)
+```
 
 - [ ] **Step 2: Run the delivery tests and verify RED**
 
@@ -1300,22 +1341,39 @@ Update `_send_gateway_text` so it returns `_GatewaySendAttempt`: resolve the tar
 
 Change `_edit_progress_bubble` to select `render_terminal_task_snapshot(managed.record, show_cost=config.notify_progress_cost)` when `completed=True`; keep `_progress_bubble_text(..., completed=True)` for rich result-card tests. Do not set `resultMessageId` from an edit. Pass `buttons=[]` on the terminal edit even when `_control_buttons_for` returns `None`, so stale Pause/Resume/Stop/Restart keyboards are cleared; when a valid log URL exists, Task 10 will make the terminal edit retain only that Open log row.
 
-Make the existing `render_completion_card` accept `max_units: int = 4096` and thread that value through its existing `_card_text_fits`, `_card_blocks_fit`, result-budget, metrics, and cost-breakdown checks. The default remains 4096 and all Task 6 card assertions remain unchanged. Render the separate message as:
+Make the existing helper use this exact signature:
+
+```text
+def render_completion_card(
+    record: dict[str, Any],
+    *,
+    preview_chars: int,
+    show_cost: bool,
+    max_units: int = 4096,
+    include_metrics: bool = True,
+) -> str:
+```
+
+Thread `max_units` through its existing `_card_text_fits`, `_card_blocks_fit`, result-budget, metrics, and cost-breakdown checks. When `include_metrics=False`, do not call or append `render_run_metrics` or `render_cost_breakdown`; preserve all rich content and budget behavior. The default `include_metrics=True` and `max_units=4096` retain the existing footer/cost-breakdown behavior and all Task 6 `CompletionCardRenderTests` assertions.
+
+Render the separate message as:
 
 ```python
 def _render_gateway_completion_message(record: dict[str, Any], config: PluginConfig) -> str:
     header = render_workflow_header(record, show_cost=config.notify_progress_cost)
     header_units = _card_formatter_units(f"{header}\n\n")
+    remaining = max(0, 4096 - header_units)
     card = render_completion_card(
         record,
         preview_chars=config.notify_result_preview_chars,
         show_cost=config.notify_progress_cost,
-        max_units=max(0, 4096 - header_units),
+        max_units=remaining,
+        include_metrics=False,
     )
     return f"{header}\n\n{card}" if card else header
 ```
 
-The result send calls `_send_gateway_text` without a `buttons` argument. Thus the original execution edit owns the optional Open log button and the result message has no keyboard. The stable header helper is the only source of the first line in both messages.
+The result send calls `_send_gateway_text` without a `buttons` argument. Thus the original execution edit owns the optional Open log button and the result message has no keyboard. The stable header helper is the only source of the first line and of duration/cost/token metrics in the result message; the card body has no internal metrics footer or cost breakdown.
 
 - [ ] **Step 5: Rework completion ordering, slow-seed callbacks, and retry behavior**
 
@@ -1348,7 +1406,7 @@ env -i HOME="$HOME" PATH="/Users/atorres/.hermes/hermes-agent/venv/bin:/usr/bin:
   tests/test_run_manager.py::CompletionCardRenderTests -q -o 'addopts='
 ```
 
-Expected: PASS. Confirm the same workflow header is byte-for-byte identical in the terminal edit and result send, the result body retains the existing rich-card formatting, both raw and adapter-formatted result messages fit the combined 4096 UTF-16 budget, and the stored full result remains unchanged.
+Expected: PASS. Confirm the same workflow header is byte-for-byte identical in the terminal edit and result send; each duration/cost/token segment occurs exactly once in the complete result message and only in its first header line; the result body retains the existing rich-card formatting without an internal metrics footer or cost breakdown; the default `CompletionCardRenderTests` still retain their footer; both raw and adapter-formatted result messages fit the combined 4096 UTF-16 budget; and the stored full result remains unchanged.
 
 - [ ] **Step 7: Commit Task 9**
 
@@ -1468,7 +1526,7 @@ hermes gateway status
 pgrep -af 'hermes_cli.main gateway run'
 ```
 
-Run a mixed-result workflow returning a string, `None`, and a failed dictionary. Read back both messages: the original execution message starts with the stable `🔄` header, ends as a task tree with `✓`/`✗`, has no rich result body, and retains only optional Open log; the separate result begins with the byte-identical header, has a blank line, contains the existing rich card and exactly one metrics line, and has no buttons. Run a 100-item overflow workflow and verify both messages remain available, each stays within the adapter’s 4096 UTF-16 limit, and the persisted artifact retains every item. Run the clarification canary from Task 5 and verify the final question includes every choice without relying on commentary.
+Run a mixed-result workflow returning a string, `None`, and a failed dictionary. Read back both messages: the original execution message starts with the stable `🔄` header, ends as a task tree with `✓`/`✗`, has no rich result body, and retains only optional Open log; the separate result begins with the byte-identical header, has a blank line, contains the existing rich card with no internal metrics footer or cost breakdown, and has each duration/cost/token segment exactly once in the header and nowhere in the card body. Verify the result has no buttons. Run a 100-item overflow workflow and verify both messages remain available, each stays within the adapter’s 4096 UTF-16 limit, and the persisted artifact retains every item. Run the clarification canary from Task 5 and verify the final question includes every choice without relying on commentary.
 
 - [ ] **Step 6: Commit Task 10**
 
@@ -1480,7 +1538,7 @@ git commit -m "fix: remove Telegram workflow restart button"
 
 ## Follow-up plan self-review
 
-- [ ] **Spec coverage:** Telegram Message Lifecycle is covered by Tasks 8–9; Task Markers by Task 8; Telegram Controls by Task 10; Delivery and controls by Tasks 9–10; the 4096 rich-card budget by Task 6 plus Task 9’s preserved default and combined-message budget; no-core/no-dependency scope by the follow-up constraints; adapter id/no-id/failure behavior by Task 9; and live canaries by Task 10 Step 5.
+- [ ] **Spec coverage:** Telegram Message Lifecycle is covered by Tasks 8–9; Task Markers by Task 8; Telegram Controls by Task 10; Delivery and controls by Tasks 9–10; standalone/default metrics-footer and cost-breakdown compatibility by Tasks 2, 6, and 9; wrapped-result header-only duration/cost/token metrics and the combined 4096 rich-card budget by Task 9; no-core/no-dependency scope by the follow-up constraints; adapter id/no-id/failure behavior by Task 9; and live canaries by Task 10 Step 5.
 - [ ] **Placeholder scan:** scan this file for unfinished-task markers and vague implementation language, excluding the scan command itself. The check must return no matching lines:
 
 ```bash
