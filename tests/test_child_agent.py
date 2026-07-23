@@ -34,6 +34,7 @@ from hermes_dynamic_workflows.child.runner import (
     _discoverable_child_toolsets,
     _make_child_approval_callback,
     _resolve_child_toolsets,
+    _register_task_cwd,
     _tool_progress_line_width,
     _tool_call_count,
     _structured_output_missing_expectation,
@@ -71,6 +72,31 @@ def _tool_name(definition: dict) -> str:
 
 
 class ChildAgentTests(unittest.TestCase):
+    def test_register_task_cwd_records_launch_agent_type(self):
+        with patch("tools.terminal_tool.register_task_env_overrides") as register:
+            _register_task_cwd(
+                "workflow-task",
+                "/lane",
+                types.SimpleNamespace(name="stacked-pr-rebase-executor"),
+            )
+
+        register.assert_called_once_with(
+            "workflow-task",
+            {
+                "cwd": "/lane",
+                "hermes_workflow_agent_type": "stacked-pr-rebase-executor",
+            },
+        )
+
+    def test_register_task_cwd_defaults_missing_agent_type_to_general_purpose(self):
+        with patch("tools.terminal_tool.register_task_env_overrides") as register:
+            _register_task_cwd("workflow-task", "/lane")
+
+        register.assert_called_once_with(
+            "workflow-task",
+            {"cwd": "/lane", "hermes_workflow_agent_type": "general-purpose"},
+        )
+
     def test_clean_worktree_is_removed_without_modifying_tracked_gitignore(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)

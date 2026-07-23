@@ -571,7 +571,7 @@ class HermesChildAgentRunner(ChildAgentRunner):
                 except Exception:
                     pass
             try:
-                _register_task_cwd(lease.task_id, lease.cwd)
+                _register_task_cwd(lease.task_id, lease.cwd, agent_type)
                 message = build_child_task_message(request, workspace=lease.cwd)
                 history = None
                 stop_attempts = 0
@@ -1417,11 +1417,20 @@ def _with_read_only_fast_path(callback: Any):
     return _callback
 
 
-def _register_task_cwd(task_id: str, cwd: str) -> None:
+def _register_task_cwd(task_id: str, cwd: str, agent_type: Any = None) -> None:
     try:
         from tools.terminal_tool import register_task_env_overrides
 
-        register_task_env_overrides(task_id, {"cwd": cwd})
+        resolved_type = str(getattr(agent_type, "name", "") or "general-purpose").strip()
+        register_task_env_overrides(
+            task_id,
+            {
+                "cwd": cwd,
+                # Launch-time infrastructure metadata consumed by routing guards;
+                # never derive authorization from the child prompt or label.
+                "hermes_workflow_agent_type": resolved_type,
+            },
+        )
     except Exception:
         pass
 
