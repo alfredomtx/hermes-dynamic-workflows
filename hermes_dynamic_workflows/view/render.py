@@ -914,10 +914,6 @@ def _topology_tree_lines(
     entries: list[str] = []
     for topology in _topology_records(snapshot):
         label = _topology_line(topology)
-        kind = str(topology.get("kind") or "").strip().lower()
-        status = str(topology.get("status") or "").strip().lower()
-        if label and kind and status in {"failed", "error", "blocked"}:
-            label = f"{kind}{label[len(kind):]}"
         if not label:
             continue
         entries.append(f"   {_topology_marker(topology.get('status'))} {label}")

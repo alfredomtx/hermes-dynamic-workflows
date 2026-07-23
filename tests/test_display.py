@@ -790,7 +790,7 @@ class CostAndCompletionTests(unittest.TestCase):
             },
         }
 
-        self.assertIn("✗ pipeline", render_terminal_task_snapshot(run, show_cost=False))
+        self.assertIn("✗ Pipeline", render_terminal_task_snapshot(run, show_cost=False))
 
 
 if __name__ == "__main__":
