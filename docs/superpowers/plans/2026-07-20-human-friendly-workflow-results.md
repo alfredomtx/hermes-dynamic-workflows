@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Render arbitrary workflow results as compact human-readable Telegram cards, remove terminal Rerun controls, and make final clarification responses self-contained.
+**Goal:** Render arbitrary workflow results as compact human-readable Telegram cards, deliver the rich result as a separate message from the terminal execution snapshot, remove terminal Rerun and all Telegram Restart controls, and make final clarification responses self-contained.
 
 **Architecture:** Extend the existing pure completion renderer rather than adding another presentation owner. Normalize arbitrary top-level results into ordered immutable rows, then render those rows under one UTF-16 budget; explicit `presentation` envelopes remain authoritative. Keep workflow control policy in the existing manager helper. Add final-response guidance to Hermes core's stable cached task-completion block so behavior changes universally without per-turn prompt mutation.
 
@@ -20,7 +20,7 @@
 - Preserve complete machine-readable workflow output.
 - Render metrics once.
 - Compose Markdown from trusted static delimiters only; escape model- and workflow-provided content before inserting it, and never sanitize the composed Markdown as plain text.
-- Remove terminal Rerun only; preserve active Pause, Resume, Stop, and Restart controls plus valid Open log URL.
+- Remove Telegram Restart and terminal Rerun buttons from every workflow message; preserve active Pause, Resume, Stop, and valid Open log URL.
 - Commentary is progress-only; final clarification responses contain the complete question and every referenced option.
 - Preserve Hermes system-prompt byte stability during a conversation.
 - Follow strict RED → GREEN → REFACTOR; no production edit before its failing test is observed.
@@ -310,11 +310,27 @@ git commit -m "feat: render readable workflow completion cards"
 
 **Interfaces:**
 - Consumes: `_control_buttons_for(record, config) -> list | None`.
-- Produces: terminal records return only a valid Open log row or `None`; completion edit passes `buttons=[]` when no terminal controls remain.
+- Produces: terminal records return only a valid Open log row or `None`; completion edit passes `buttons=[]` when no terminal controls remain. Task 10 removes the active-state Telegram Restart button while preserving restart callbacks/backend support.
 
-- [ ] **Step 1: Replace terminal-Rerun expectation with failing absence tests**
+- [ ] **Step 1: Preserve active controls and replace terminal-Rerun expectation with failing absence tests**
 
 ```python
+def test_running_control_buttons_include_pause_stop_restart(self):
+    buttons = _control_buttons_for(self._record(status="running"), PluginConfig())
+    callbacks = [button["callback_data"] for button in buttons]
+    self.assertIn("wf:pause:wf_abc123", callbacks)
+    self.assertIn("wf:stop:wg123", callbacks)
+    self.assertIn("wf:restart:wf_abc123", callbacks)
+
+
+def test_paused_control_buttons_include_resume_stop_restart(self):
+    buttons = _control_buttons_for(self._record(status="paused"), PluginConfig())
+    callbacks = [button["callback_data"] for button in buttons]
+    self.assertIn("wf:resume:wf_abc123", callbacks)
+    self.assertIn("wf:stop:wg123", callbacks)
+    self.assertIn("wf:restart:wf_abc123", callbacks)
+
+
 def test_terminal_control_buttons_do_not_include_rerun(self):
     for status in ("completed", "failed", "error", "stopped", "interrupted"):
         buttons = _control_buttons_for(self._record(status=status), PluginConfig())
@@ -330,7 +346,7 @@ def test_terminal_control_buttons_keep_open_log_only(self):
 
     self.assertEqual(
         _control_buttons_for(record, PluginConfig()),
-        [[{"text": "📄 Open log", "url": "https://example.com/log"}]],
+        [{"text": "📄 Open log", "url": "https://example.com/log"}],
     )
 ```
 
@@ -346,7 +362,7 @@ env -i HOME="$HOME" PATH="/Users/atorres/.hermes/hermes-agent/venv/bin:/usr/bin:
   tests/test_gateway_callback.py tests/test_run_manager.py -q -o 'addopts='
 ```
 
-Expected: FAIL because terminal records still add `wf:rerun:<runId>`.
+Expected: FAIL because terminal records still add `wf:rerun:<runId>` before Task 3’s production edit; the active Restart absence remains a follow-up assertion for Task 10.
 
 - [ ] **Step 3: Remove terminal Rerun production branch**
 
@@ -361,7 +377,7 @@ Keep callback handling/storage support for explicit rerun commands unchanged. Up
 
 - [ ] **Step 4: Run control tests and verify GREEN**
 
-Run Task 3 command. Expected: PASS.
+Run Task 3 command. Expected: PASS for terminal Rerun absence and active Pause/Resume/Stop coverage; Task 10 will remove the active Telegram Restart branch.
 
 - [ ] **Step 5: Commit Task 3**
 
@@ -526,11 +542,11 @@ return {
 }
 ```
 
-Verify Telegram shows the approved hybrid card: a bold warning title, italic aggregate metadata, one fenced compact index with three ordered rows, titled detail sections, exactly one italic summary for the successful first result, exception findings/action hierarchy, one italic metrics line, no raw JSON dump, no Rerun button, and no stale active controls.
+Verify Telegram shows the approved two-message delivery: the original execution message is a terminal task-tree snapshot, while the separate result card has a bold warning title, italic aggregate metadata, one fenced compact index with three ordered rows, titled detail sections, exactly one italic summary for the successful first result, exception findings/action hierarchy, one italic metrics line, no raw JSON dump, no Telegram Restart/Rerun button, and no stale active controls.
 
 - [ ] **Step 6: Run overflow canary**
 
-Render or run enough long results to exceed the compact-index budget. Verify one Telegram card with an aligned index prefix, an italic `… N more results in stored report` marker before italic metrics, exception detail priority, raw and post-formatter lengths within 4096 UTF-16 units, and persisted full output containing every returned result.
+Render or run enough long results to exceed the compact-index budget. Verify the separate result card has an aligned index prefix, an italic `… N more results in stored report` marker before italic metrics, exception detail priority, raw and post-formatter lengths within 4096 UTF-16 units, while the terminal execution snapshot remains a distinct task-tree message and persisted full output contains every returned result.
 
 - [ ] **Step 7: Run clarification canary**
 
@@ -877,7 +893,7 @@ Restart from a separate controlling shell with `hermes gateway restart` followed
 
 - [ ] **Step 3: Run live mixed-result canary**
 
-Verify the edited completion delivery, not only a direct helper call: bold warning title, italic aggregate metadata, aligned fenced compact index, bold result headings, exactly one italic success summary, exception findings/action hierarchy, italic metrics exactly once, no raw Markdown punctuation or raw JSON, no Rerun button, and `buttons=[]` when no Open log URL exists.
+Verify the two-message edited completion delivery, not only a direct helper call: the terminal execution edit has only the stable task-tree snapshot and optional Open log, the separate result has the bold warning title, italic aggregate metadata, aligned fenced compact index, bold result headings, exactly one italic success summary, exception findings/action hierarchy, italic metrics exactly once, no raw Markdown punctuation or raw JSON, no Telegram Restart/Rerun button, and the result send has no buttons.
 
 - [ ] **Step 4: Run live overflow canary**
 
@@ -886,3 +902,618 @@ Return 100 long results. Verify the width-matched index prefix plus italic overf
 - [ ] **Step 5: Parent final review and guarded publication**
 
 Parent reviews final diff and test/live evidence. Publish plugin master through guarded git operations, verify remote SHA, and report the clickable commit URL. Clean implementation worktree/branch only after remote and live read-back succeed.
+
+---
+
+## Follow-up scope: separate execution and result messages
+
+Tasks 8–10 are the approved follow-up to the lifecycle contract in the design spec. They supersede any earlier wording that treats the final edit of the progress bubble as the result-card delivery: the original message is the execution reference and ends as a terminal task-tree snapshot; the result card is always delivered by a distinct send. In particular, update the old Task 5/Task 7 live assertions from “one edited completion card” to “one terminal execution edit followed by one separate result send.” Task 6’s renderer tests continue to exercise `_progress_bubble_text(..., completed=True)` as the rich-card renderer; Task 9 makes the manager’s final edit use a separate terminal-snapshot helper, so the existing 4096-unit rich-card renderer is not replaced.
+
+These follow-up tasks are plugin-only. Do not modify Hermes core, gateway core, callback storage, TUI restart commands, dependency declarations, `uv.lock`, or `.superpowers/`; use no new dependency. The only persistent delivery markers are `resultMessageId` when the adapter returns a confirmed message id and `resultMessageDelivered` when an adapter confirms success without exposing an id. Both are written to the run record only after confirmed send success. A transient in-flight flag is held only in `ManagedRun` and is never used as a durable success marker.
+
+### Task 8: Stable workflow header and terminal task-tree snapshot
+
+**Files:**
+- Modify: `hermes_dynamic_workflows/view/render.py:104-118,282-385,469-485,806-832`
+- Modify: `hermes_dynamic_workflows/run/manager.py:70-106,2048-2176`
+- Test: `tests/test_display.py` stable-header and task-marker tests
+- Test: `tests/test_run_manager.py` terminal progress-render tests
+
+**Interfaces:**
+- Produces: `render_workflow_header(run: dict[str, Any], *, show_cost: bool = True) -> str`, whose first character is always `🔄` and whose complete shape is `🔄 <workflow-name> · <duration> · <cost> · <tokens>` with absent metrics omitted.
+- Produces: `render_terminal_task_snapshot(run: dict[str, Any], *, show_cost: bool = True) -> str`, which delegates to the detailed progress renderer and never calls `render_completion_card`.
+- Preserves: `_progress_bubble_text(record, config, completed=True)` as the rich-card renderer used by the existing completion-card tests. Only `_edit_progress_bubble(..., completed=True)` switches to `render_terminal_task_snapshot` in Task 9.
+
+- [ ] **Step 1: Write failing stable-header and glyph tests**
+
+Add the following focused tests. The fixture deliberately supplies fixed snapshot duration, totals, costable usage, and a failed agent so the header and tree are deterministic:
+
+```python
+def test_stable_workflow_header_is_shared_shape_for_active_and_terminal_progress(self):
+    from hermes_dynamic_workflows.view.render import render_run_progress, render_workflow_header
+
+    run = {
+        "status": "running",
+        "workflow": {
+            "meta": {"name": "consolidate-delegation-policy"},
+            "duration_seconds": 597,
+            "totals": {"agents": 2, "done": 1, "running": 1, "errors": 0, "tokens": 1_860_000},
+            "agents": [
+                {"id": 1, "label": "policy", "status": "done", "model": "gpt-5.6-luna", "tokens": 930_000},
+                {"id": 2, "label": "delegation", "status": "running", "model": "gpt-5.6-luna", "tokens": 930_000},
+            ],
+        },
+    }
+
+    from unittest.mock import patch
+
+    header = render_workflow_header(run, show_cost=False)
+    progress_header = render_run_progress(run, show_cost=False).splitlines()[0]
+    with patch("hermes_dynamic_workflows.view.render._format_cost", return_value="~$1.05"):
+        priced_header = render_workflow_header(run, show_cost=True)
+
+    assert header == "🔄 consolidate-delegation-policy · 9m 57s · ~1.86M tok"
+    assert progress_header == header
+    assert priced_header == "🔄 consolidate-delegation-policy · 9m 57s · ~$1.05 · ~1.86M tok"
+    assert not progress_header.startswith("✅")
+    assert not progress_header.startswith("❌")
+
+
+def test_terminal_task_snapshot_uses_tree_glyphs_and_has_no_result_card(self):
+    from hermes_dynamic_workflows.view.render import render_terminal_task_snapshot
+
+    run = {
+        "status": "failed",
+        "workflow": {
+            "meta": {"name": "glyph-canary"},
+            "duration_seconds": 2,
+            "totals": {"agents": 2, "done": 1, "running": 0, "errors": 1, "tokens": 0},
+            "agents": [
+                {"id": 1, "label": "completed task", "status": "done"},
+                {"id": 2, "label": "failed task", "status": "failed"},
+            ],
+        },
+    }
+
+    text = render_terminal_task_snapshot(run, show_cost=False)
+
+    assert text.startswith("🔄 glyph-canary · 2s")
+    assert "✓ completed task" in text
+    assert "✗ failed task" in text
+    assert "✅" not in text
+    assert "❌" not in text
+    assert "**" not in text
+
+
+def test_failed_topology_row_uses_tree_failure_glyph(self):
+    from hermes_dynamic_workflows.view.render import render_terminal_task_snapshot
+
+    run = {
+        "status": "failed",
+        "workflow": {
+            "meta": {"name": "topology-glyph-canary"},
+            "duration_seconds": 1,
+            "totals": {"agents": 0, "done": 0, "running": 0, "errors": 1, "tokens": 0},
+            "agents": [],
+            "topologies": [{"kind": "pipeline", "status": "failed", "items": 1, "stages": 1, "agent_ids": []}],
+        },
+    }
+
+    assert "✗ pipeline" in render_terminal_task_snapshot(run, show_cost=False)
+```
+
+- [ ] **Step 2: Run the focused tests and verify RED**
+
+Run from the plugin checkout with the Hermes virtualenv and no ambient pytest addopts:
+
+```bash
+cd /Users/atorres/Documents/GitHub/hermes-dynamic-workflows
+env -i HOME="$HOME" PATH="/Users/atorres/.hermes/hermes-agent/venv/bin:/usr/bin:/bin" \
+  /Users/atorres/.hermes/hermes-agent/venv/bin/python -m pytest \
+  tests/test_display.py -k 'stable_workflow_header or terminal_task_snapshot or failed_topology_row' -q -o 'addopts='
+```
+
+Expected: FAIL because `render_workflow_header` and `render_terminal_task_snapshot` do not yet exist, and the detailed terminal header still uses `status_emoji`.
+
+- [ ] **Step 3: Implement the shared header and tree-only terminal renderer**
+
+Add the pure header helper beside `render_run_progress` and make detailed progress use it. Do not include agent count in this identity header; the stable contract carries workflow name, duration, estimated cost, and token total only. Keep the existing overview (`detailed=False`) status presentation unchanged.
+
+```python
+def render_workflow_header(run: dict[str, Any], *, show_cost: bool = True) -> str:
+    snapshot = run.get("workflow") or {}
+    meta = snapshot.get("meta") or {}
+    name = _bounded_text(meta.get("name") or run.get("source", {}).get("ref") or "workflow", _PROGRESS_NAME_MAX_CHARS)
+    parts: list[str] = []
+    duration = _duration(run, snapshot)
+    if duration:
+        parts.append(_format_duration(duration))
+    if show_cost:
+        cost = _format_cost(_total_cost(_all_agents(snapshot)))
+        if cost:
+            parts.append(cost)
+    tokens = _totals(snapshot).get("tokens")
+    if tokens:
+        parts.append(f"~{_format_tokens(tokens)} tok")
+    return f"🔄 {name}" + (f" · {' · '.join(parts)}" if parts else "")
+
+
+def render_terminal_task_snapshot(run: dict[str, Any], *, show_cost: bool = True) -> str:
+    return render_run_progress(run, show_cost=show_cost)
+```
+
+Inside `_render_run_block`, select `render_workflow_header(run, show_cost=show_cost)` only for `detailed=True`; leave the compact `/workflows` overview’s `status_emoji` line as-is. Keep `render_run_progress`’s detailed roster and phase checklist paths, because they already use `_detail_marker` and `_agent_marker` with `✓` and `✗`. Change `_topology_marker` so `failed`, `error`, and `blocked` return `✗`, `done` and `completed` return `✓`, and active states return `▶`; do not add `✅` or `❌` to any task-tree path. Add the stable header to the manager’s terminal-snapshot call site in Task 9, not to the rich completion card.
+
+- [ ] **Step 4: Run the focused tests and verify GREEN**
+
+```bash
+cd /Users/atorres/Documents/GitHub/hermes-dynamic-workflows
+env -i HOME="$HOME" PATH="/Users/atorres/.hermes/hermes-agent/venv/bin:/usr/bin:/bin" \
+  /Users/atorres/.hermes/hermes-agent/venv/bin/python -m pytest \
+  tests/test_display.py -k 'stable_workflow_header or terminal_task_snapshot or failed_topology_row' \
+  tests/test_run_manager.py -k 'progress or completion' -q -o 'addopts='
+```
+
+Expected: PASS. Confirm the old completion-card tests still pass because `_progress_bubble_text(..., completed=True)` has not been changed in this task.
+
+- [ ] **Step 5: Commit Task 8**
+
+```bash
+git add hermes_dynamic_workflows/view/render.py hermes_dynamic_workflows/run/manager.py \
+  tests/test_display.py tests/test_run_manager.py
+git commit -m "feat: add stable workflow task headers"
+```
+
+### Task 9: Split completion delivery and make result sends idempotent
+
+**Files:**
+- Modify: `hermes_dynamic_workflows/run/manager.py:70-106,235-286,842-877,1525-1628,1719-1771,1925-2143,2263-2269`
+- Modify: `hermes_dynamic_workflows/view/completion.py:712-940` only to thread an optional `max_units: int = 4096` budget through the existing card renderer; the default renderer and its rich hierarchy remain unchanged.
+- Test: `tests/test_run_manager.py` existing gateway progress tests around lines 1189-1819, plus new send/idempotency tests
+
+**Interfaces:**
+- Adds `ManagedRun.result_send_in_flight: bool` and `ManagedRun.store: WorkflowStore | None`; production construction supplies `self.store`, while hand-built unit fixtures supply a temporary store when persistence is under test.
+- Adds run-record fields initialized at launch: `resultMessageId: None`, `resultMessageDelivered: False`, and `resultMessageError: None`.
+- Changes `_send_gateway_text(...)` to return `_GatewaySendAttempt(confirmed, message_id, future)` and to accept an optional `buttons` argument. Default result sends do not pass `buttons`; seed/edit paths pass buttons only after the existing capability probe.
+- Adds `_deliver_result_message(managed, config, session_context, *, block: bool) -> bool`. It reserves the send under `managed.lock`, releases the lock before scheduling or waiting on the adapter, writes `resultMessageId` or `resultMessageDelivered` only after confirmed success, and clears the reservation on failure so a later completion callback can retry.
+- Changes `_edit_progress_bubble(..., completed=True)` to render only `render_terminal_task_snapshot`; it never receives or emits `render_completion_card` output. A nonblocking final edit callback invokes `_deliver_result_message(..., block=False)` only after the edit future resolves, while the worker-thread path uses `block=True` outside any managed lock.
+- Replaces `_send_gateway_completion_notification(...)` with a thin compatibility wrapper around `_deliver_result_message(..., block=True)` or removes its only call site; no completion path may call `_send_gateway_text` directly for the result card. `_notify_completion` and the slow-seed callback both go through the idempotent helper.
+- Changes `_render_gateway_completion_message` to import and use `render_workflow_header` plus the existing `_card_formatter_units` budget helper, returning `render_workflow_header(record) + "\\n\\n" + render_completion_card(...)`; the existing card renderer receives only the remaining budget so the combined source and adapter-formatted message remains within 4096 UTF-16 units.
+
+- [ ] **Step 1: Write failing delivery, persistence, and failure-path tests**
+
+Replace the old one-message expectations in `test_live_progress_bubble_seeds_then_finalizes_one_message`, `test_completion_edit_flood_failure_falls_back_to_fresh_send`, `test_completion_edit_flood_recovers_even_when_notify_on_complete_false`, `test_completion_edit_success_with_notify_on_complete_false_no_send`, and `test_live_progress_bubble_slow_seed_finalizes_via_callback_no_duplicate` with the separate-message contract. Add these focused assertions to the gateway test fixture:
+
+```python
+def test_terminal_edit_precedes_distinct_result_send_and_persists_message_id(self):
+    events = []
+
+    class Adapter:
+        async def send(self, chat_id, content, metadata=None, buttons=None):
+            events.append(("send", content, buttons))
+            return SimpleNamespace(success=True, message_id=f"result-{len(events)}")
+
+        async def edit_message(self, chat_id, message_id, content, *, finalize=False, metadata=None, buttons=None):
+            events.append(("edit", content, buttons, finalize))
+            return SimpleNamespace(success=True, message_id=message_id)
+
+    # Use the existing gateway-run harness and wait for the terminal record.
+    final, store = self._run_gateway_fixture(Adapter(), notify_progress=True)
+
+    self.assertEqual(final["status"], "completed")
+    self.assertEqual([event[0] for event in events], ["send", "edit", "send"])
+    seed, terminal_edit, result = events
+    self.assertTrue(terminal_edit[3])
+    self.assertEqual(terminal_edit[2], [])
+    self.assertTrue(terminal_edit[1].startswith("🔄 bubble · "))
+    self.assertNotIn("**", terminal_edit[1])
+    self.assertNotIn("Result:", terminal_edit[1])
+    self.assertTrue(result[1].startswith("🔄 bubble · "))
+    result_lines = result[1].splitlines()
+    terminal_lines = terminal_edit[1].splitlines()
+    self.assertEqual(result_lines[0], terminal_lines[0])
+    self.assertEqual(result_lines[1], "")
+    self.assertIn("**", result[1])
+    self.assertIsNone(result[2])
+    persisted = store.load_run(final["runId"])
+    self.assertEqual(persisted["resultMessageId"], "result-3")
+    self.assertTrue(persisted["resultMessageDelivered"] is False)
+
+
+def test_duplicate_completion_callbacks_send_one_result(self):
+    adapter = self._successful_send_only_adapter(message_id="stable-result")
+    managed, config, context, store = self._managed_gateway_result_fixture(adapter)
+
+    self.assertTrue(manager_module._deliver_result_message(managed, config, context, block=True))
+    self.assertTrue(manager_module._deliver_result_message(managed, config, context, block=True))
+
+    self.assertEqual(adapter.sent_count, 1)
+    self.assertEqual(store.load_run(managed.run_id)["resultMessageId"], "stable-result")
+
+
+def test_success_without_message_id_uses_durable_delivered_marker(self):
+    adapter = self._successful_send_only_adapter(message_id=None)
+    managed, config, context, store = self._managed_gateway_result_fixture(adapter)
+
+    self.assertTrue(manager_module._deliver_result_message(managed, config, context, block=True))
+    self.assertTrue(manager_module._deliver_result_message(managed, config, context, block=True))
+
+    persisted = store.load_run(managed.run_id)
+    self.assertIsNone(persisted["resultMessageId"])
+    self.assertTrue(persisted["resultMessageDelivered"])
+    self.assertEqual(adapter.sent_count, 1)
+
+
+def test_result_send_failure_keeps_terminal_record_retryable(self):
+    adapter = self._failure_then_success_send_adapter()
+    managed, config, context, store = self._managed_gateway_result_fixture(adapter, status="failed")
+
+    self.assertFalse(manager_module._deliver_result_message(managed, config, context, block=True))
+    failed = store.load_run(managed.run_id)
+    self.assertEqual(failed["status"], "failed")
+    self.assertIsNone(failed["resultMessageId"])
+    self.assertFalse(failed["resultMessageDelivered"])
+    self.assertIsNotNone(failed["resultMessageError"])
+
+    self.assertTrue(manager_module._deliver_result_message(managed, config, context, block=True))
+    self.assertEqual(adapter.sent_count, 2)
+    self.assertEqual(store.load_run(managed.run_id)["resultMessageId"], "retry-result")
+
+
+def test_terminal_edit_failure_still_sends_result_without_overwriting_execution_body(self):
+    adapter = self._terminal_edit_failure_adapter()
+    final, store = self._run_gateway_fixture(adapter, notify_progress=True)
+
+    self.assertEqual(final["status"], "completed")
+    terminal_edits = [event for event in adapter.events if event[0] == "edit" and event[3]]
+    result_sends = [event for event in adapter.events if event[0] == "send" and "**" in event[1]]
+    self.assertEqual(len(terminal_edits), 1)
+    self.assertEqual(len(result_sends), 1)
+    self.assertNotIn("**", terminal_edits[0][1])
+    self.assertIn("**", result_sends[0][1])
+    self.assertTrue(store.load_run(final["runId"])["resultMessageId"])
+
+
+def test_non_editable_seed_falls_back_to_launch_marker_and_one_separate_result(self):
+    adapter = self._send_only_adapter_without_message_id()
+    final, store = self._run_gateway_fixture(adapter, notify_progress=True)
+
+    self.assertEqual(final["status"], "completed")
+    self.assertEqual(len(adapter.sent), 2)
+    self.assertIn("Workflow started", adapter.sent[0][1])
+    self.assertTrue(adapter.sent[1][1].startswith("🔄 "))
+    self.assertIn("\n\n", adapter.sent[1][1])
+    self.assertIsNone(adapter.sent[1][2])
+    self.assertTrue(store.load_run(final["runId"])["resultMessageDelivered"])
+
+
+def test_result_send_exception_is_retryable(self):
+    adapter = self._exception_then_success_send_adapter()
+    managed, config, context, store = self._managed_gateway_result_fixture(adapter)
+
+    self.assertFalse(manager_module._deliver_result_message(managed, config, context, block=True))
+    self.assertIsNone(store.load_run(managed.run_id)["resultMessageId"])
+    self.assertTrue(manager_module._deliver_result_message(managed, config, context, block=True))
+    self.assertEqual(store.load_run(managed.run_id)["resultMessageId"], "exception-retry-result")
+```
+
+Define the adapter fixtures as test-only helpers in `tests/test_run_manager.py`: `_successful_send_only_adapter(message_id)` records sends and returns `SimpleNamespace(success=True, message_id=message_id)`; `_failure_then_success_send_adapter()` returns `SimpleNamespace(success=False, error="flood_control:30")` once and then `SimpleNamespace(success=True, message_id="retry-result")`; `_exception_then_success_send_adapter()` raises `RuntimeError("gateway unavailable")` once and then returns `SimpleNamespace(success=True, message_id="exception-retry-result")`; `_send_only_adapter_without_message_id()` exposes `async def send(...)`, no `edit_message`, and returns `SimpleNamespace(success=True)`; `_terminal_edit_failure_adapter()` returns `SimpleNamespace(success=False, error="flood_control:30")` only for `finalize=True` and a successful result for the result send. `_managed_gateway_result_fixture` must create a temporary `WorkflowStore`, save a terminal record with the three result-delivery fields, construct `ManagedRun(..., store=store)`, install the existing fake gateway runner/synchronous `safe_schedule_threadsafe` from the surrounding tests, and return `(managed, PluginConfig(...), session_context, store)`. `_run_gateway_fixture(adapter, notify_progress)` must reuse the existing `WorkflowRunManager.start_from_params` harness in the neighboring gateway tests, pass the supplied adapter and `notify_progress`, wait for the run, and return `(final_record, store)`.
+
+- [ ] **Step 2: Run the delivery tests and verify RED**
+
+```bash
+cd /Users/atorres/Documents/GitHub/hermes-dynamic-workflows
+env -i HOME="$HOME" PATH="/Users/atorres/.hermes/hermes-agent/venv/bin:/usr/bin:/bin" \
+  /Users/atorres/.hermes/hermes-agent/venv/bin/python -m pytest \
+  tests/test_run_manager.py -k 'terminal_edit_precedes or duplicate_completion or without_message_id or result_send_failure or terminal_edit_failure or non_editable_seed or live_progress_bubble' \
+  -q -o 'addopts='
+```
+
+Expected: FAIL because the current code edits the rich card into the execution message, suppresses the separate send after a successful edit, does not persist a result message id, and still emits the old slow-seed/flood expectations.
+
+- [ ] **Step 3: Add persistent result-delivery state and a nonblocking send outcome**
+
+Initialize the three record keys beside `result`, and construct `ManagedRun(store=self.store)`. Add the transient reservation field. Use the following shape; all network operations occur after the reservation lock is released:
+
+```python
+@dataclass(frozen=True)
+class _GatewaySendAttempt:
+    confirmed: bool
+    message_id: str | None = None
+    future: Any = None
+
+
+def _gateway_result_ok(result: Any) -> bool:
+    success = getattr(result, "success", None)
+    return True if success is None else bool(success)
+
+
+def _gateway_attempt_from_future(future: Any) -> _GatewaySendAttempt:
+    try:
+        result = future.result()
+    except Exception:
+        return _GatewaySendAttempt(confirmed=False)
+    return _GatewaySendAttempt(
+        confirmed=_gateway_result_ok(result),
+        message_id=str(getattr(result, "message_id", "") or "") or None,
+    )
+
+
+def _deliver_result_message(
+    managed: "ManagedRun",
+    config: PluginConfig,
+    session_context: dict[str, str] | None,
+    *,
+    block: bool,
+) -> bool:
+    with managed.lock:
+        record = managed.record
+        if record.get("resultMessageId") or record.get("resultMessageDelivered"):
+            return True
+        if managed.result_send_in_flight:
+            return False
+        managed.result_send_in_flight = True
+
+    try:
+        attempt = _send_gateway_text(
+            record,
+            session_context,
+            _render_gateway_completion_message(record, config),
+            block=block,
+        )
+        if not block and attempt.future is not None:
+            attempt.future.add_done_callback(
+                lambda future: _finish_result_delivery(
+                    managed, _gateway_attempt_from_future(future)
+                )
+            )
+            return False
+        return _finish_result_delivery(managed, attempt)
+    except Exception as exc:
+        return _finish_result_delivery(managed, _GatewaySendAttempt(confirmed=False), exc)
+
+
+def _finish_result_delivery(
+    managed: "ManagedRun",
+    attempt: _GatewaySendAttempt,
+    error: BaseException | None = None,
+) -> bool:
+    with managed.lock:
+        record = managed.record
+        if attempt.confirmed:
+            if attempt.message_id:
+                record["resultMessageId"] = attempt.message_id
+            else:
+                record["resultMessageDelivered"] = True
+            record["resultMessageError"] = None
+        else:
+            record["resultMessageError"] = str(error or "gateway result send was not confirmed")
+        managed.result_send_in_flight = False
+        if managed.store is not None:
+            managed.store.save_run(record)
+        return attempt.confirmed
+```
+
+Update `_send_gateway_text` so it returns `_GatewaySendAttempt`: resolve the target, create `send_kwargs = {"metadata": metadata}`, add `buttons` only when the caller supplied it and `_accepts_buttons(adapter.send)` is true, schedule `adapter.send(chat_id, text, **send_kwargs)`, and return `_GatewaySendAttempt(future=future)` for `block=False`. For `block=True`, call `future.result(timeout=15)` outside every managed lock and return `_gateway_attempt_from_future(future)`. A missing target, missing future, raised send, or explicit `success=False` returns `confirmed=False`; a successful result without `message_id` remains confirmed and is persisted through `resultMessageDelivered=True`.
+
+- [ ] **Step 4: Split terminal edit text from result-card text and preserve the card budget**
+
+Change `_edit_progress_bubble` to select `render_terminal_task_snapshot(managed.record, show_cost=config.notify_progress_cost)` when `completed=True`; keep `_progress_bubble_text(..., completed=True)` for rich result-card tests. Do not set `resultMessageId` from an edit. Pass `buttons=[]` on the terminal edit even when `_control_buttons_for` returns `None`, so stale Pause/Resume/Stop/Restart keyboards are cleared; when a valid log URL exists, Task 10 will make the terminal edit retain only that Open log row.
+
+Make the existing `render_completion_card` accept `max_units: int = 4096` and thread that value through its existing `_card_text_fits`, `_card_blocks_fit`, result-budget, metrics, and cost-breakdown checks. The default remains 4096 and all Task 6 card assertions remain unchanged. Render the separate message as:
+
+```python
+def _render_gateway_completion_message(record: dict[str, Any], config: PluginConfig) -> str:
+    header = render_workflow_header(record, show_cost=config.notify_progress_cost)
+    header_units = _card_formatter_units(f"{header}\n\n")
+    card = render_completion_card(
+        record,
+        preview_chars=config.notify_result_preview_chars,
+        show_cost=config.notify_progress_cost,
+        max_units=max(0, 4096 - header_units),
+    )
+    return f"{header}\n\n{card}" if card else header
+```
+
+The result send calls `_send_gateway_text` without a `buttons` argument. Thus the original execution edit owns the optional Open log button and the result message has no keyboard. The stable header helper is the only source of the first line in both messages.
+
+- [ ] **Step 5: Rework completion ordering, slow-seed callbacks, and retry behavior**
+
+Keep the existing bounded seed wait and wake-event logic, but replace the old “bubble finalized means no fresh send” branch with this exact ordering:
+
+```python
+if active:
+    # Worker thread: blocking is safe here, and the lock is not held.
+    _edit_progress_bubble(managed, config, completed=True, force=True, block=True)
+    _deliver_result_message(managed, config, session_context, block=True)
+elif requested:
+    # The seed callback owns both operations after the seed future resolves.
+    bubble_pending = True
+else:
+    # No active/editable seed: launch-marker fallback remains independent.
+    _deliver_result_message(managed, config, session_context, block=True)
+```
+
+The result delivery call is not gated by `notify_on_complete`; the gateway completion artifact must still exist when a progress bubble or launch-marker fallback is configured. Keep `notify_on_complete` as the gate for the task-notification injection and gateway wake event. If the terminal edit returns `success=False`, raises, has no editable target, or is skipped because no seed exists, still call `_deliver_result_message`; never replace the execution message with result-card text. A failed result send records `resultMessageError`, leaves both durable success markers unset, and returns without changing terminal `status`, so a later retry can call the same helper.
+
+In `_on_seeded`, when the run is already terminal, schedule the final edit with `block=False` and attach a done callback. The callback must inspect the already-completed edit future without waiting, then invoke `_deliver_result_message(..., block=False)`. If the edit cannot be scheduled, invoke the same result helper immediately with `block=False`. The result send’s future callback calls `_finish_result_delivery`; it must not call `.result()` on a coroutine scheduled onto the current gateway loop. This preserves the existing gateway-loop deadlock protection for both slow-seed and flood paths.
+
+- [ ] **Step 6: Run focused delivery tests and verify GREEN**
+
+```bash
+cd /Users/atorres/Documents/GitHub/hermes-dynamic-workflows
+env -i HOME="$HOME" PATH="/Users/atorres/.hermes/hermes-agent/venv/bin:/usr/bin:/bin" \
+  /Users/atorres/.hermes/hermes-agent/venv/bin/python -m pytest \
+  tests/test_run_manager.py -k 'terminal_edit_precedes or duplicate_completion or without_message_id or result_send_failure or terminal_edit_failure or non_editable_seed or live_progress_bubble or completion_edit_flood' \
+  tests/test_run_manager.py::CompletionCardRenderTests -q -o 'addopts='
+```
+
+Expected: PASS. Confirm the same workflow header is byte-for-byte identical in the terminal edit and result send, the result body retains the existing rich-card formatting, both raw and adapter-formatted result messages fit the combined 4096 UTF-16 budget, and the stored full result remains unchanged.
+
+- [ ] **Step 7: Commit Task 9**
+
+```bash
+git add hermes_dynamic_workflows/run/manager.py hermes_dynamic_workflows/view/completion.py \
+  tests/test_run_manager.py
+git commit -m "feat: deliver workflow results separately"
+```
+
+### Task 10: Remove Telegram Restart controls and run complete verification
+
+**Files:**
+- Modify: `hermes_dynamic_workflows/run/manager.py:1876-1909` to remove the active-state Restart button only; keep restart/rerun callback and backend methods unchanged.
+- Test: `tests/test_gateway_callback.py:105-201`
+- Test: `tests/test_run_manager.py` result-button and terminal-edit assertions
+- Test: `tests/test_display.py` final task-tree glyph assertions
+- No Hermes core files; no dependency files; no `uv.lock` or `.superpowers/`.
+
+**Interfaces:**
+- `_control_buttons_for` keeps Pause for queued/running, Resume for paused, Stop for queued/running/paused, and Open log when a valid URL exists. It never emits `wf:restart` or `wf:rerun` in any state.
+- `on_gateway_callback` continues accepting authorized `wf:restart:<runId>` and `wf:rerun:<runId>` callbacks so backend, CLI, TUI, and explicit command support remain intact.
+- Result sends always omit `buttons`; terminal execution edits clear active controls and retain only Open log.
+
+- [ ] **Step 1: Write failing Restart-absence and result-button tests**
+
+Replace the active-state expectations in `tests/test_gateway_callback.py` with:
+
+```python
+def test_running_control_buttons_keep_pause_and_stop_but_no_restart(self):
+    buttons = _control_buttons_for(self._record(status="running"), PluginConfig())
+    callbacks = [button["callback_data"] for button in buttons]
+    self.assertIn("wf:pause:wf_abc123", callbacks)
+    self.assertIn("wf:stop:wg123", callbacks)
+    self.assertFalse(any("restart" in callback or "rerun" in callback for callback in callbacks))
+
+
+def test_paused_control_buttons_keep_resume_and_stop_but_no_restart(self):
+    buttons = _control_buttons_for(self._record(status="paused"), PluginConfig())
+    callbacks = [button["callback_data"] for button in buttons]
+    self.assertIn("wf:resume:wf_abc123", callbacks)
+    self.assertIn("wf:stop:wg123", callbacks)
+    self.assertFalse(any("restart" in callback or "rerun" in callback for callback in callbacks))
+
+
+def test_no_restart_or_rerun_button_in_any_telegram_state(self):
+    statuses = ("queued", "running", "paused", "stopping", "completed", "failed", "error", "stopped", "interrupted")
+    for status in statuses:
+        buttons = _control_buttons_for(self._record(status=status), PluginConfig()) or []
+        rows = buttons if buttons and isinstance(buttons[0], list) else [buttons]
+        callbacks = [button.get("callback_data", "") for row in rows for button in row]
+        self.assertFalse(any("restart" in callback or "rerun" in callback for callback in callbacks), status)
+
+
+def test_terminal_open_log_is_the_only_execution_control(self):
+    record = self._record(status="completed")
+    record["logUrl"] = "https://example.com/log"
+    self.assertEqual(
+        _control_buttons_for(record, PluginConfig()),
+        [{"text": "📄 Open log", "url": "https://example.com/log"}],
+    )
+
+
+def test_restart_callbacks_remain_supported_without_a_telegram_button(self):
+    class FakeManager:
+        def restart(self, run_id):
+            return {"runId": "wf_new123"}
+
+    with patch.object(gc_module, "get_run_manager", return_value=FakeManager()):
+        directive = on_gateway_callback(data="wf:restart:wf_old123", authorized=True)
+    self.assertIn("wf_new123", directive["answer"])
+    self.assertTrue(directive["strip_buttons"])
+```
+
+- [ ] **Step 2: Run control tests and verify RED**
+
+```bash
+cd /Users/atorres/Documents/GitHub/hermes-dynamic-workflows
+env -i HOME="$HOME" PATH="/Users/atorres/.hermes/hermes-agent/venv/bin:/usr/bin:/bin" \
+  /Users/atorres/.hermes/hermes-agent/venv/bin/python -m pytest \
+  tests/test_gateway_callback.py -k 'control_buttons or restart_callbacks' -q -o 'addopts='
+```
+
+Expected: FAIL because `_control_buttons_for` still appends `wf:restart:<runId>` for active states.
+
+- [ ] **Step 3: Remove only the Telegram Restart branch**
+
+Delete the active-state branch:
+
+```python
+if status in _ACTIVE_CONTROL_STATES and run_id:
+    controls.append({"text": "🔄 Restart", "callback_data": f"wf:restart:{run_id}"})
+```
+
+Do not delete `_ACTIVE_CONTROL_STATES`, callback parsing, `restart()`, `rerun`, persistence, or TUI controls. Keep the terminal control behavior from Task 9: a terminal execution edit passes the optional Open log row or `[]`, and the result send passes no buttons.
+
+- [ ] **Step 4: Run focused and full suites and verify GREEN**
+
+```bash
+cd /Users/atorres/Documents/GitHub/hermes-dynamic-workflows
+env -i HOME="$HOME" PATH="/Users/atorres/.hermes/hermes-agent/venv/bin:/usr/bin:/bin" \
+  /Users/atorres/.hermes/hermes-agent/venv/bin/python -m pytest \
+  tests/test_gateway_callback.py tests/test_run_manager.py tests/test_display.py -q -o 'addopts='
+
+env -i HOME="$HOME" PATH="/Users/atorres/.hermes/hermes-agent/venv/bin:/usr/bin:/bin" \
+  /Users/atorres/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q -o 'addopts='
+```
+
+Expected: PASS. The full suite must retain callback/backend restart coverage while proving no Telegram state contains a Restart/Rerun button, result messages have no buttons, terminal execution messages have only optional Open log, and the current rich-card tests still pass.
+
+- [ ] **Step 5: Run live Telegram canaries**
+
+Restart the serving gateway from a separate controlling shell, then verify one healthy post-change process:
+
+```bash
+hermes gateway restart
+hermes gateway status
+pgrep -af 'hermes_cli.main gateway run'
+```
+
+Run a mixed-result workflow returning a string, `None`, and a failed dictionary. Read back both messages: the original execution message starts with the stable `🔄` header, ends as a task tree with `✓`/`✗`, has no rich result body, and retains only optional Open log; the separate result begins with the byte-identical header, has a blank line, contains the existing rich card and exactly one metrics line, and has no buttons. Run a 100-item overflow workflow and verify both messages remain available, each stays within the adapter’s 4096 UTF-16 limit, and the persisted artifact retains every item. Run the clarification canary from Task 5 and verify the final question includes every choice without relying on commentary.
+
+- [ ] **Step 6: Commit Task 10**
+
+```bash
+git add hermes_dynamic_workflows/run/manager.py tests/test_gateway_callback.py \
+  tests/test_run_manager.py tests/test_display.py
+git commit -m "fix: remove Telegram workflow restart button"
+```
+
+## Follow-up plan self-review
+
+- [ ] **Spec coverage:** Telegram Message Lifecycle is covered by Tasks 8–9; Task Markers by Task 8; Telegram Controls by Task 10; Delivery and controls by Tasks 9–10; the 4096 rich-card budget by Task 6 plus Task 9’s preserved default and combined-message budget; no-core/no-dependency scope by the follow-up constraints; adapter id/no-id/failure behavior by Task 9; and live canaries by Task 10 Step 5.
+- [ ] **Placeholder scan:** scan this file for unfinished-task markers and vague implementation language, excluding the scan command itself. The check must return no matching lines:
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+
+text = Path("docs/superpowers/plans/2026-07-20-human-friendly-workflow-results.md").read_text(encoding="utf-8")
+needles = ["T" + "BD", "TO" + "DO", "FIX" + "ME", "implement " + "later", "fill in " + "details", "add " + "appropriate"]
+matches = [line for line in text.splitlines() if any(needle in line for needle in needles)]
+if matches:
+    raise SystemExit("placeholder/vague-plan matches:\n" + "\n".join(matches))
+print("placeholder scan: PASS")
+PY
+```
+
+- [ ] **Type and snippet consistency:** verify the names used across Tasks 8–10 are exactly `render_workflow_header`, `render_terminal_task_snapshot`, `_GatewaySendAttempt`, `_gateway_result_ok`, `_gateway_attempt_from_future`, `_deliver_result_message`, `_finish_result_delivery`, `resultMessageId`, `resultMessageDelivered`, and `resultMessageError`. Extract each newly added fenced `python` block after `## Follow-up scope` and compile it with `ast.parse`; fix any syntax error in the plan before implementation begins.
+- [ ] **Lifecycle contradiction check:** confirm no follow-up test expects the execution edit to contain `render_completion_card`, `Result:`, or a rich-card heading; confirm every terminal path calls the idempotent result helper exactly once or leaves it retryable; confirm the old Task 5/Task 7 “one edited completion card” wording is explicitly superseded above.
+- [ ] **Scope and diff check:** after writing this plan, run `git diff --check`, inspect the exact diff, and verify only this plan is staged. The pre-existing untracked `.superpowers/` and `uv.lock` must remain untouched.
+
+```bash
+git diff --check -- docs/superpowers/plans/2026-07-20-human-friendly-workflow-results.md
+git diff --stat -- docs/superpowers/plans/2026-07-20-human-friendly-workflow-results.md
+git status --short
+```
+
+The implementation worker must run the focused RED command before each production change, the corresponding GREEN command after it, and the full suite/live canaries before publication. This plan’s publication commit is separate from the future implementation commits: the current docs-only handoff is committed as `docs: plan separate workflow results`.
+
+For this docs-only handoff, force-add exactly the ignored/selected plan path, inspect the staged file list, and commit only the plan:
+
+```bash
+git add -f docs/superpowers/plans/2026-07-20-human-friendly-workflow-results.md
+test "$(git diff --cached --name-only)" = "docs/superpowers/plans/2026-07-20-human-friendly-workflow-results.md"
+git diff --cached --check
+git diff --cached --stat -- docs/superpowers/plans/2026-07-20-human-friendly-workflow-results.md
+git commit -m "docs: plan separate workflow results"
+```
