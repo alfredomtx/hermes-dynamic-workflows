@@ -23,7 +23,7 @@ Also prevent clarification responses from referring to choices that appeared onl
 
 - Skill-specific, validation-specific, review-specific, or deployment-specific inference.
 - Parsing arbitrary prose to determine workflow success or failure.
-- Removing active Pause, Resume, Stop, or Restart controls.
+- Removing active Pause, Resume, or Stop controls.
 - Deleting stored workflow output or changing workflow execution semantics.
 - Adding an expandable Telegram details interface.
 
@@ -75,6 +75,30 @@ Keep transport status separate from task outcome:
 2. **Task outcome:** passed, warning, blocked, failed, or unknown when supplied through structured result fields.
 
 The renderer may display verdict words already present in plain-string headings, such as `PASS — zero blockers`, but must not promote the overall task outcome by parsing arbitrary prose. A quoted `FAIL`, a negated blocker statement, or diagnostic sample must not change workflow status.
+
+## Telegram Message Lifecycle
+
+Each workflow owns two durable Telegram messages:
+
+1. **Execution message:** the original progress message. It is continuously updated while work runs, then updated once more into a terminal task-tree snapshot. It remains visible as the execution reference and is never replaced by result content.
+2. **Result message:** a new message sent after the terminal task-tree snapshot succeeds. It contains the rich completion card and does not reuse or edit the execution message.
+
+Both messages begin with the same stable workflow header:
+
+```text
+🔄 consolidate-delegation-policy · 9m 57s · ~$1.05 · ~1.86M tok
+```
+
+The `🔄` marker is a stable workflow identity marker, not a transport-status marker. Keep it on active progress, terminal task snapshots, and separate result messages. Task status remains explicit in the task tree and result card below the header.
+
+Delivery rules:
+
+- Finalize the original execution message before sending the result message.
+- The terminal execution message contains the completed task tree and no result body.
+- The new result message repeats the exact current workflow header as its first line, then a blank line, then the rich result card.
+- Store or reuse enough run metadata to render the same workflow name, duration, cost, and token totals in both headers.
+- Result-send failure must not roll the execution message back to a running state. Report/send fallback errors through existing delivery protection while preserving the terminal snapshot.
+- A completion retry must not create duplicate result messages after a successful send; persist the result message ID or an equivalent idempotency marker.
 
 ## Telegram Card Layout
 
@@ -142,18 +166,33 @@ Budget policy:
 
 Full output remains available in the persisted workflow artifact.
 
+## Task Markers
+
+Use lightweight glyphs in workflow task trees:
+
+| State | Marker |
+|---|---:|
+| Running/current | `▶` |
+| Completed | `✓` |
+| Failed | `✗` |
+| Queued | `◦` |
+| Paused | `⏸` |
+
+Do not use `✅` or `❌` for task-tree completion/failure rows. Result-card outcome markers may remain visually stronger because they summarize domain outcomes rather than execution-tree state.
+
 ## Telegram Controls
 
+- Remove `Restart` from Telegram workflow messages in every state.
 - Remove `Rerun` from terminal workflow completion messages.
 - Preserve active controls when meaningful:
   - Pause while queued or running.
   - Resume while paused.
   - Stop while queued, running, or paused.
-  - Restart while active when currently supported.
-- Preserve an Open log URL button when a valid log URL exists.
-- Completion edits must clear stale active controls rather than leaving unusable buttons attached.
+- Preserve `Open log` only on the original execution message when a valid log URL exists.
+- The separate result message has no buttons.
+- Terminal execution-message edits must clear stale Pause, Resume, and Stop controls before retaining optional `Open log`.
 
-This change removes only the terminal Rerun affordance. It does not remove engine support for explicit restart or resume commands.
+These changes remove only Telegram button affordances. They do not remove engine, CLI, callback-storage, or explicit command support for restart, rerun, or resume.
 
 ## Self-Contained Final Responses
 
@@ -229,15 +268,25 @@ Test:
 - long inputs remain within 4096 UTF-16 units;
 - truncation removes detail sections before compact index rows, overflow marker, or metrics.
 
-### Controls
+### Delivery and controls
 
 Test:
 
+- active execution message keeps the stable `🔄` workflow header;
+- completion first edits the original execution message into a terminal task-tree snapshot;
+- completion then sends a distinct result message rather than editing result content into the execution message;
+- result message repeats the exact workflow header before the rich card;
+- successful execution rows use `✓` and failed rows use `✗`;
+- task-tree rows do not use `✅` or `❌`;
+- no Telegram state contains a Restart button;
 - terminal states have no Rerun button;
-- running states retain Pause, Stop, and Restart;
-- paused state retains Resume, Stop, and Restart;
-- terminal edit clears stale active controls;
-- valid Open log URL remains available.
+- running states retain Pause and Stop;
+- paused state retains Resume and Stop;
+- terminal execution-message edit clears stale active controls;
+- valid Open log URL remains only on the execution message;
+- result message has no buttons;
+- retry after successful result send does not duplicate the result message;
+- result-send failure leaves the terminal execution snapshot intact.
 
 ### Response delivery discipline
 
@@ -253,9 +302,11 @@ After implementation and focused tests:
 
 1. Restart the gateway because plugin code is loaded by the gateway process.
 2. Run a generic workflow canary that returns mixed strings, a dictionary, and null.
-3. Confirm Telegram shows every subtask, one metrics line, no raw JSON dump, and no Rerun button.
-4. Confirm one post-change gateway process is serving.
-5. Send a clarification canary with choices and confirm the final Telegram message is self-contained.
+3. Confirm the original Telegram execution message remains as a terminal task-tree snapshot with the stable `🔄` header, `✓` / `✗` task glyphs, optional Open log, and no Restart/Rerun/stale active controls.
+4. Confirm a separate result message appears with the same stable workflow header, rich result card, one metrics line, no raw JSON dump, and no buttons.
+5. Run an overflow canary and confirm the execution snapshot and separate bounded result message both remain available.
+6. Confirm one post-change gateway process is serving.
+7. Send a clarification canary with choices and confirm the final Telegram message is self-contained.
 
 ## Acceptance Criteria
 
@@ -267,7 +318,11 @@ After implementation and focused tests:
 - Telegram card uses the approved hybrid hierarchy: bold title/labels, italic metadata/summaries/metrics, compact monospace result index, and rich detail sections.
 - Every returned result gets one bounded summary line while detail budget permits; exception details receive priority.
 - Telegram card contains one metrics line and no default raw JSON dump.
-- Terminal workflow cards contain no Rerun button.
-- Active workflow controls continue working.
+- Original execution message remains visible as a terminal task-tree snapshot; result content arrives in a separate message.
+- Both execution and result messages begin with the same stable `🔄` workflow header.
+- Workflow task trees use `✓` for completed and `✗` for failed rows, not check/X emoji.
+- Telegram workflow messages contain no Restart or Rerun button.
+- Active Pause/Resume/Stop controls remain appropriate; terminal execution messages retain only optional Open log.
+- Separate result messages contain no buttons.
 - Final clarification messages never depend on transient commentary.
 - Focused tests and live Telegram canaries pass.
