@@ -54,6 +54,8 @@ plugins:
         max_concurrency: 16           # 同時実行数のハードキャップ
         max_agents: 1000              # 1 回の実行あたりのエージェント総数の上限（暴走防止）
         max_turns: 150                # agent() が maxTurns を省略した場合のデフォルト論理ターン数（HERMES_DYNAMIC_WORKFLOWS_MAX_TURNS、1..1000 に制限）
+        max_tool_calls: 50             # agent() が maxToolCalls を省略した場合の子エージェントのデフォルト tool call 数（HERMES_DYNAMIC_WORKFLOWS_MAX_TOOL_CALLS、1..10000 に制限）
+        max_tool_output_chars: 300000   # agent() が maxToolOutputChars を省略した場合の子エージェントのデフォルト出力文字数（HERMES_DYNAMIC_WORKFLOWS_MAX_TOOL_OUTPUT_CHARS、1..20000000 に制限）
         max_nesting_depth: 2          # workflow() の最大ネスト深度（ルート + N 階層）。実行全体の上限は全階層に適用される
         workflow_timeout_seconds: 900 # 実行全体のウォールクロックタイムアウト（一時停止時間を除く）
         child_timeout_seconds: 300    # 単一の子エージェントのタイムアウト
@@ -130,11 +132,12 @@ findings = await pipeline(
 return await agent("検証済みの結果を統合する:\n" + json.dumps(findings), {"provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 6, "maxToolCalls": 8, "maxToolOutputChars": 120000})
 ```
 
-- `agent(prompt, opts)` は子エージェントを起動します。各呼び出しは `provider`、正規の `model`、
-  `reasoningEffort`、`maxToolCalls`、`maxToolOutputChars` をインラインで必ず宣言します。`maxTurns` は省略可能で、
-  省略時はプラグインの `max_turns` 設定（デフォルト 150、1..1000 に制限）から解決されます。明示的なインライン
-  `maxTurns` はこの設定を上書きします。形式不正または明示的な無効値は、エージェント予約・起動前に失敗します。
-  preset はロール指示とツール権限だけを定義し、ルーティングや予算を提供できません。Bedrock と `codex_app_server` は workflow reasoning effort を転送しないため、子エージェント起動前に失敗します。
+- `agent(prompt, opts)` は子エージェントを起動します。各呼び出しでは `provider`、正規の `model`、
+  `reasoningEffort` をインラインで必ず指定します。`maxTurns`、`maxToolCalls`、`maxToolOutputChars` は省略可能で、
+  省略時はプラグイン設定の `max_turns`（150）、`max_tool_calls`（50）、`max_tool_output_chars`（300000）から解決され、
+  それぞれのハード上限内に制限されます。明示的なインライン値は設定されたデフォルトを上書きします。形式不正または
+  明示的／設定値の無効な予算は、エージェントの予約・起動前に失敗します。解決済みの予算はレジュームキャッシュの
+  識別子にも含まれます。preset はロール指示とツール権限だけを定義し、ルーティングや予算を提供できません。Bedrock と `codex_app_server` は workflow reasoning effort を転送しないため、子エージェント起動前に失敗します。
 - `pipeline`（デフォルト、バリアなし）／`parallel`（バリアあり）が並行処理を扱います。
   `phase`／`log` は進捗を報告し、`workflow()` は名前付きワークフローをインラインで実行し、`args` /
   `budget` は入力引数とトークン予算にアクセスします。

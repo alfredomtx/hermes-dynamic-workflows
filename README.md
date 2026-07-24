@@ -56,6 +56,8 @@ plugins:
         max_concurrency: 16           # Hard cap on concurrency
         max_agents: 1000              # Max total agents per run (runaway guard)
         max_turns: 150                # Default logical turns when agent() omits maxTurns (HERMES_DYNAMIC_WORKFLOWS_MAX_TURNS; clamped to 1..1000)
+        max_tool_calls: 50             # Default child tool calls when agent() omits maxToolCalls (HERMES_DYNAMIC_WORKFLOWS_MAX_TOOL_CALLS; clamped to 1..10000)
+        max_tool_output_chars: 300000   # Default child tool-output chars when agent() omits maxToolOutputChars (HERMES_DYNAMIC_WORKFLOWS_MAX_TOOL_OUTPUT_CHARS; clamped to 1..20000000)
         max_nesting_depth: 2          # Max workflow() nesting depth (root + N levels); run-wide caps still bind across all levels
         workflow_timeout_seconds: 900 # Wall-clock timeout for the whole run (excludes paused time)
         child_timeout_seconds: 300    # Timeout for a single child agent
@@ -172,10 +174,12 @@ return await agent("Synthesize the verified findings:\n" + json.dumps(findings),
 ```
 
 - `agent(prompt, opts)` spawns a child agent. Every call requires inline `provider`,
-  canonical `model`, `reasoningEffort`, `maxToolCalls`, and `maxToolOutputChars`.
-  `maxTurns` is optional: when omitted, it resolves from the plugin's `max_turns`
-  setting (default 150, clamped to 1..1000); an explicit inline `maxTurns` overrides
-  that setting. Malformed or invalid explicit values fail before reservation and launch.
+  canonical `model`, and `reasoningEffort`. `maxTurns`, `maxToolCalls`, and
+  `maxToolOutputChars` are optional: omitted values resolve from plugin config
+  `max_turns` (150), `max_tool_calls` (50), and `max_tool_output_chars` (300000),
+  each clamped to its hard ceiling; explicit inline values override the configured
+  defaults. Malformed or invalid explicit/configured values fail before reservation
+  and launch. Resolved budgets are included in resume-cache identity.
   Presets define role instructions and tool permissions only; routing and budgets cannot
   come from presets. Current Bedrock and `codex_app_server` transports do not forward
   workflow reasoning effort, so those runtimes fail before child launch.

@@ -48,6 +48,8 @@ plugins:
         max_concurrency: 16           # 并发上限硬限制
         max_agents: 1000              # 单个 run 的 agent 总数上限（防逃逸）
         max_turns: 150                # agent() 省略 maxTurns 时的默认逻辑轮数（HERMES_DYNAMIC_WORKFLOWS_MAX_TURNS；限制在 1..1000）
+        max_tool_calls: 50             # agent() 省略 maxToolCalls 时的默认子代理 tool call 数（HERMES_DYNAMIC_WORKFLOWS_MAX_TOOL_CALLS；限制在 1..10000）
+        max_tool_output_chars: 300000   # agent() 省略 maxToolOutputChars 时的默认子代理输出字符数（HERMES_DYNAMIC_WORKFLOWS_MAX_TOOL_OUTPUT_CHARS；限制在 1..20000000）
         max_nesting_depth: 2          # workflow() 最大嵌套深度（根 + N 层）；run 级别上限仍跨所有层级生效
         workflow_timeout_seconds: 900 # 整个 run 的 wall-clock 超时（不含暂停时间）
         child_timeout_seconds: 300    # 单个子 agent 超时
@@ -116,10 +118,11 @@ findings = await pipeline(
 return await agent("Synthesize the verified findings:\n" + json.dumps(findings), {"provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 6, "maxToolCalls": 8, "maxToolOutputChars": 120000})
 ```
 
-- `agent(prompt, opts)` 起一个子代理。每次调用都必须内联声明 `provider`、规范 `model`、
-  `reasoningEffort`、`maxToolCalls` 和 `maxToolOutputChars`。`maxTurns` 可以省略；省略时从插件的
-  `max_turns` 设置解析（默认 150，限制在 1..1000），显式内联的 `maxTurns` 会覆盖该设置。
-  格式错误或显式无效值会在预留 agent 和启动前失败。preset 只定义角色指令和工具权限，不能提供路由或预算。
+- `agent(prompt, opts)` 起一个子代理。每次调用都必须内联声明 `provider`、规范 `model` 和
+  `reasoningEffort`。`maxTurns`、`maxToolCalls` 和 `maxToolOutputChars` 都可以省略；省略时分别从插件配置
+  `max_turns`（150）、`max_tool_calls`（50）和 `max_tool_output_chars`（300000）解析，并限制在各自硬上限内；
+  显式内联值优先于配置默认值。格式错误或显式/配置无效值会在预留 agent 和启动前失败，解析后的预算也会进入恢复缓存指纹。
+  preset 只定义角色指令和工具权限，不能提供路由或预算。
   Bedrock 和 `codex_app_server` 当前不会转发 workflow reasoning effort，因此会在子代理启动前失败。
 - `pipeline`（默认，无栅栏）/ `parallel`（栅栏）做并发；`phase`/`log` 报告进度；
   `workflow()` 内联跑命名工作流；`args` / `budget` 取入参与 token 预算。

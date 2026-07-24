@@ -626,7 +626,8 @@ def _validate_agent_opts(opts: dict[str, Any]) -> None:
         ("maxToolCalls", 10000),
         ("maxToolOutputChars", 20_000_000),
     ):
-        _required_limit(opts, key, upper)
+        if key in opts:
+            _required_limit(opts, key, upper)
 
 
 def _required_limit(opts: dict[str, Any], key: str, upper: int) -> int:
@@ -645,6 +646,20 @@ def _resolve_max_turns(opts: dict[str, Any], config: Any) -> int:
         return _required_limit(opts, "maxTurns", 1000)
     configured = getattr(config, "max_turns", 150)
     return _required_limit({"maxTurns": configured}, "maxTurns", 1000)
+
+
+def _resolve_tool_budget(
+    opts: dict[str, Any],
+    key: str,
+    config: Any,
+    config_attr: str,
+    default: int,
+    upper: int,
+) -> int:
+    if key in opts:
+        return _required_limit(opts, key, upper)
+    configured = getattr(config, config_attr, default)
+    return _required_limit({key: configured}, key, upper)
 
 
 def _check_vm_array_length(items: list[Any]) -> None:
@@ -769,8 +784,22 @@ def _resolve_agent_spec(
     )
     provider = str(opts["provider"]).strip()
     model = str(opts["model"]).strip()
-    max_tool_calls = _required_limit(opts, "maxToolCalls", 10000)
-    max_tool_output_chars = _required_limit(opts, "maxToolOutputChars", 20_000_000)
+    max_tool_calls = _resolve_tool_budget(
+        opts,
+        "maxToolCalls",
+        config,
+        "max_tool_calls",
+        50,
+        10_000,
+    )
+    max_tool_output_chars = _resolve_tool_budget(
+        opts,
+        "maxToolOutputChars",
+        config,
+        "max_tool_output_chars",
+        300_000,
+        20_000_000,
+    )
     _prepare_mcp_tool_registry(config)
     has_inline_or_meta_tool_surface = _has_inline_tool_surface(opts) or (
         not explicit_type

@@ -500,7 +500,7 @@ return await agent("go", {"agentType": "reader", "label": "reader", "provider": 
         self.assertEqual(request.resolved.allowed_tools, ("read_file",))
         self.assertTrue(request.resolved.allowed_tools_explicit)
 
-    def test_agent_requires_inline_provider_model_effort_and_tool_budgets_before_launch(self):
+    def test_agent_requires_inline_provider_model_and_effort_before_launch(self):
         complete = {
             "provider": "openai-codex",
             "model": "gpt-5.6-luna",
@@ -509,7 +509,7 @@ return await agent("go", {"agentType": "reader", "label": "reader", "provider": 
             "maxToolCalls": 16,
             "maxToolOutputChars": 200000,
         }
-        for missing in (key for key in complete if key != "maxTurns"):
+        for missing in ("provider", "model", "reasoningEffort"):
             opts = {key: value for key, value in complete.items() if key != missing}
             script = (
                 'meta = {"name": "missing-routing", "description": "Test workflow"}\n'
@@ -1426,6 +1426,12 @@ class MaxTurnsRuntimeTests(unittest.TestCase):
     def test_plugin_max_turns_default_is_150(self):
         self.assertEqual(PluginConfig().max_turns, 150)
 
+    def test_plugin_tool_budget_defaults_are_finite(self):
+        config = PluginConfig()
+
+        self.assertEqual(config.max_tool_calls, 50)
+        self.assertEqual(config.max_tool_output_chars, 300_000)
+
     def test_max_turns_env_override_is_clamped_to_workflow_range(self):
         for raw, expected in (("275", 275), ("0", 1), ("1001", 1000), ("not-an-int", 150)):
             with self.subTest(raw=raw), patch.dict(
@@ -1433,6 +1439,25 @@ class MaxTurnsRuntimeTests(unittest.TestCase):
                 {"HERMES_DYNAMIC_WORKFLOWS_MAX_TURNS": raw},
             ):
                 self.assertEqual(load_config().max_turns, expected)
+
+    def test_tool_budget_env_overrides_are_clamped_to_hard_ceilings(self):
+        cases = (
+            ("275", "400000", 275, 400000),
+            ("0", "0", 1, 1),
+            ("10001", "20000001", 10000, 20_000_000),
+            ("not-an-int", "not-an-int", 50, 300_000),
+        )
+        for calls, output, expected_calls, expected_output in cases:
+            with self.subTest(calls=calls, output=output), patch.dict(
+                os.environ,
+                {
+                    "HERMES_DYNAMIC_WORKFLOWS_MAX_TOOL_CALLS": calls,
+                    "HERMES_DYNAMIC_WORKFLOWS_MAX_TOOL_OUTPUT_CHARS": output,
+                },
+            ):
+                config = load_config()
+                self.assertEqual(config.max_tool_calls, expected_calls)
+                self.assertEqual(config.max_tool_output_chars, expected_output)
 
     def test_omitted_inline_max_turns_uses_config_default(self):
         options = dict(self._base)
@@ -1467,6 +1492,45 @@ class MaxTurnsRuntimeTests(unittest.TestCase):
         )
 
         self.assertEqual(runner.requests[0].max_turns, 7)
+
+    def test_omitted_inline_tool_budgets_use_config_defaults(self):
+        options = dict(self._base)
+        options.pop("maxToolCalls")
+        options.pop("maxToolOutputChars")
+        runner = FakeRunner()
+
+        result = run_workflow(
+            self._script(options),
+            WorkflowOptions(
+                config=PluginConfig(max_tool_calls=42, max_tool_output_chars=123_456),
+                child_runner=runner,
+            ),
+        )
+
+        request = runner.requests[0]
+        self.assertEqual(request.max_tool_calls, 42)
+        self.assertEqual(request.max_tool_output_chars, 123_456)
+        self.assertIsNotNone(request.resolved)
+        assert request.resolved is not None
+        self.assertEqual(request.resolved.max_tool_calls, 42)
+        self.assertEqual(request.resolved.max_tool_output_chars, 123_456)
+        agent = result.state.snapshot()["agents"][0]
+        self.assertEqual(agent["max_tool_calls"], 42)
+        self.assertEqual(agent["max_tool_output_chars"], 123_456)
+
+    def test_inline_tool_budgets_override_config_defaults(self):
+        runner = FakeRunner()
+
+        run_workflow(
+            self._script({**self._base, "maxToolCalls": 7, "maxToolOutputChars": 2345}),
+            WorkflowOptions(
+                config=PluginConfig(max_tool_calls=42, max_tool_output_chars=123_456),
+                child_runner=runner,
+            ),
+        )
+
+        self.assertEqual(runner.requests[0].max_tool_calls, 7)
+        self.assertEqual(runner.requests[0].max_tool_output_chars, 2345)
 
     def test_inline_budgets_are_recorded_and_resolved(self):
         runner = FakeRunner()
@@ -1503,14 +1567,20 @@ class MaxTurnsRuntimeTests(unittest.TestCase):
                     )
                     self.assertEqual(getattr(runner.requests[0], _request_field(key)), value)
 
-    def test_missing_budget_fields_fail_before_launch(self):
-        for key in ("maxToolCalls", "maxToolOutputChars"):
-            options = dict(self._base)
-            options.pop(key)
+    def test_invalid_configured_tool_budgets_fail_before_launch(self):
+        options = dict(self._base)
+        options.pop("maxToolCalls")
+        options.pop("maxToolOutputChars")
+        for config in (
+            PluginConfig(max_tool_calls=0),
+            PluginConfig(max_tool_output_chars=0),
+            PluginConfig(max_tool_calls=10_001),
+            PluginConfig(max_tool_output_chars=20_000_001),
+        ):
             runner = FakeRunner()
-            with self.subTest(key=key), self.assertRaises(Exception) as ctx:
-                run_workflow(self._script(options), WorkflowOptions(config=PluginConfig(), child_runner=runner))
-            self.assertIn(f"agent() {key} is required", str(ctx.exception))
+            with self.subTest(config=config), self.assertRaises(Exception) as ctx:
+                run_workflow(self._script(options), WorkflowOptions(config=config, child_runner=runner))
+            self.assertIn("must be an integer", str(ctx.exception))
             self.assertEqual(runner.requests, [])
 
     def test_invalid_inline_budget_values_fail_before_launch(self):
@@ -1563,6 +1633,33 @@ return await agent("go", {{"agentType": "researcher", "provider": "openai-codex"
         )
         self.assertEqual(len(changed_runner.requests), 1)
         self.assertEqual(cached_runner.requests, [])
+
+    @patch("hermes_dynamic_workflows.child.runner._discoverable_child_toolsets", return_value=[])
+    def test_configured_default_budgets_change_cache_identity(self, _toolsets):
+        options = dict(self._base)
+        options.pop("maxToolCalls")
+        options.pop("maxToolOutputChars")
+        script = self._script(options)
+        first_cache = ResumeCache()
+        run_workflow(
+            script,
+            WorkflowOptions(
+                config=PluginConfig(max_tool_calls=16, max_tool_output_chars=200_000),
+                child_runner=FakeRunner(),
+                resume_cache=first_cache,
+            ),
+        )
+
+        changed_runner = FakeRunner()
+        run_workflow(
+            script,
+            WorkflowOptions(
+                config=PluginConfig(max_tool_calls=8, max_tool_output_chars=200_000),
+                child_runner=changed_runner,
+                resume_cache=ResumeCache(first_cache.current),
+            ),
+        )
+        self.assertEqual(len(changed_runner.requests), 1)
 
 
 def _request_field(key):
