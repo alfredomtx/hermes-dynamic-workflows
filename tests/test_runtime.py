@@ -1429,8 +1429,8 @@ class MaxTurnsRuntimeTests(unittest.TestCase):
     def test_plugin_tool_budget_defaults_are_finite(self):
         config = PluginConfig()
 
-        self.assertEqual(config.max_tool_calls, 50)
-        self.assertEqual(config.max_tool_output_chars, 300_000)
+        self.assertEqual(config.max_tool_calls, 200)
+        self.assertEqual(config.max_tool_output_chars, 2_000_000)
 
     def test_max_turns_env_override_is_clamped_to_workflow_range(self):
         for raw, expected in (("275", 275), ("0", 1), ("1001", 1000), ("not-an-int", 150)):
@@ -1445,7 +1445,7 @@ class MaxTurnsRuntimeTests(unittest.TestCase):
             ("275", "400000", 275, 400000),
             ("0", "0", 1, 1),
             ("10001", "20000001", 10000, 20_000_000),
-            ("not-an-int", "not-an-int", 50, 300_000),
+            ("not-an-int", "not-an-int", 200, 2_000_000),
         )
         for calls, output, expected_calls, expected_output in cases:
             with self.subTest(calls=calls, output=output), patch.dict(

@@ -42,7 +42,7 @@ required; `whenToUse`, `phases`, and `agents` optional). `meta["agents"]` is a p
 
 | Global | Signature | Description |
 |---|---|---|
-| `agent` | `await agent(prompt, opts=None)` | Spawns a subagent. Without a schema it returns text; with `schema` it returns the validated object. Every call requires inline `provider`, canonical `model`, and `reasoningEffort`. `maxTurns`, `maxToolCalls`, and `maxToolOutputChars` are optional; omitted values resolve from plugin config (`max_turns` 150, `max_tool_calls` 50, `max_tool_output_chars` 300000), clamped to their hard ceilings, while explicit inline values override the defaults. Malformed or invalid explicit/configured values fail before reservation. Resolved budgets are part of resume-cache identity. Role/tool opts include `agentType`, `instructions`/`systemPrompt`, `toolsets`, `allowedTools`, and `disallowedTools`. Returns `None` if skipped by the user. |
+| `agent` | `await agent(prompt, opts=None)` | Spawns a subagent. Without a schema it returns text; with `schema` it returns the validated object. Every call requires inline `provider`, canonical `model`, and `reasoningEffort`. `maxTurns`, `maxToolCalls`, and `maxToolOutputChars` are optional; omitted values resolve from plugin config (`max_turns` 150, `max_tool_calls` 200, `max_tool_output_chars` 2000000), clamped to their hard ceilings, while explicit inline values override the defaults. Malformed or invalid explicit/configured values fail before reservation. Resolved budgets are part of resume-cache identity. Role/tool opts include `agentType`, `instructions`/`systemPrompt`, `toolsets`, `allowedTools`, and `disallowedTools`. Returns `None` if skipped by the user. |
 | `pipeline` | `await pipeline(items, stage1, …)` | Each item flows through the stages independently, **no barrier**. Stage callbacks receive `(prev, original, index)`; if a stage throws → that item becomes `None`. The default for multi-stage work. |
 | `parallel` | `await parallel(thunks)` | Runs concurrently, **with a barrier**: returns only once all complete. A single failure → `None` in the results (the whole call does not throw). |
 | `phase` | `phase(title)` | Starts a progress group. |
@@ -281,10 +281,10 @@ share the cache prefix. Inline `instructions` and `meta["agents"]` runtime prese
   `agent()` call omits it, clamped to 1..1000 by config loading. The environment override
   is `HERMES_DYNAMIC_WORKFLOWS_MAX_TURNS`; an explicit inline `maxTurns` always wins and
   this setting is not inherited from role presets.
-- **Default child tool calls** `max_tool_calls` (default 50): supplies `maxToolCalls` when
+- **Default child tool calls** `max_tool_calls` (default 200): supplies `maxToolCalls` when
   an inline `agent()` call omits it, clamped to 1..10000. The environment override is
   `HERMES_DYNAMIC_WORKFLOWS_MAX_TOOL_CALLS`; an explicit inline value always wins.
-- **Default child tool output** `max_tool_output_chars` (default 300000): supplies
+- **Default child tool output** `max_tool_output_chars` (default 2000000): supplies
   `maxToolOutputChars` when an inline `agent()` call omits it, clamped to 1..20000000.
   The environment override is `HERMES_DYNAMIC_WORKFLOWS_MAX_TOOL_OUTPUT_CHARS`; an
   explicit inline value always wins. Both resolved values are included in resume identity.

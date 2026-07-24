@@ -56,8 +56,8 @@ plugins:
         max_concurrency: 16           # Hard cap on concurrency
         max_agents: 1000              # Max total agents per run (runaway guard)
         max_turns: 150                # Default logical turns when agent() omits maxTurns (HERMES_DYNAMIC_WORKFLOWS_MAX_TURNS; clamped to 1..1000)
-        max_tool_calls: 50             # Default child tool calls when agent() omits maxToolCalls (HERMES_DYNAMIC_WORKFLOWS_MAX_TOOL_CALLS; clamped to 1..10000)
-        max_tool_output_chars: 300000   # Default child tool-output chars when agent() omits maxToolOutputChars (HERMES_DYNAMIC_WORKFLOWS_MAX_TOOL_OUTPUT_CHARS; clamped to 1..20000000)
+        max_tool_calls: 200             # Default child tool calls when agent() omits maxToolCalls (HERMES_DYNAMIC_WORKFLOWS_MAX_TOOL_CALLS; clamped to 1..10000)
+        max_tool_output_chars: 2000000  # Default child tool-output chars when agent() omits maxToolOutputChars (HERMES_DYNAMIC_WORKFLOWS_MAX_TOOL_OUTPUT_CHARS; clamped to 1..20000000)
         max_nesting_depth: 2          # Max workflow() nesting depth (root + N levels); run-wide caps still bind across all levels
         workflow_timeout_seconds: 900 # Wall-clock timeout for the whole run (excludes paused time)
         child_timeout_seconds: 300    # Timeout for a single child agent
@@ -176,7 +176,7 @@ return await agent("Synthesize the verified findings:\n" + json.dumps(findings),
 - `agent(prompt, opts)` spawns a child agent. Every call requires inline `provider`,
   canonical `model`, and `reasoningEffort`. `maxTurns`, `maxToolCalls`, and
   `maxToolOutputChars` are optional: omitted values resolve from plugin config
-  `max_turns` (150), `max_tool_calls` (50), and `max_tool_output_chars` (300000),
+  `max_turns` (150), `max_tool_calls` (200), and `max_tool_output_chars` (2000000),
   each clamped to its hard ceiling; explicit inline values override the configured
   defaults. Malformed or invalid explicit/configured values fail before reservation
   and launch. Resolved budgets are included in resume-cache identity.

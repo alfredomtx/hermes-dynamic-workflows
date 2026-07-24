@@ -22,11 +22,11 @@ class PluginConfig:
     # Default child tool-call ceiling when agent() omits maxToolCalls.
     # Inline values still take precedence; the runtime validates against the
     # hard workflow ceiling before reserving or launching a child.
-    max_tool_calls: int = 50
+    max_tool_calls: int = 200
     # Default child tool-output character ceiling when agent() omits
     # maxToolOutputChars. Inline values still take precedence; the runtime
     # validates against the hard workflow ceiling before launch.
-    max_tool_output_chars: int = 300_000
+    max_tool_output_chars: int = 2_000_000
     # Maximum workflow() nesting depth. depth=0 is the top-level run; each
     # nested workflow() call goes one deeper. A value of N allows the root plus
     # N nested levels (N+1 total), so the default 2 permits root -> child ->

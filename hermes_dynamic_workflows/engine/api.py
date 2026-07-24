@@ -789,7 +789,7 @@ def _resolve_agent_spec(
         "maxToolCalls",
         config,
         "max_tool_calls",
-        50,
+        200,
         10_000,
     )
     max_tool_output_chars = _resolve_tool_budget(
@@ -797,7 +797,7 @@ def _resolve_agent_spec(
         "maxToolOutputChars",
         config,
         "max_tool_output_chars",
-        300_000,
+        2_000_000,
         20_000_000,
     )
     _prepare_mcp_tool_registry(config)
