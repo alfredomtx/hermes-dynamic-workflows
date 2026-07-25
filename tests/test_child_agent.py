@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import sys
 import os
@@ -2321,6 +2322,100 @@ class ChildApprovalPolicyTests(unittest.TestCase):
         with patch.dict(sys.modules, {"tools": tools_pkg, "tools.approval": approval_mod}):
             cb = _make_child_approval_callback("inherit")
             self.assertEqual(cb("rm -rf build", "recursive delete"), "once")
+
+
+def _real_core_root() -> Path | None:
+    """Locate the Hermes checkout used by the real-core compatibility test."""
+    candidates = []
+    configured = os.environ.get("HERMES_AGENT_ROOT")
+    if configured:
+        candidates.append(Path(configured))
+    candidates.extend(Path(entry) for entry in sys.path if entry)
+    candidates.append(Path.home() / ".hermes" / "hermes-agent")
+    for root in candidates:
+        if (root / "run_agent.py").is_file() and (root / "agent" / "tool_budget.py").is_file():
+            return root.resolve()
+    return None
+
+
+def _load_real_core_types():
+    """Import AIAgent and ToolBudget from the selected Hermes checkout."""
+    root = _real_core_root()
+    if root is None:
+        raise ImportError("Hermes core checkout with run_agent.py is unavailable")
+    root_text = str(root)
+    if root_text not in sys.path:
+        sys.path.insert(0, root_text)
+    importlib.invalidate_caches()
+    from agent.tool_budget import ToolBudget
+    from run_agent import AIAgent
+
+    return AIAgent, ToolBudget
+
+
+def _real_core_tool_budget_importable() -> bool:
+    try:
+        _load_real_core_types()
+        return True
+    except Exception:
+        return False
+
+
+@unittest.skipUnless(
+    _real_core_tool_budget_importable(),
+    "Hermes core checkout with AIAgent and ToolBudget is not importable",
+)
+class RealCoreToolBudgetCompatibilityTests(unittest.TestCase):
+    """Exercise the plugin's budgeted child path with the real Hermes core.
+
+    RED provenance: before core commit feda20626d0baf1acd0247577d65ffc92935599d,
+    the same constructor call raised ``TypeError: unexpected keyword argument
+    'tool_budget'`` because the core AIAgent signature did not accept the
+    plugin's ToolBudget. The RED check uses ``HERMES_AGENT_ROOT`` to point at a
+    disposable checkout of that parent commit; it never resets the installed
+    live core checkout.
+    """
+
+    def test_budgeted_child_uses_real_core_constructor_and_stores_budget(self):
+        AIAgent, ToolBudget = _load_real_core_types()
+        request = ChildAgentRequest(
+            id=1,
+            prompt="work",
+            label="real-core-budget",
+            phase=None,
+            toolsets=[],
+            provider="openrouter",
+            model="test-model",
+            max_turns=7,
+            max_tool_calls=3,
+            max_tool_output_chars=42,
+            reasoning_effort="high",
+        )
+        runtime = {
+            "provider": "openrouter",
+            "model": "test-model",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "test-key",
+            "api_mode": "chat_completions",
+        }
+
+        with (
+            patch("hermes_dynamic_workflows.child.runner._create_session_db", return_value=None),
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.OpenAI"),
+        ):
+            child = HermesChildAgentRunner(PluginConfig())._build_agent(
+                request,
+                runtime,
+                [],
+                WorkspaceLease(task_id="real-core-budget", cwd="/tmp"),
+                None,
+            )
+
+        self.assertIsInstance(child, AIAgent)
+        self.assertIsInstance(child.tool_budget, ToolBudget)
+        self.assertEqual(child.tool_budget.max_calls, 3)
+        self.assertEqual(child.tool_budget.max_output_chars, 42)
 
 
 def _core_refresh_importable() -> bool:
