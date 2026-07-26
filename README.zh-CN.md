@@ -183,6 +183,19 @@ toolsets: [web, file, terminal]
 运行时持久化脚本与每个子代理的完整执行链路（transcript），并在完成时把
 `<task-notification>` 注入对话——无需轮询。用 `/workflows` 看历史与详情。
 
+## 原生 Codex 阶段
+
+工作流也提供用于有限仓库任务的原生 `codex(opts)` 阶段：
+
+```python
+return await codex({"mode": "discover", "workdir": "/absolute/repo", "contract": "Inspect the repository and report findings."})
+```
+
+支持 `code`、`discover`、`debug`、`verify` 四种模式。`code` 必须提供非空相对路径
+列表 `allowFiles`，只读模式禁止该字段。可选字段为 `timeout`、`label`、`phase`；启动器
+默认使用 `gpt-5.6-luna` 和 `high` reasoning。没有编排语义的单个有限阶段应直接使用
+父 Codex。不要走 `agent() -> Codex`；Codex 阶段不会 commit、push、rebase、review 或 run tests。
+
 ## 深入
 
 实现细节（核心链路、工具与完整调用结果、prompt cache、并发与限额、权限治理、从

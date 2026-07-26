@@ -28,7 +28,8 @@ def _assert_codex_contract(text: str, source: str) -> None:
         assert mode in lowered, source
     assert "allowfiles" in lowered, source
     assert "code" in lowered and "allowfiles" in lowered, source
-    assert "single bounded" in lowered or "one bounded" in lowered, source
+    if source in {"workflow tool description", "README.md", "TECHNICAL.md"}:
+        assert "single bounded" in lowered or "one bounded" in lowered, source
     assert "agent()" in text, source
     assert (
         "agent() -> codex" in lowered

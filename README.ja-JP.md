@@ -202,6 +202,20 @@ toolsets: [web, file, terminal]
 永続化し、完了時に `<task-notification>` を会話に注入します。ポーリングは不要です。
 履歴と詳細を表示するには `/workflows` を使用してください。
 
+## ネイティブ Codex ステージ
+
+ワークフローには、限定されたリポジトリ作業向けのネイティブ `codex(opts)` ステージもあります。
+
+```python
+return await codex({"mode": "discover", "workdir": "/absolute/repo", "contract": "Inspect the repository and report findings."})
+```
+
+モードは `code`、`discover`、`debug`、`verify` です。`code` では空でない相対パスのリスト
+`allowFiles` が必須で、読み取り専用モードでは禁止されます。任意フィールドは `timeout`、
+`label`、`phase`、起動時の既定値は `gpt-5.6-luna` と `high` reasoning です。編成のない単一の
+限定ステージには親 Codex を直接使います。`agent() -> Codex` にはルーティングせず、Codex
+ステージは commit、push、rebase、review、run tests を行いません。
+
 ## ディープダイブ
 
 実装の詳細（コア実行パス、ツールと完全な呼び出し結果、プロンプトキャッシュ、並行処理と制限、

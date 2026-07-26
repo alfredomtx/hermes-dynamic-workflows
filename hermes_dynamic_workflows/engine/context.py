@@ -10,6 +10,7 @@ from time import monotonic
 from typing import Any, Callable, Iterator
 
 from .cache import ResumeCache
+from .codex import CodexStageRunner
 from ..core.config import PluginConfig
 from ..core.errors import (
     WorkflowDeadlineExceeded,
@@ -69,6 +70,7 @@ class PauseGate:
 class WorkflowExecutionContext:
     config: PluginConfig
     runner: ChildAgentRunner
+    codex_runner: CodexStageRunner
     stop_event: threading.Event
     pause_gate: PauseGate
     resume_cache: ResumeCache

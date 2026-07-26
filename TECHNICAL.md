@@ -438,6 +438,23 @@ ought to have. Tool inputs / `meta` / config / environment cannot set `total`.
   isolation, not a security sandbox; the worktree is deleted after use by default
   (`keep_worktrees` off).
 
+## Native Codex stage
+
+`codex(opts)` invokes the existing `codex-coder.py` launcher directly as a workflow
+worker. The supported modes are `code`, `discover`, `debug`, and `verify`; a `code`
+stage requires a non-empty relative-path `allowFiles` list, while read-only modes
+prohibit `allowFiles`. The complete shape is:
+
+```python
+return await codex({"mode": "discover", "workdir": "/absolute/repo", "contract": "Inspect the repository and report findings."})
+```
+
+Optional fields are `timeout`, `label`, and `phase`. The launcher defaults are
+`gpt-5.6-luna` and `high` reasoning. The stage uses the same worker record, topology,
+concurrency, resume cache, journal, and token accounting as `agent()`, but it never
+routes `agent() -> Codex` and never performs commit, push, rebase, review, or test
+behavior. Use direct parent Codex for one single bounded stage without orchestration.
+
 ## Control (Pause / Resume / Stop / Restart)
 
 The standalone dashboard `hermes-workflows` (in a separate terminal) sends control back

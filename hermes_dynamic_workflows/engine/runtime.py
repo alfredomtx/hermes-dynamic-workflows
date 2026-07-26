@@ -13,6 +13,7 @@ from typing import Any, Callable
 
 from .api import WorkflowAPI
 from .cache import ResumeCache
+from .codex import CodexStageRunner
 from ..core.config import PluginConfig, load_config
 from ..core.errors import ChildAgentError
 from .context import PauseGate, WorkflowExecutionContext
@@ -32,6 +33,7 @@ class WorkflowOptions:
     cwd: str | None = None
     config: PluginConfig | None = None
     child_runner: ChildAgentRunner | None = None
+    codex_runner: CodexStageRunner | None = None
     stop_event: threading.Event | None = None
     pause_gate: PauseGate | None = None
     resume_cache: ResumeCache | None = None
@@ -131,6 +133,11 @@ async def _run_workflow_async(script: str, options: WorkflowOptions | None = Non
         context = WorkflowExecutionContext(
             config=config,
             runner=child_runner,
+            codex_runner=(
+                options.codex_runner
+                if options.codex_runner is not None
+                else _production_codex_runner()
+            ),
             stop_event=stop_event,
             pause_gate=pause_gate,
             resume_cache=options.resume_cache or ResumeCache(),
@@ -199,3 +206,9 @@ def _build_namespace(api: WorkflowAPI) -> dict[str, Any]:
     # Per-iteration guard injected into every `while` test by the sandbox.
     namespace[LOOP_GUARD_NAME] = api.context.tick_loop
     return namespace
+
+
+def _production_codex_runner() -> Any:
+    from .codex import SubprocessCodexStageRunner
+
+    return SubprocessCodexStageRunner()

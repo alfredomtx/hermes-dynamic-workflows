@@ -288,6 +288,21 @@ At runtime the plugin persists the script and the full execution trace (transcri
 every child agent, and injects a `<task-notification>` into the conversation on
 completion — no polling required. Use `/workflows` to view history and details.
 
+## Native Codex stages
+
+Workflows also expose `codex(opts)` as a native stage for bounded repository work:
+
+```python
+return await codex({"mode": "discover", "workdir": "/absolute/repo", "contract": "Inspect the repository and report findings."})
+```
+
+The modes are `code`, `discover`, `debug`, and `verify`. `allowFiles` is required as
+a non-empty relative-path list for `code` and is prohibited for read-only modes.
+Optional fields are `timeout`, `label`, and `phase`; launcher defaults are
+`gpt-5.6-luna` with `high` reasoning. Use direct parent Codex for one single bounded
+stage with no orchestration semantics. Do not route `agent() -> Codex`; Codex stages
+never commit, push, rebase, review, or run tests.
+
 ## Deep Dive
 
 For implementation details (core execution path, tools and full call results, prompt

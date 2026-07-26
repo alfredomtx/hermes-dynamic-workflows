@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import importlib
 import inspect
+import math
 import threading
 from contextvars import ContextVar
 from pathlib import Path
@@ -13,6 +14,11 @@ from time import monotonic
 from typing import Any, Callable
 
 from .cache import agent_fingerprint, is_cache_miss
+from .codex import (
+    CodexStageRequest,
+    canonical_workdir_and_head,
+    codex_stage_fingerprint_inputs,
+)
 from ..core.text import preview
 from ..core.errors import (
     ChildAgentError,
@@ -76,6 +82,7 @@ class WorkflowAPI:
         self.context = context
         self.frame = frame
         self.runner = context.runner
+        self.codex_runner = context.codex_runner
         self.config = context.config
         self.resume_cache = context.resume_cache
         self.depth = depth
@@ -85,6 +92,7 @@ class WorkflowAPI:
     def globals(self) -> dict[str, Any]:
         return {
             "agent": self.agent,
+            "codex": self.codex,
             "parallel": self.parallel,
             "pipeline": self.pipeline,
             "phase": self.phase,
@@ -348,6 +356,139 @@ class WorkflowAPI:
     def _run_child(self, request: ChildAgentRequest, record: AgentRecord) -> Any:
         return self.runner.run(request)
 
+    async def codex(self, opts: dict[str, Any]) -> dict[str, Any]:
+        self._check_deadline()
+        validated = await asyncio.to_thread(
+            _validate_codex_opts,
+            opts,
+            current_phase=self.frame.current_phase,
+        )
+        topology: TopologyRecord | None = None
+        topology_token = None
+        if _active_topology(self.frame) is None:
+            topology = self._begin_sequential_step()
+            topology_token = _bind_topology(self.frame, topology)
+        try:
+            return await asyncio.to_thread(self._codex_sync, validated)
+        finally:
+            if topology_token is not None:
+                _ACTIVE_TOPOLOGIES.reset(topology_token)
+            if topology is not None:
+                self._finish_topology(topology)
+
+    def _codex_sync(
+        self,
+        validated: tuple[CodexStageRequest, str, str | None, str],
+    ) -> dict[str, Any]:
+        self._check_deadline()
+        request, label, phase_name, start_head = validated
+        fingerprint = agent_fingerprint(
+            request.contract,
+            codex_stage_fingerprint_inputs(request, start_head),
+        )
+        journal_key = f"v2:{fingerprint}"
+
+        with self._lock:
+            agent_id = self.context.reserve_agent()
+            record = AgentRecord(
+                id=agent_id,
+                label=label,
+                phase=phase_name,
+                prompt=request.contract,
+                prompt_preview=preview(request.contract, 160),
+                runner="codex-cli",
+                agent_type="codex-cli",
+                isolation="shared",
+                workspace=request.workdir,
+                provider="openai-codex",
+                model=request.model,
+                reasoning_effort=request.reasoning,
+            )
+            active_topology = _active_topology(self.frame)
+            if active_topology is not None:
+                active_topology.add_agent(agent_id)
+            self.frame.agents.append(record)
+            self._notify()
+
+        cached = self.resume_cache.get(fingerprint)
+        if not is_cache_miss(cached):
+            record.status = "done"
+            record.attempts = 0
+            record.started_at = monotonic()
+            record.ended_at = record.started_at
+            record.result_preview = f"(cached) {preview(cached, 170)}"
+            _apply_codex_receipt(record, cached)
+            record.result_preview = f"(cached) {preview(cached, 170)}"
+            self.resume_cache.put(fingerprint, cached)
+            self._journal(
+                {
+                    "type": "result",
+                    "key": journal_key,
+                    "agentId": str(agent_id),
+                    "cached": True,
+                    "result": cached,
+                }
+            )
+            self._notify()
+            return cached
+
+        record.status = "running"
+        record.started_at = monotonic()
+        self._journal(
+            {
+                "type": "started",
+                "key": journal_key,
+                "agentId": str(agent_id),
+            }
+        )
+        self._notify()
+
+        try:
+            stage_deadline = min(
+                self.context.deadline,
+                monotonic() + request.timeout,
+            )
+            with self.context.agent_slot():
+                receipt = self.codex_runner.run(
+                    request,
+                    self.context.stop_event,
+                    stage_deadline,
+                )
+            if not isinstance(receipt, dict) or receipt.get("success") is not True:
+                raise WorkflowRuntimeError("Codex launcher receipt was unsuccessful")
+            _apply_codex_receipt(record, receipt)
+            self.context.record_tokens(record.tokens)
+            record.status = "done"
+            record.attempts = 1
+            self.resume_cache.put(fingerprint, receipt)
+            self._journal(
+                {
+                    "type": "result",
+                    "key": journal_key,
+                    "agentId": str(agent_id),
+                    "result": receipt,
+                }
+            )
+            return receipt
+        except WorkflowHalt:
+            raise
+        except Exception as exc:
+            record.status = "error"
+            record.attempts = 1
+            record.error = f"{type(exc).__name__}: {exc}"
+            self._journal(
+                {
+                    "type": "error",
+                    "key": journal_key,
+                    "agentId": str(agent_id),
+                    "error": record.error,
+                }
+            )
+            raise
+        finally:
+            record.ended_at = monotonic()
+            self._notify()
+
     def _begin_sequential_step(self) -> TopologyRecord:
         with self._lock:
             if self.frame._sequential_chain_open and self.frame.topologies:
@@ -577,6 +718,176 @@ _TOOL_SURFACE_OPT_KEYS = frozenset(
     {"toolsets", "allowedTools", "allowed_tools", "disallowedTools", "disallowed_tools"}
 )
 _MISSING_AGENT_TYPE_POLICIES = {"error", "fallback_warn"}
+
+_CODEX_MODES = frozenset({"code", "discover", "debug", "verify"})
+_CODEX_OPT_KEYS = frozenset(
+    {"mode", "workdir", "contract", "allowFiles", "timeout", "label", "phase"}
+)
+_MISSING = object()
+
+
+def _validate_codex_opts(
+    opts: dict[str, Any],
+    *,
+    current_phase: str | None,
+) -> tuple[CodexStageRequest, str, str | None, str]:
+    if not isinstance(opts, dict):
+        raise WorkflowRuntimeError("codex() options must be a dict")
+    unknown = sorted(str(key) for key in opts if str(key) not in _CODEX_OPT_KEYS)
+    if unknown:
+        raise WorkflowRuntimeError(
+            "unsupported codex() option(s): "
+            + ", ".join(unknown)
+            + ". Supported options are mode, workdir, contract, allowFiles, "
+            "timeout, label, and phase."
+        )
+
+    mode = opts.get("mode")
+    if not isinstance(mode, str) or mode not in _CODEX_MODES:
+        allowed = ", ".join(sorted(_CODEX_MODES))
+        raise WorkflowRuntimeError(f"codex() mode must be one of: {allowed}")
+
+    workdir = opts.get("workdir")
+    if not isinstance(workdir, str) or not workdir.strip():
+        raise WorkflowRuntimeError("codex() workdir is required")
+
+    contract = opts.get("contract")
+    if not isinstance(contract, str) or not contract.strip():
+        raise WorkflowRuntimeError("codex() contract must be non-empty text")
+
+    raw_allow_files = opts.get("allowFiles", _MISSING)
+    allow_files: tuple[str, ...]
+    if mode == "code" and raw_allow_files is _MISSING:
+        raise WorkflowRuntimeError("codex() allowFiles is required for code mode")
+    if mode != "code" and raw_allow_files is not _MISSING:
+        raise WorkflowRuntimeError("codex() allowFiles is only valid for code mode")
+    if raw_allow_files is _MISSING:
+        allow_files = ()
+    else:
+        if not isinstance(raw_allow_files, list) or not raw_allow_files:
+            raise WorkflowRuntimeError("codex() allowFiles must be a non-empty list")
+        normalized_files: list[str] = []
+        for path in raw_allow_files:
+            if not isinstance(path, str) or not path.strip():
+                raise WorkflowRuntimeError(
+                    "codex() allowFiles must contain non-empty relative paths"
+                )
+            if Path(path).is_absolute():
+                raise WorkflowRuntimeError(
+                    "codex() allowFiles must contain only relative paths"
+                )
+            normalized = Path(path).as_posix()
+            if normalized == "." or ".." in Path(path).parts:
+                raise WorkflowRuntimeError(
+                    "codex() allowFiles must name relative paths without '..'"
+                )
+            if normalized in normalized_files:
+                raise WorkflowRuntimeError("codex() allowFiles paths must be unique")
+            normalized_files.append(normalized)
+        allow_files = tuple(normalized_files)
+
+    raw_timeout = opts.get("timeout", 900)
+    if isinstance(raw_timeout, bool) or not isinstance(raw_timeout, (int, float)):
+        raise WorkflowRuntimeError("codex() timeout must be a positive number")
+    timeout = float(raw_timeout)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise WorkflowRuntimeError("codex() timeout must be a positive number")
+
+    label_value = opts.get("label", _MISSING)
+    if label_value is not _MISSING and (
+        not isinstance(label_value, str) or not label_value.strip()
+    ):
+        raise WorkflowRuntimeError("codex() label must be a non-empty string")
+    label = str(label_value) if label_value is not _MISSING else f"codex:{mode}"
+
+    phase_value = opts.get("phase", _MISSING)
+    if phase_value is not _MISSING and (
+        not isinstance(phase_value, str) or not phase_value.strip()
+    ):
+        raise WorkflowRuntimeError("codex() phase must be a non-empty string")
+    phase = str(phase_value) if phase_value is not _MISSING else current_phase
+
+    canonical_workdir, start_head = canonical_workdir_and_head(workdir)
+    return (
+        CodexStageRequest(
+            mode=mode,
+            workdir=canonical_workdir,
+            contract=contract,
+            allow_files=allow_files,
+            timeout=timeout,
+        ),
+        label,
+        phase,
+        start_head,
+    )
+
+
+def _apply_codex_receipt(record: AgentRecord, receipt: Any) -> None:
+    if not isinstance(receipt, dict):
+        return
+    usage = receipt.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+    input_tokens = _codex_usage_int(usage, "input_tokens")
+    output_tokens = _codex_usage_int(usage, "output_tokens")
+    reasoning_tokens = _codex_usage_int(
+        usage,
+        "reasoning_tokens",
+        fallback="reasoning_output_tokens",
+    )
+    total_tokens = _codex_usage_int(usage, "total_tokens")
+    if total_tokens == 0:
+        total_tokens = input_tokens + output_tokens + reasoning_tokens
+    metadata = {
+        "runner": "codex-cli",
+        "agent_type": "codex-cli",
+        "provider": "openai-codex",
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "high",
+        "transcript_path": _codex_artifact_directory(receipt),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "tokens": total_tokens,
+        "tool_calls": _codex_usage_int(usage, "tool_calls"),
+        "cache_read_tokens": _codex_usage_int(
+            usage,
+            "cache_read_tokens",
+            fallback="cached_input_tokens",
+        ),
+        "cache_write_tokens": _codex_usage_int(
+            usage,
+            "cache_write_tokens",
+            fallback="cache_write_input_tokens",
+        ),
+    }
+    _apply_child_metadata(record, metadata)
+    record.result_preview = preview(receipt, 180)
+
+
+def _codex_usage_int(
+    usage: dict[str, Any],
+    key: str,
+    *,
+    fallback: str | None = None,
+) -> int:
+    try:
+        value = usage.get(key)
+        if value is None and fallback is not None:
+            value = usage.get(fallback)
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _codex_artifact_directory(receipt: dict[str, Any]) -> str | None:
+    paths = receipt.get("artifact_paths") or receipt.get("artifacts")
+    if isinstance(paths, dict):
+        for key in ("directory", "dir", "receipt_dir", "transcript", "transcript_path"):
+            value = paths.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+    value = receipt.get("artifact_directory") or receipt.get("receipt_dir")
+    return value if isinstance(value, str) and value.strip() else None
 
 
 def _validate_agent_opts(opts: dict[str, Any]) -> None:

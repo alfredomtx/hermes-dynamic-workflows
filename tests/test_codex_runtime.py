@@ -13,6 +13,7 @@ from hermes_dynamic_workflows.core.errors import (
     WorkflowRuntimeError,
     WorkflowStopped,
 )
+from hermes_dynamic_workflows.core.types import WorkflowState
 from hermes_dynamic_workflows.engine.cache import ResumeCache
 from hermes_dynamic_workflows.engine.runtime import WorkflowOptions, run_workflow
 
@@ -70,9 +71,11 @@ class FakeCodexRunner:
             "usage": {
                 "input_tokens": 11,
                 "output_tokens": 7,
-                "reasoning_tokens": 5,
+                "reasoning_output_tokens": 5,
                 "total_tokens": 23,
                 "tool_calls": 2,
+                "cached_input_tokens": 3,
+                "cache_write_input_tokens": 2,
             },
             "final_message": "fake Codex completed",
             "duration_seconds": 0.01,
@@ -164,6 +167,8 @@ def test_codex_is_a_global_and_success_updates_public_worker_metadata(tmp_path: 
     assert agent["input_tokens"] == 11
     assert agent["output_tokens"] == 7
     assert agent["reasoning_tokens"] == 5
+    assert agent["cache_read_tokens"] == 3
+    assert agent["cache_write_tokens"] == 2
     assert agent["tool_calls"] == 2
     assert agent["transcript_path"] == str(artifact_root / "1")
     assert "src/example.py" in agent["result_preview"]
@@ -178,6 +183,9 @@ def test_codex_is_a_global_and_success_updates_public_worker_metadata(tmp_path: 
         {"mode": "discover", "workdir": "/tmp", "contract": ""},
         {"mode": "discover", "workdir": "/tmp", "contract": "inspect", "allowFiles": "src/a.py"},
         {"mode": "discover", "workdir": "/tmp", "contract": "inspect", "allowFiles": ["/absolute.py"]},
+        {"mode": "code", "workdir": "/tmp", "contract": "implement", "allowFiles": ["../escape.py"]},
+        {"mode": "code", "workdir": "/tmp", "contract": "implement", "allowFiles": ["."]},
+        {"mode": "code", "workdir": "/tmp", "contract": "implement", "allowFiles": ["src/a.py", "src/a.py"]},
         {"mode": "code", "workdir": "/tmp", "contract": "implement"},
         {"mode": "code", "workdir": "/tmp", "contract": "implement", "allowFiles": []},
         {"mode": "discover", "workdir": "/tmp", "contract": "inspect", "allowFiles": ["src/a.py"]},
@@ -189,11 +197,11 @@ def test_invalid_public_options_fail_before_reservation_or_launch(
     tmp_path: Path, options: dict[str, object]
 ) -> None:
     runner = FakeCodexRunner(tmp_path / "artifacts")
-    snapshots: list[dict[str, object]] = []
+    snapshots: list[WorkflowState] = []
     with pytest.raises(WorkflowRuntimeError):
         _run(_script(f"return await codex({options!r})"), runner, on_update=snapshots.append)
     assert runner.requests == []
-    assert snapshots == []
+    assert all(not snapshot.agents for snapshot in snapshots)
 
 
 def test_unsuccessful_codex_execution_records_error_and_journal(tmp_path: Path) -> None:
