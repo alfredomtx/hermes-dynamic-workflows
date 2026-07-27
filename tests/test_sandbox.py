@@ -137,6 +137,30 @@ return await agent("hello")
         meta = extract_meta(tree)
         self.assertEqual(meta["phases"][0]["title"], "Scan")
 
+    def test_rejects_lowercase_json_literals_in_nested_bodies(self):
+        cases = (
+            ("true", "True", '{"schema": {"properties": {"enabled": true}}}'),
+            ("false", "False", '{"schema": {"additionalProperties": false}}'),
+            ("null", "None", '{"schema": {"default": null}}'),
+        )
+        for token, replacement, value in cases:
+            with self.subTest(token=token):
+                with self.assertRaises(WorkflowParseError) as ctx:
+                    parse_script(workflow_script(f"value = {value}\nreturn value"), PluginConfig())
+                message = str(ctx.exception)
+                self.assertIn(token, message)
+                self.assertIn("line 3", message)
+                self.assertIn(replacement, message)
+
+    def test_allows_python_literals_and_lowercase_json_names_in_store_context(self):
+        parse_script(
+            workflow_script(
+                'value = {"enabled": True, "disabled": False, "default": None}\n'
+                'true = "ordinary identifier"\nreturn value'
+            ),
+            PluginConfig(),
+        )
+
 
 class ControlFlowAllowedTests(unittest.TestCase):
     """while/try/raise are pure control flow — now allowed (the docs' loop-

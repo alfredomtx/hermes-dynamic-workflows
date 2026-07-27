@@ -72,6 +72,11 @@ MAX_AST_NODES = 2500
 MAX_STRING_LITERAL_CHARS = 20000
 MAX_ABS_INT_LITERAL = 10**9
 ENTRYPOINT_NAME = "__workflow_main__"
+_LOWERCASE_JSON_LITERAL_REPLACEMENTS = {
+    "true": "True",
+    "false": "False",
+    "null": "None",
+}
 
 
 def parse_script(script: str, config: PluginConfig) -> ast.Module:
@@ -109,6 +114,13 @@ def validate_ast(tree: ast.AST) -> None:
             raise SandboxViolation(f"forbidden Python syntax: {type(node).__name__}")
 
         if isinstance(node, ast.Name):
+            replacement = _LOWERCASE_JSON_LITERAL_REPLACEMENTS.get(node.id)
+            if isinstance(node.ctx, ast.Load) and replacement is not None:
+                raise WorkflowParseError(
+                    "Invalid workflow script: lowercase JSON literal "
+                    f"`{node.id}` is invalid at line {node.lineno}; "
+                    f"use Python `{replacement}` instead"
+                )
             _validate_name(node.id)
 
         if isinstance(node, ast.Attribute):
