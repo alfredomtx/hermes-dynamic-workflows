@@ -174,6 +174,79 @@ def test_codex_is_a_global_and_success_updates_public_worker_metadata(tmp_path: 
     assert "src/example.py" in agent["result_preview"]
 
 
+def test_codex_accept_existing_changes_reaches_stage_request(tmp_path: Path) -> None:
+    repo = _git_repo(tmp_path)
+    runner = FakeCodexRunner(tmp_path / "artifacts")
+
+    _run(
+        _script(
+            f"return await codex({_opts(repo, mode='code', allowFiles=['src/example.py'], acceptExistingChanges=True)!r})"
+        ),
+        runner,
+    )
+
+    assert len(runner.requests) == 1
+    assert runner.requests[0].accept_existing_changes is True
+
+
+@pytest.mark.parametrize("extra", [{}, {"acceptExistingChanges": False}])
+def test_codex_accept_existing_changes_defaults_to_false(
+    tmp_path: Path, extra: dict[str, object]
+) -> None:
+    repo = _git_repo(tmp_path)
+    runner = FakeCodexRunner(tmp_path / "artifacts")
+    options = _opts(repo, mode="code", allowFiles=["src/example.py"], **extra)
+
+    _run(_script(f"return await codex({options!r})"), runner)
+
+    assert len(runner.requests) == 1
+    assert runner.requests[0].accept_existing_changes is False
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true", [], {}])
+def test_codex_accept_existing_changes_rejects_non_bool_before_reservation_or_launch(
+    tmp_path: Path, value: object
+) -> None:
+    repo = _git_repo(tmp_path)
+    runner = FakeCodexRunner(tmp_path / "artifacts")
+    snapshots: list[WorkflowState] = []
+    options = _opts(
+        repo,
+        mode="code",
+        allowFiles=["src/example.py"],
+        acceptExistingChanges=value,
+    )
+
+    with pytest.raises(WorkflowRuntimeError, match="acceptExistingChanges"):
+        _run(
+            _script(f"return await codex({options!r})"),
+            runner,
+            on_update=snapshots.append,
+        )
+
+    assert runner.requests == []
+    assert all(not snapshot.agents for snapshot in snapshots)
+
+
+def test_codex_accept_existing_changes_is_rejected_for_read_only_modes_before_launch(
+    tmp_path: Path,
+) -> None:
+    repo = _git_repo(tmp_path)
+    runner = FakeCodexRunner(tmp_path / "artifacts")
+    snapshots: list[WorkflowState] = []
+    options = _opts(repo, mode="discover", acceptExistingChanges=True)
+
+    with pytest.raises(WorkflowRuntimeError, match="acceptExistingChanges"):
+        _run(
+            _script(f"return await codex({options!r})"),
+            runner,
+            on_update=snapshots.append,
+        )
+
+    assert runner.requests == []
+    assert all(not snapshot.agents for snapshot in snapshots)
+
+
 @pytest.mark.parametrize(
     "options",
     [
@@ -259,6 +332,34 @@ def test_resume_cache_requires_same_inputs_and_starting_head(tmp_path: Path) -> 
     changed_head_runner = FakeCodexRunner(tmp_path / "changed-head")
     _run(script, changed_head_runner, resume_cache=ResumeCache(cache.current))
     assert len(changed_head_runner.requests) == 1
+
+
+def test_resume_cache_identity_includes_accept_existing_changes(tmp_path: Path) -> None:
+    repo = _git_repo(tmp_path)
+    cache = ResumeCache()
+    false_runner = FakeCodexRunner(tmp_path / "false")
+    false_options = _opts(repo, mode="code", allowFiles=["src/example.py"])
+    _run(
+        _script(f"return await codex({false_options!r})"),
+        false_runner,
+        resume_cache=cache,
+    )
+
+    true_runner = FakeCodexRunner(tmp_path / "true")
+    true_options = _opts(
+        repo,
+        mode="code",
+        allowFiles=["src/example.py"],
+        acceptExistingChanges=True,
+    )
+    _run(
+        _script(f"return await codex({true_options!r})"),
+        true_runner,
+        resume_cache=ResumeCache(cache.current),
+    )
+
+    assert len(false_runner.requests) == 1
+    assert len(true_runner.requests) == 1
 
 
 def test_parallel_and_pipeline_carry_codex_workers_in_topology_and_share_cap(tmp_path: Path) -> None:

@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -172,6 +173,29 @@ def test_runner_builds_exact_argv_and_keeps_artifacts_outside_workdir(tmp_path: 
     ]
     assert popen_calls[0]["shell"] is False
     assert popen_calls[0]["start_new_session"] is True
+
+
+@pytest.mark.parametrize("accept_existing_changes", [False, True])
+def test_runner_passes_accept_existing_changes_flag_only_when_enabled(
+    tmp_path: Path, accept_existing_changes: bool
+) -> None:
+    repo = _git_repo(tmp_path)
+    launcher = _fake_launcher(tmp_path)
+    request = replace(
+        _request(repo),
+        accept_existing_changes=accept_existing_changes,
+    )
+
+    receipt = SubprocessCodexStageRunner(launcher=launcher).run(
+        request,
+        threading.Event(),
+        time.monotonic() + 60,
+    )
+
+    observed = receipt["observed"]
+    assert isinstance(observed, dict)
+    flag = "--accept-existing-changes"
+    assert (flag in observed["argv"]) is accept_existing_changes
 
 
 def test_runner_returns_receipt_but_rejects_unsuccessful_receipt(tmp_path: Path) -> None:

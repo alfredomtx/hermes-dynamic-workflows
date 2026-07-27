@@ -721,7 +721,16 @@ _MISSING_AGENT_TYPE_POLICIES = {"error", "fallback_warn"}
 
 _CODEX_MODES = frozenset({"code", "discover", "debug", "verify"})
 _CODEX_OPT_KEYS = frozenset(
-    {"mode", "workdir", "contract", "allowFiles", "timeout", "label", "phase"}
+    {
+        "mode",
+        "workdir",
+        "contract",
+        "allowFiles",
+        "acceptExistingChanges",
+        "timeout",
+        "label",
+        "phase",
+    }
 )
 _MISSING = object()
 
@@ -739,6 +748,7 @@ def _validate_codex_opts(
             "unsupported codex() option(s): "
             + ", ".join(unknown)
             + ". Supported options are mode, workdir, contract, allowFiles, "
+            "acceptExistingChanges, "
             "timeout, label, and phase."
         )
 
@@ -746,6 +756,14 @@ def _validate_codex_opts(
     if not isinstance(mode, str) or mode not in _CODEX_MODES:
         allowed = ", ".join(sorted(_CODEX_MODES))
         raise WorkflowRuntimeError(f"codex() mode must be one of: {allowed}")
+
+    accept_existing_changes = opts.get("acceptExistingChanges", False)
+    if not isinstance(accept_existing_changes, bool):
+        raise WorkflowRuntimeError("codex() acceptExistingChanges must be a boolean")
+    if mode != "code" and accept_existing_changes:
+        raise WorkflowRuntimeError(
+            "codex() acceptExistingChanges is only valid for code mode"
+        )
 
     workdir = opts.get("workdir")
     if not isinstance(workdir, str) or not workdir.strip():
@@ -815,6 +833,7 @@ def _validate_codex_opts(
             contract=contract,
             allow_files=allow_files,
             timeout=timeout,
+            accept_existing_changes=accept_existing_changes,
         ),
         label,
         phase,

@@ -449,11 +449,12 @@ prohibit `allowFiles`. The complete shape is:
 return await codex({"mode": "discover", "workdir": "/absolute/repo", "contract": "Inspect the repository and report findings."})
 ```
 
-Optional fields are `timeout`, `label`, and `phase`. The launcher defaults are
+Optional fields are `timeout`, `label`, `phase`, and `acceptExistingChanges`. The launcher defaults are
 `gpt-5.6-luna` and `high` reasoning. The stage uses the same worker record, topology,
 concurrency, resume cache, journal, and token accounting as `agent()`, but it never
 routes `agent() -> Codex` and never performs commit, push, rebase, review, or test
 behavior. Use direct parent Codex for one single bounded stage without orchestration.
+Setting `acceptExistingChanges: true` opts into pre-existing changes only within `allowFiles`; the default remains a clean entry.
 
 ## Control (Pause / Resume / Stop / Restart)
 

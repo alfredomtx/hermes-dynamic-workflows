@@ -28,6 +28,7 @@ class CodexStageRequest:
     timeout: float = 900.0
     model: str = "gpt-5.6-luna"
     reasoning: str = "high"
+    accept_existing_changes: bool = False
 
 
 class CodexStageRunner(Protocol):
@@ -52,6 +53,7 @@ def codex_stage_fingerprint_inputs(
         "workdir": request.workdir,
         "contract": request.contract,
         "allowFiles": list(request.allow_files),
+        "acceptExistingChanges": request.accept_existing_changes,
         "timeout": request.timeout,
         "start_head": start_head,
     }
@@ -137,6 +139,8 @@ class SubprocessCodexStageRunner:
         ]
         for path in request.allow_files:
             argv.extend(("--allow-file", path))
+        if request.accept_existing_changes:
+            argv.append("--accept-existing-changes")
 
         process: subprocess.Popen[bytes] | None = None
         stdout = stdout_path.open("wb")
