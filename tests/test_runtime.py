@@ -169,6 +169,15 @@ return await agent("inspect repo", {"label": "top-agent", "provider": "openai-co
         self.assertEqual(runner.requests[0].label, "top-agent")
         self.assertEqual(result.state.current_phase, "scan")
 
+    def test_workflow_script_supports_isinstance(self):
+        script = """
+meta = {"name": "isinstance", "description": "Test workflow"}
+return isinstance("value", str)
+"""
+        result = run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=FakeRunner()))
+
+        self.assertTrue(result.value)
+
     def test_parallel_preserves_order(self):
         script = """
 meta = {"name": "parallel", "description": "Test workflow"}
