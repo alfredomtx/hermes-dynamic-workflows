@@ -215,6 +215,7 @@ return await codex({"mode": "discover", "workdir": "/absolute/repo", "contract":
 `label`、`phase`、起動時の既定値は `gpt-5.6-luna` と `high` reasoning です。編成のない単一の
 限定ステージには親 Codex を直接使います。`agent() -> Codex` にはルーティングせず、Codex
 ステージは commit、push、rebase、review、run tests を行いません。
+`acceptExistingChanges: true` を指定すると `allowFiles` 内に限って既存の変更を許可しますが、既定ではクリーンな状態から開始します。
 
 ## ディープダイブ
 

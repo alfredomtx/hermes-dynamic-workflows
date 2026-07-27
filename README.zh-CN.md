@@ -192,9 +192,10 @@ return await codex({"mode": "discover", "workdir": "/absolute/repo", "contract":
 ```
 
 支持 `code`、`discover`、`debug`、`verify` 四种模式。`code` 必须提供非空相对路径
-列表 `allowFiles`，只读模式禁止该字段。可选字段为 `timeout`、`label`、`phase`；启动器
+列表 `allowFiles`，只读模式禁止该字段。可选字段为 `timeout`、`label`、`phase`、`acceptExistingChanges`；启动器
 默认使用 `gpt-5.6-luna` 和 `high` reasoning。没有编排语义的单个有限阶段应直接使用
 父 Codex。不要走 `agent() -> Codex`；Codex 阶段不会 commit、push、rebase、review 或 run tests。
+设置 `acceptExistingChanges: true` 后，仅允许在 `allowFiles` 范围内接受已有更改；默认仍要求以干净状态进入。
 
 ## 深入
 

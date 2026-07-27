@@ -298,10 +298,11 @@ return await codex({"mode": "discover", "workdir": "/absolute/repo", "contract":
 
 The modes are `code`, `discover`, `debug`, and `verify`. `allowFiles` is required as
 a non-empty relative-path list for `code` and is prohibited for read-only modes.
-Optional fields are `timeout`, `label`, and `phase`; launcher defaults are
+Optional fields are `timeout`, `label`, `phase`, and `acceptExistingChanges`; launcher defaults are
 `gpt-5.6-luna` with `high` reasoning. Use direct parent Codex for one single bounded
 stage with no orchestration semantics. Do not route `agent() -> Codex`; Codex stages
 never commit, push, rebase, review, or run tests.
+Setting `acceptExistingChanges: true` opts into pre-existing changes only within `allowFiles`; the default remains a clean entry.
 
 ## Deep Dive
 
