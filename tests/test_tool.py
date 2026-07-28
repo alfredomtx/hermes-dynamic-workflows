@@ -5,6 +5,7 @@ import re
 import tempfile
 import threading
 import unittest
+from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -168,6 +169,32 @@ Review code carefully.
         workflow_registration = next(tool for tool in context.tools if tool["name"] == "workflow")
         self.assertIn("low literal child budgets", workflow_registration["description"])
         self.assertIn("warnings never block launch", workflow_registration["description"])
+
+    def test_dynamic_workflows_plugin_does_not_expose_autoflow(self):
+        class Context:
+            def __init__(self):
+                self.tools = []
+                self.hooks = []
+                self.commands = []
+
+            def register_tool(self, **kwargs):
+                self.tools.append(kwargs)
+
+            def register_hook(self, *args):
+                self.hooks.append(args)
+
+            def register_command(self, **kwargs):
+                self.commands.append(kwargs)
+
+        context = Context()
+        with patch.object(entry_module, "get_dynamic_workflow_schema", return_value={"parameters": {}}):
+            entry_module.register(context)
+
+        self.assertNotIn("autoflow", {command["name"] for command in context.commands})
+        self.assertNotIn("pre_gateway_dispatch", {hook[0] for hook in context.hooks})
+        config_fields = {field.name for field in fields(PluginConfig)}
+        self.assertNotIn("auto_workflow_default_on", config_fields)
+        self.assertNotIn("auto_workflow_min_chars", config_fields)
 
     def test_dynamic_schema_documents_completion_presentation_contract(self):
         description = get_dynamic_workflow_schema()["description"]

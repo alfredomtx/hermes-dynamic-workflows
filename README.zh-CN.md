@@ -66,8 +66,6 @@ plugins:
         notify_on_launch: true        # 启动时向来源 gateway 聊天发送「workflow 已启动」标记
         notify_result_preview_chars: 2000  # 通知中结果预览的截断长度（字符）
         notify_progress_stop_button: true  # 在实时进度气泡上显示可点击的 ⏹ 停止按钮（Telegram；需要支持内联按钮的核心）
-        auto_workflow_default_on: false # 为 true 时每个会话默认 ON，除非运行 /autoflow off（会提高所有聊天的成本）
-        auto_workflow_min_chars: 24    # 判定为「实质性」消息的最小长度（廉价预过滤，无 LLM 调用）
         orphan_grace_seconds: 900      # 无「PID 已死」信号时，判定为陈旧并回收的空闲时间窗（兜底 PID 复用）
         auto_resume_on_boot: false     # 为 true 时在启动时重新拉起刚回收的孤儿运行（从缓存恢复）；默认关闭
         auto_resume_max: 3             # 每次启动自动恢复的孤儿运行数上限（防止恢复风暴）
