@@ -72,8 +72,6 @@ plugins:
         notify_result_preview_chars: 2000  # 通知での結果プレビューの切り詰め長（文字数）
         notify_progress_stop_button: true  # ライブ進捗バブルにタップ可能な ⏹ 停止ボタンを表示（Telegram；インラインボタン対応のコアが必要）
         notify_on_launch: true        # 起動時に起点となった gateway チャットへ「workflow 開始」マーカーを送信
-        auto_workflow_default_on: false # true の場合、各セッションはデフォルトで ON（/autoflow off を実行するまで）。全チャットのコストが上がる
-        auto_workflow_min_chars: 24    # 「実質的」とみなす最小メッセージ長（安価な事前フィルタ、LLM 呼び出しなし）
         orphan_grace_seconds: 900      # 「PID 死亡」シグナルがない場合に古いと判定して回収するまでのアイドル時間窓（PID 再利用への保険）
         auto_resume_on_boot: false     # true の場合、起動時に回収したばかりの孤児ランを再起動する（キャッシュから再開）。出荷時は無効
         auto_resume_max: 3             # 1 回の起動で自動再開する孤児ランの上限（再開ストームを抑制）

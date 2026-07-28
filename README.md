@@ -74,48 +74,17 @@ plugins:
         notify_on_launch: true        # Send a "workflow started" marker to the origin gateway chat at launch
         notify_result_preview_chars: 2000  # Truncation length (chars) for the result preview in notifications
         notify_progress_stop_button: true  # Show a tappable ⏹ Stop button on the live progress bubble (Telegram; needs a core that supports inline buttons)
-        auto_workflow_default_on: false # When true, every session starts ON unless it runs /autoflow off (raises cost across all chats)
-        auto_workflow_min_chars: 24    # Min message length to count as "substantive" (cheap prefilter, no LLM call)
         orphan_grace_seconds: 900      # Idle window before a run with no dead-PID signal is reaped as stale (backstops PID recycling)
         auto_resume_on_boot: false     # When true, relaunch freshly-reaped orphans on boot (resumes from cache); shipped off
         auto_resume_max: 3             # Max orphans auto-resumed per boot (bounds a resurrection storm)
         auto_resume_window_seconds: 21600 # Only auto-resume orphans whose last activity was within this window (6h)
 ```
 
-## Autoflow (ultracode-style auto-workflow steering)
-
-`/autoflow on` turns on a **sticky per-session mode** in the gateway
-(Telegram/Discord/etc.). While it's on, every *substantive* message you send
-that session is automatically steered toward the `workflow` tool — no need to
-type "use a workflow" each time. This is Hermes' analogue of Claude Code's
-`ultracode`.
-
-```text
-/autoflow on       # enable for this session (sticky until you turn it off)
-/autoflow off      # back to normal turn-by-turn handling
-/autoflow          # report current state
-```
-
-Set `auto_workflow_default_on: true` to make **every** gateway session start ON
-without anyone typing `/autoflow on` — each session stays ON until it runs
-`/autoflow off` (an explicit off is sticky and beats the default). Shipped
-default is false; turning it on raises cost across every connected chat, so
-it's intended for benchmarking / always-orchestrate setups.
-
-While on, each substantive inbound message gets a steering directive appended
-that tells the model the task is pre-authorized for orchestration, so it prefers
-the `workflow` tool. Autoflow does not change the parent session's reasoning effort.
-
-It is a **nudge, not a hard force** (the model still decides, matching
-ultracode), it is **gateway-only** (CLI/TUI unaffected), and **launch approval
-still applies** — `require_launch_approval` gates every workflow launch
-regardless. Trivial messages (short acks, slash commands) pass through untouched.
-
 When a workflow launches, `notify_on_launch` (default on) posts a concise
 "🚀 Workflow started" marker to the origin chat, and `notify_on_complete` posts
 the result at the end — so each run is bracketed with start/end markers in the
-chat, with timing visible. Useful when autoflow auto-launches runs with
-approval off and you want to keep an eye on what fired and how long it took.
+chat, with timing visible. This keeps workflow launches and completions visible
+when they run without interactive approval.
 
 ## Crash recovery (orphan reaping + auto-resume)
 
