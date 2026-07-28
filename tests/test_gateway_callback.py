@@ -102,30 +102,16 @@ class GatewayCallbackHandlerTests(unittest.TestCase):
         self.assertEqual(fake.called_with, "wf_abc123")
         self.assertIn("Resumed", directive["answer"])
 
-    def test_restart_callbacks_remain_supported_without_a_telegram_button(self):
-        class FakeManager:
-            def restart(self, run_id):
-                self.called_with = run_id
-                return {"runId": "wf_new123"}
+    def test_retired_restart_and_rerun_callbacks_are_ignored(self):
+        for action in ("restart", "rerun"):
+            with patch.object(gc_module, "get_run_manager") as get_manager:
+                directive = on_gateway_callback(
+                    data=f"wf:{action}:wf_old123",
+                    authorized=True,
+                )
 
-        fake = FakeManager()
-        with patch.object(gc_module, "get_run_manager", return_value=fake):
-            directive = on_gateway_callback(data="wf:restart:wf_old123", authorized=True)
-        self.assertEqual(fake.called_with, "wf_old123")
-        self.assertIn("wf_new123", directive["answer"])
-        self.assertTrue(directive["strip_buttons"])
-
-    def test_authorized_rerun_maps_to_restart(self):
-        class FakeManager:
-            def restart(self, run_id):
-                self.called_with = run_id
-                return {"runId": "wf_new123"}
-
-        fake = FakeManager()
-        with patch.object(gc_module, "get_run_manager", return_value=fake):
-            directive = on_gateway_callback(data="wf:rerun:wf_old123", authorized=True)
-        self.assertEqual(fake.called_with, "wf_old123")
-        self.assertIn("Rerun", directive["answer"])
+            get_manager.assert_not_called()
+            self.assertIsNone(directive)
 
 
 class StopButtonHelperTests(unittest.TestCase):

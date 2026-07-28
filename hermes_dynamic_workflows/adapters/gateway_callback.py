@@ -3,8 +3,7 @@
 Consumes the core ``gateway_callback`` plugin hook (fired by a gateway adapter
 when an inline-button click's ``callback_data`` matches no built-in core
 prefix). We own the ``wf:`` namespace for workflow controls:
-``wf:stop:<taskId>``, ``wf:pause:<runId>``, ``wf:resume:<runId>``,
-``wf:restart:<runId>``, and ``wf:rerun:<runId>``.
+``wf:stop:<taskId>``, ``wf:pause:<runId>``, and ``wf:resume:<runId>``.
 
 The handler does NO async/platform I/O. It returns a DIRECTIVE dict that the
 adapter performs:
@@ -24,7 +23,7 @@ from ..run.manager import get_run_manager
 
 # Prefix this plugin owns. Anything else -> return None (not ours).
 _PREFIX = "wf:"
-_ACTIONS = {"stop", "pause", "resume", "restart", "rerun"}
+_ACTIONS = {"stop", "pause", "resume"}
 
 
 def on_gateway_callback(
@@ -70,13 +69,6 @@ def on_gateway_callback(
         if action == "resume":
             ok = bool(manager.resume(target))
             return _directive("▶️ Resumed." if ok else "Workflow is not paused.")
-        if action in {"restart", "rerun"}:
-            restarted = manager.restart(target)
-            new_run_id = str((restarted or {}).get("runId") or "").strip()
-            if restarted and new_run_id:
-                verb = "Rerun" if action == "rerun" else "Restart"
-                return _directive(f"🔄 {verb} started: {new_run_id}", strip_buttons=True)
-            return _directive("Workflow could not be restarted.")
     except Exception:
         # Never let a handler exception bubble into the gateway loop; report a
         # benign toast and strip the now-untrustworthy button set.
