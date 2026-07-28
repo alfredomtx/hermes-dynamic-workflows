@@ -94,11 +94,11 @@ class PluginConfig:
     # notify_result_preview_chars to protect context/chat length.
     notify_on_complete: bool = True
     # On launch, send a concise "workflow started" message to the origin
-    # gateway chat so the user sees an auto-fired (or approved) run begin and
+    # gateway chat so the user sees a run begin and
     # can track timing. CLI is unaffected (the launch tool result already
     # surfaces there). Best-effort; never blocks or fails the launch. Pairs
     # with notify_on_complete to bracket each run with start+end markers —
-    # useful when autoflow auto-launches workflows with approval off.
+    # useful when workflows launch without interactive approval.
     notify_on_launch: bool = True
     notify_result_preview_chars: int = 2000
     # Live, edited-in-place progress bubble in gateway chats. When on (default)
@@ -131,18 +131,6 @@ class PluginConfig:
     # token counts × official model pricing (status "estimated"), omitted when no
     # agent has a known pricing route. config.yaml only (no env var).
     notify_progress_cost: bool = True
-    # --- Autoflow (ultracode-style auto-workflow steering) ---------------
-    # A per-session mode toggled with `/autoflow on|off` in the gateway. While
-    # ON for a session, each substantive inbound message gets a steering
-    # directive appended that nudges the model to prefer the `workflow` tool.
-    # It is a NUDGE, not a hard force, it is gateway-only, and launch approval
-    # still applies. Default per-session state is OFF.
-    #
-    # auto_workflow_default_on flips that baseline: when true, EVERY gateway
-    # session starts ON unless that session explicitly runs `/autoflow off`.
-    auto_workflow_default_on: bool = False
-    # Minimum stripped-text length for a message to count as substantive.
-    auto_workflow_min_chars: int = 24
     # --- Orphan reaping + auto-resume ------------------------------------
     # A workflow run executes inside the Hermes process that launched it (the
     # gateway daemon or a CLI). If that process exits — a `hermes gateway
@@ -386,19 +374,6 @@ def load_config() -> PluginConfig:
             default.notify_result_preview_chars,
             minimum=0,
             maximum=20000,
-        ),
-        auto_workflow_default_on=_as_bool(
-            os.getenv(
-                "HERMES_DYNAMIC_WORKFLOWS_AUTO_WORKFLOW_DEFAULT_ON",
-                raw.get("auto_workflow_default_on"),
-            ),
-            default.auto_workflow_default_on,
-        ),
-        auto_workflow_min_chars=_as_int(
-            raw.get("auto_workflow_min_chars"),
-            default.auto_workflow_min_chars,
-            minimum=1,
-            maximum=10000,
         ),
         orphan_grace_seconds=_as_float(
             os.getenv(
