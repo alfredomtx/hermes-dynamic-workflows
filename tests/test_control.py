@@ -27,13 +27,13 @@ first = await agent("first", {
     "label": "first",
     "provider": "openai-codex",
     "model": "gpt-5.6-luna",
-    "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000,
+    "reasoningEffort": "medium", "maxTurns": 10,
 })
 second = await agent("second", {
     "label": "second",
     "provider": "openai-codex",
     "model": "gpt-5.6-luna",
-    "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000,
+    "reasoningEffort": "medium", "maxTurns": 10,
 })
 result = [first, second]
 """
@@ -339,7 +339,7 @@ result = await agent("work", {
     "label": "worker",
     "provider": "openai-codex",
     "model": "gpt-5.6-luna",
-    "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000,
+    "reasoningEffort": "medium", "maxTurns": 10,
 })
 """,
                     WorkflowOptions(

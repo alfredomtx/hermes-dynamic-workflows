@@ -19,14 +19,7 @@ class PluginConfig:
     # Default logical-turn ceiling for workflow child agents when agent() omits
     # its inline maxTurns value. Inline values still take precedence.
     max_turns: int = 150
-    # Default child tool-call ceiling when agent() omits maxToolCalls.
-    # Inline values still take precedence; the runtime validates against the
-    # hard workflow ceiling before reserving or launching a child.
-    max_tool_calls: int = 200
-    # Default child tool-output character ceiling when agent() omits
-    # maxToolOutputChars. Inline values still take precedence; the runtime
-    # validates against the hard workflow ceiling before launch.
-    max_tool_output_chars: int = 2_000_000
+
     # Maximum workflow() nesting depth. depth=0 is the top-level run; each
     # nested workflow() call goes one deeper. A value of N allows the root plus
     # N nested levels (N+1 total), so the default 2 permits root -> child ->
@@ -53,7 +46,7 @@ class PluginConfig:
         "messaging",
         "clarify",
     )
-    blocked_models: tuple[str, ...] = ()
+
     # Behavior when a workflow explicitly requests an unknown agentType.
     # error = fail before child launch (default/backward compatible).
     # fallback_warn = log visibly and run the generic general-purpose child.
@@ -243,24 +236,7 @@ def load_config() -> PluginConfig:
             minimum=1,
             maximum=1000,
         ),
-        max_tool_calls=_as_int(
-            os.getenv(
-                "HERMES_DYNAMIC_WORKFLOWS_MAX_TOOL_CALLS",
-                raw.get("max_tool_calls"),
-            ),
-            default.max_tool_calls,
-            minimum=1,
-            maximum=10_000,
-        ),
-        max_tool_output_chars=_as_int(
-            os.getenv(
-                "HERMES_DYNAMIC_WORKFLOWS_MAX_TOOL_OUTPUT_CHARS",
-                raw.get("max_tool_output_chars"),
-            ),
-            default.max_tool_output_chars,
-            minimum=1,
-            maximum=20_000_000,
-        ),
+
         max_nesting_depth=_as_int(
             os.getenv(
                 "HERMES_DYNAMIC_WORKFLOWS_MAX_NESTING_DEPTH",
@@ -305,10 +281,7 @@ def load_config() -> PluginConfig:
             raw.get("blocked_child_toolsets"),
             default.blocked_child_toolsets,
         ),
-        blocked_models=_as_str_tuple(
-            raw.get("blocked_models"),
-            default.blocked_models,
-        ),
+
         missing_agent_type_policy=_as_mode(
             os.getenv(
                 "HERMES_DYNAMIC_WORKFLOWS_MISSING_AGENT_TYPE_POLICY",

@@ -45,8 +45,6 @@ class AgentRecord:
     base_url: str | None = None
     reasoning_effort: str | None = None
     max_turns: int | None = None
-    max_tool_calls: int | None = None
-    max_tool_output_chars: int | None = None
     tool_output_chars: int = 0
     stop_reason: str | None = None
     attempts: int = 0
@@ -89,8 +87,6 @@ class AgentRecord:
             "base_url": self.base_url,
             "reasoning_effort": self.reasoning_effort,
             "max_turns": self.max_turns,
-            "max_tool_calls": self.max_tool_calls,
-            "max_tool_output_chars": self.max_tool_output_chars,
             "tool_output_chars": self.tool_output_chars,
             "stop_reason": self.stop_reason,
             "attempts": self.attempts,
@@ -285,62 +281,13 @@ class ChildAgentResult:
 
 
 @dataclass(frozen=True)
-class ResolvedAgentSpec:
-    requested_agent_type: str | None
-    agent_type_spec: Any = None
-    provider: str | None = None
-    model: str | None = None
-    isolation: str | None = None
-    toolsets: tuple[str, ...] = ()
-    toolsets_explicit: bool = False
-    allowed_tools: tuple[str, ...] = ()
-    allowed_tools_explicit: bool = False
-    disallowed_tools: tuple[str, ...] = ()
-    system_prompt_hash: str = ""
-    workspace: str = ""
-    warnings: tuple[str, ...] = ()
-    max_turns: int | None = None
-    max_tool_calls: int | None = None
-    max_tool_output_chars: int | None = None
-    reasoning_effort: str | None = None
-
-    @property
-    def agent_type_name(self) -> str | None:
-        value = getattr(self.agent_type_spec, "name", None)
-        return str(value) if value else self.requested_agent_type
-
-    def cache_inputs(self) -> dict[str, Any]:
-        inputs = {
-            "provider": self.provider,
-            "model": self.model,
-            "isolation": self.isolation,
-            "toolsets": list(self.toolsets),
-            "toolsetsExplicit": self.toolsets_explicit,
-            "allowedTools": list(self.allowed_tools),
-            "allowedToolsExplicit": self.allowed_tools_explicit,
-            "disallowedTools": list(self.disallowed_tools),
-            "agentType": self.agent_type_name,
-            "systemPromptHash": self.system_prompt_hash,
-            "workspace": self.workspace,
-        }
-        if self.max_turns is not None:
-            inputs["maxTurns"] = self.max_turns
-        if self.max_tool_calls is not None:
-            inputs["maxToolCalls"] = self.max_tool_calls
-        if self.max_tool_output_chars is not None:
-            inputs["maxToolOutputChars"] = self.max_tool_output_chars
-        if self.reasoning_effort is not None:
-            inputs["reasoningEffort"] = self.reasoning_effort
-        return inputs
-
-
-@dataclass(frozen=True)
 class ChildAgentRequest:
     id: int
     prompt: str
     label: str
     phase: str | None
     toolsets: list[str]
+    profile: str | None = None
     provider: str | None = None
     model: str | None = None
     schema: dict[str, Any] | None = None
@@ -348,13 +295,15 @@ class ChildAgentRequest:
     isolation: str | None = None
     cwd: str | None = None
     request_overrides: dict[str, Any] | None = None
+    instructions: str = ""
+    agent_type_spec: Any = None
+    allowed_tools: tuple[str, ...] = ()
+    allowed_tools_explicit: bool = False
+    disallowed_tools: tuple[str, ...] = ()
     structured_tool: bool = False
     on_start: Callable[[dict[str, Any]], None] | None = None
     on_update: Callable[[dict[str, Any]], None] | None = None
-    resolved: ResolvedAgentSpec | None = None
     max_turns: int | None = None
-    max_tool_calls: int | None = None
-    max_tool_output_chars: int | None = None
     reasoning_effort: str | None = None
 
 

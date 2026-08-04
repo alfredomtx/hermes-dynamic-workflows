@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import importlib
 import inspect
 import math
 import threading
@@ -32,7 +31,7 @@ from ..core.types import (
     AgentRecord,
     ChildAgentRequest,
     ChildAgentResult,
-    ResolvedAgentSpec,
+
     TopologyRecord,
     WorkflowFrame,
 )
@@ -144,7 +143,7 @@ class WorkflowAPI:
             structured_output=schema is not None,
             runtime_agents=_runtime_agent_specs(self.frame.meta),
         )
-        for warning in resolved.warnings:
+        for warning in resolved["warnings"]:
             self.log(f"⚠️ {warning}")
 
         with self._lock:
@@ -156,14 +155,12 @@ class WorkflowAPI:
                 phase=phase_name,
                 prompt=prompt,
                 prompt_preview=preview(prompt, 160),
-                agent_type=resolved.agent_type_name,
-                isolation=resolved.isolation or "shared",
-                provider=resolved.provider,
-                model=resolved.model,
-                reasoning_effort=resolved.reasoning_effort,
-                max_turns=resolved.max_turns,
-                max_tool_calls=resolved.max_tool_calls,
-                max_tool_output_chars=resolved.max_tool_output_chars,
+                agent_type=getattr(resolved["agent_type_spec"], "name", None),
+                isolation=resolved["isolation"] or "shared",
+                provider=resolved["provider"],
+                model=resolved["model"],
+                reasoning_effort=resolved["reasoning_effort"],
+                max_turns=resolved["max_turns"],
             )
             active_topology = _active_topology(self.frame)
             if active_topology is not None:
@@ -175,7 +172,7 @@ class WorkflowAPI:
             prompt,
             {
                 "schema": schema,
-                **resolved.cache_inputs(),
+                **_agent_cache_inputs(resolved),
             },
         )
         journal_key = f"v2:{fingerprint}"
@@ -232,21 +229,24 @@ class WorkflowAPI:
             prompt=prompt,
             label=label,
             phase=phase_name,
-            toolsets=list(resolved.toolsets),
-            provider=resolved.provider,
-            model=resolved.model,
+            toolsets=list(resolved["toolsets"]),
+            profile=resolved["profile"],
+            provider=resolved["provider"],
+            model=resolved["model"],
             schema=schema,
-            agent_type=resolved.agent_type_name,
-            isolation=resolved.isolation,
+            agent_type=getattr(resolved["agent_type_spec"], "name", None),
+            agent_type_spec=resolved["agent_type_spec"],
+            isolation=resolved["isolation"],
             cwd=self.frame.cwd,
+            instructions=str(getattr(resolved["agent_type_spec"], "instructions", "") or ""),
+            allowed_tools=resolved["allowed_tools"],
+            allowed_tools_explicit=resolved["allowed_tools_explicit"],
+            disallowed_tools=resolved["disallowed_tools"],
             structured_tool=bool(schema),
             on_start=on_child_start,
             on_update=on_child_update,
-            resolved=resolved,
-            max_turns=resolved.max_turns,
-            max_tool_calls=resolved.max_tool_calls,
-            max_tool_output_chars=resolved.max_tool_output_chars,
-            reasoning_effort=resolved.reasoning_effort,
+            max_turns=resolved["max_turns"],
+            reasoning_effort=resolved["reasoning_effort"],
         )
         if schema:
             record.structured = {
@@ -681,6 +681,7 @@ _PUBLIC_AGENT_OPT_KEYS = frozenset(
         "label",
         "phase",
         "schema",
+        "profile",
         "provider",
         "model",
         "isolation",
@@ -695,8 +696,6 @@ _PUBLIC_AGENT_OPT_KEYS = frozenset(
         "system_prompt",
         "description",
         "maxTurns",
-        "maxToolCalls",
-        "maxToolOutputChars",
         "reasoningEffort",
     }
 )
@@ -915,9 +914,9 @@ def _validate_agent_opts(opts: dict[str, Any]) -> None:
         raise WorkflowRuntimeError(
             "unsupported agent() option(s): "
             + ", ".join(unknown)
-            + ". Public workflow agent options are label, phase, schema, provider, model, "
+            + ". Public workflow agent options are label, phase, schema, profile, provider, model, "
             "isolation, agentType, toolsets, allowedTools, disallowedTools, "
-            "instructions, systemPrompt, maxTurns, maxToolCalls, maxToolOutputChars, "
+            "instructions, systemPrompt, maxTurns, "
             "and reasoningEffort. Runtime, timeout, and retry policy belong in "
             "Hermes/plugin configuration, not workflow scripts."
         )
@@ -927,37 +926,13 @@ def _validate_agent_opts(opts: dict[str, Any]) -> None:
         effort = _reasoning_effort_from(opts, source="agent()", key="reasoningEffort")
     except ValueError as exc:
         raise WorkflowRuntimeError(str(exc)) from exc
-    for key in ("provider", "model"):
+    for key in ("profile", "provider", "model"):
         value = opts.get(key)
-        if not isinstance(value, str) or not value.strip() or value.strip().lower() == "inherit":
-            raise WorkflowRuntimeError(f"agent() {key} is required")
-    provider = str(opts["provider"]).strip().lower()
-    model = str(opts["model"]).strip()
-    if provider == "auto":
-        raise WorkflowRuntimeError("agent() provider must be explicit; auto is not supported")
-    try:
-        config_module = importlib.import_module("hermes_cli.config")
-        aliases = (config_module.load_config() or {}).get("model_aliases") or {}
-    except Exception as exc:
-        raise WorkflowRuntimeError(
-            f"could not validate agent() canonical model id: {exc}"
-        ) from exc
-    if isinstance(aliases, dict) and model.lower() in {
-        str(alias).strip().lower() for alias in aliases
-    }:
-        raise WorkflowRuntimeError(
-            "agent() model must be a canonical model id, not a configured alias"
-        )
-    if effort is None:
-        raise WorkflowRuntimeError("agent() reasoningEffort is required")
+        if value is not None and not isinstance(value, str):
+            raise WorkflowRuntimeError(f"agent() {key} must be a string when supplied")
     if "maxTurns" in opts:
         _required_limit(opts, "maxTurns", 1000)
-    for key, upper in (
-        ("maxToolCalls", 10000),
-        ("maxToolOutputChars", 20_000_000),
-    ):
-        if key in opts:
-            _required_limit(opts, key, upper)
+
 
 
 def _required_limit(opts: dict[str, Any], key: str, upper: int) -> int:
@@ -976,20 +951,6 @@ def _resolve_max_turns(opts: dict[str, Any], config: Any) -> int:
         return _required_limit(opts, "maxTurns", 1000)
     configured = getattr(config, "max_turns", 150)
     return _required_limit({"maxTurns": configured}, "maxTurns", 1000)
-
-
-def _resolve_tool_budget(
-    opts: dict[str, Any],
-    key: str,
-    config: Any,
-    config_attr: str,
-    default: int,
-    upper: int,
-) -> int:
-    if key in opts:
-        return _required_limit(opts, key, upper)
-    configured = getattr(config, config_attr, default)
-    return _required_limit({key: configured}, key, upper)
 
 
 def _check_vm_array_length(items: list[Any]) -> None:
@@ -1014,6 +975,37 @@ def _normalize_agent_model(value: Any) -> str | None:
     if not clean or clean.lower() == "inherit":
         return None
     return clean
+
+
+def _normalize_route_selector(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    clean = str(value).strip()
+    if not clean or clean.lower() == "inherit":
+        return None
+    return clean
+
+
+def _agent_cache_inputs(resolved: dict[str, Any]) -> dict[str, Any]:
+    inputs = {
+        "profile": resolved["profile"],
+        "provider": resolved["provider"],
+        "model": resolved["model"],
+        "isolation": resolved["isolation"],
+        "toolsets": list(resolved["toolsets"]),
+        "toolsetsExplicit": resolved["toolsets_explicit"],
+        "allowedTools": list(resolved["allowed_tools"]),
+        "allowedToolsExplicit": resolved["allowed_tools_explicit"],
+        "disallowedTools": list(resolved["disallowed_tools"]),
+        "agentType": getattr(resolved["agent_type_spec"], "name", None),
+        "systemPromptHash": resolved["system_prompt_hash"],
+        "workspace": resolved["workspace"],
+    }
+    if resolved["max_turns"] is not None:
+        inputs["maxTurns"] = resolved["max_turns"]
+    if resolved["reasoning_effort"] is not None:
+        inputs["reasoningEffort"] = resolved["reasoning_effort"]
+    return inputs
 
 
 def _normalize_isolation(value: Any) -> str | None:
@@ -1054,7 +1046,7 @@ def _resolve_agent_spec(
     config: Any,
     structured_output: bool,
     runtime_agents: dict[str, Any] | None = None,
-) -> ResolvedAgentSpec:
+) -> dict[str, Any]:
     from ..child.presets import generic_agent_type, list_agent_types, resolve_agent_type
     from ..child.runner import (
         _prepare_mcp_tool_registry,
@@ -1112,24 +1104,9 @@ def _resolve_agent_spec(
     agent_type_isolation = _normalize_agent_type_isolation(
         getattr(effective_spec, "isolation", None)
     )
-    provider = str(opts["provider"]).strip()
-    model = str(opts["model"]).strip()
-    max_tool_calls = _resolve_tool_budget(
-        opts,
-        "maxToolCalls",
-        config,
-        "max_tool_calls",
-        200,
-        10_000,
-    )
-    max_tool_output_chars = _resolve_tool_budget(
-        opts,
-        "maxToolOutputChars",
-        config,
-        "max_tool_output_chars",
-        2_000_000,
-        20_000_000,
-    )
+    profile = _normalize_route_selector(opts.get("profile"))
+    provider = _normalize_route_selector(opts.get("provider"))
+    model = _normalize_agent_model(opts.get("model"))
     _prepare_mcp_tool_registry(config)
     has_inline_or_meta_tool_surface = _has_inline_tool_surface(opts) or (
         not explicit_type
@@ -1152,25 +1129,24 @@ def _resolve_agent_spec(
         effective_spec,
         structured_output=structured_output,
     )
-    return ResolvedAgentSpec(
-        requested_agent_type=requested_type,
-        agent_type_spec=effective_spec,
-        provider=provider,
-        model=model,
-        isolation=explicit_isolation or agent_type_isolation,
-        toolsets=toolsets,
-        toolsets_explicit=bool(getattr(effective_spec, "toolsets_explicit", False)),
-        allowed_tools=tuple(getattr(effective_spec, "allowed_tools", ()) or ()),
-        allowed_tools_explicit=bool(getattr(effective_spec, "allowed_tools_explicit", False)),
-        disallowed_tools=tuple(getattr(effective_spec, "disallowed_tools", ()) or ()),
-        system_prompt_hash=hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
-        workspace=str(Path(cwd).expanduser().resolve()),
-        warnings=tuple(warnings),
-        max_turns=max_turns,
-        max_tool_calls=max_tool_calls,
-        max_tool_output_chars=max_tool_output_chars,
-        reasoning_effort=reasoning_effort,
-    )
+    return {
+        "requested_agent_type": requested_type,
+        "agent_type_spec": effective_spec,
+        "profile": profile,
+        "provider": provider,
+        "model": model,
+        "isolation": explicit_isolation or agent_type_isolation,
+        "toolsets": toolsets,
+        "toolsets_explicit": bool(getattr(effective_spec, "toolsets_explicit", False)),
+        "allowed_tools": tuple(getattr(effective_spec, "allowed_tools", ()) or ()),
+        "allowed_tools_explicit": bool(getattr(effective_spec, "allowed_tools_explicit", False)),
+        "disallowed_tools": tuple(getattr(effective_spec, "disallowed_tools", ()) or ()),
+        "system_prompt_hash": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "workspace": str(Path(cwd).expanduser().resolve()),
+        "warnings": tuple(warnings),
+        "max_turns": max_turns,
+        "reasoning_effort": reasoning_effort,
+    }
 
 
 def _compose_effective_agent_type(

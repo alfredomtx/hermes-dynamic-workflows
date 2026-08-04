@@ -218,7 +218,7 @@ class ToolChannelTests(unittest.TestCase):
         script = """
 meta = {"name": "tool-channel", "description": "Test workflow"}
 
-return await agent("return status", {"label": "json", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000, "schema": {"type": "object", "required": ["ok"]}})
+return await agent("return status", {"label": "json", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "schema": {"type": "object", "required": ["ok"]}})
 """
         runner = CaptureRunner({"ok": True, "n": 5})
         result = run_workflow(
@@ -230,7 +230,10 @@ return await agent("return status", {"label": "json", "provider": "openai-codex"
         request = runner.requests[0]
         self.assertTrue(request.structured_tool)
         self.assertEqual(request.prompt, "return status")
-        self.assertIsNotNone(request.resolved)
+        self.assertEqual(request.provider, "openai-codex")
+        self.assertEqual(request.model, "gpt-5.6-luna")
+        self.assertEqual(request.reasoning_effort, "medium")
+        self.assertFalse(hasattr(request, "resolved"))
         agent = result.state.snapshot()["agents"][0]
         self.assertEqual(agent["structured"]["mode"], "tool")
         self.assertEqual(agent["structured"]["status"], "valid")

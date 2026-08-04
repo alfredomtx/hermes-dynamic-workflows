@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 import json
 import sys
 import os
@@ -11,7 +10,7 @@ import types
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from hermes_dynamic_workflows.child.presets import (
     AgentTypeSpec,
@@ -42,11 +41,10 @@ from hermes_dynamic_workflows.child.runner import (
 )
 from hermes_dynamic_workflows.child.worktree import WorkspaceLease, create_workspace_lease
 from hermes_dynamic_workflows.core.config import PluginConfig
-from hermes_dynamic_workflows.core.errors import ChildAgentError
+from hermes_dynamic_workflows.core.errors import ChildAgentError, WorkflowTimeout
 from hermes_dynamic_workflows.core.types import (
     ChildAgentRequest,
     ChildAgentResult,
-    ResolvedAgentSpec,
 )
 from hermes_dynamic_workflows.child.structured_output import (
     MAX_STRUCTURED_OUTPUT_RETRIES,
@@ -70,6 +68,20 @@ def _tool_definition(name: str) -> dict:
 
 def _tool_name(definition: dict) -> str:
     return str((definition.get("function") or {}).get("name") or "")
+
+
+def _legacy_core(child):
+    def run_child(_child, message, **kwargs):
+        initializer = kwargs.get("initializer")
+        if callable(initializer):
+            initializer()
+        return _child.run_conversation(
+            user_message=message,
+            conversation_history=kwargs.get("conversation_history"),
+            task_id=kwargs.get("task_id"),
+        )
+
+    return types.SimpleNamespace(run_child=run_child)
 
 
 class ChildAgentTests(unittest.TestCase):
@@ -550,8 +562,6 @@ class ChildAgentTests(unittest.TestCase):
             phase=None,
             toolsets=[],
             max_turns=10,
-            max_tool_calls=16,
-            max_tool_output_chars=200000,
         )
         spec = AgentTypeSpec(
             name="planner",
@@ -1039,13 +1049,19 @@ class StructuredOutputRunnerFailureTests(unittest.TestCase):
                 schema={"type": "object"},
                 structured_tool=True,
                 max_turns=10,
-                max_tool_calls=16,
-                max_tool_output_chars=200000,
             )
             lease = WorkspaceLease(task_id="workflow-test", cwd=tmp)
 
             with self.assertRaises(ChildAgentError) as ctx:
-                runner._run_child_with_timeout(child, request, lease, None, [])
+                runner._run_child(
+                    _legacy_core(child),
+                    child,
+                    request,
+                    lease,
+                    None,
+                    [],
+                    structured_tool=True,
+                )
 
         self.assertIn("without the registered expectation", str(ctx.exception))
         self.assertEqual(child.calls, 1)
@@ -1155,44 +1171,6 @@ class ToolCallCountTests(unittest.TestCase):
         ):
             self.assertEqual(_tool_progress_line_width(), 28)
 
-    def test_child_agent_installs_compact_tool_progress_callback(self):
-        seen_kwargs = {}
-
-        class FakeAIAgent:
-            def __init__(self, **kwargs):
-                seen_kwargs.update(kwargs)
-                self.model = kwargs.get("model")
-
-        run_agent_mod = types.ModuleType("run_agent")
-        run_agent_mod.AIAgent = FakeAIAgent
-        runner = HermesChildAgentRunner(PluginConfig())
-        request = ChildAgentRequest(
-            id=1,
-            prompt="work",
-            label="search:models",
-            phase=None,
-            toolsets=[],
-            reasoning_effort="high",
-        )
-        lease = WorkspaceLease(task_id="workflow-abc123", cwd="/tmp")
-        runtime = {"model": "test-model"}
-
-        with patch.dict(sys.modules, {"run_agent": run_agent_mod}):
-            child = runner._build_agent(request, runtime, [], lease, None)
-
-        self.assertIsInstance(child, FakeAIAgent)
-        self.assertEqual(seen_kwargs["quiet_mode"], True)
-        self.assertEqual(seen_kwargs["platform"], "cli")
-        self.assertTrue(callable(seen_kwargs["tool_progress_callback"]))
-        self.assertTrue(callable(seen_kwargs["thinking_callback"]))
-        self.assertIsNone(seen_kwargs["thinking_callback"]("pondering..."))
-        # The child must freeze its tool surface: run() assembles a deliberate
-        # surface (filter + forced Tool Search + structured_output injection)
-        # AFTER construction, and the core's per-turn MCP refresh would wipe it
-        # unless _skip_mcp_refresh is set. Regression guard for schema workflows
-        # failing with "structured_output does not exist".
-        self.assertTrue(getattr(child, "_skip_mcp_refresh", False))
-
     def test_tool_progress_callback_prints_one_started_line_on_tty(self):
         class TtyStringIO(io.StringIO):
             def isatty(self):
@@ -1206,8 +1184,6 @@ class ToolCallCountTests(unittest.TestCase):
             phase=None,
             toolsets=[],
             max_turns=10,
-            max_tool_calls=16,
-            max_tool_output_chars=200000,
         )
         lease = WorkspaceLease(task_id="workflow-abc123", cwd="/tmp")
         callback = runner._make_tool_progress_callback(request, lease)
@@ -1248,76 +1224,11 @@ class RunnerSessionContextTests(unittest.TestCase):
         runner = HermesChildAgentRunner(PluginConfig(), approval_session_key="parent-session")
         self.assertEqual(runner._approval_session_key, "parent-session")
 
-    def test_explicit_provider_and_model_bypass_parent_aliases_and_detection(self):
-        runner = HermesChildAgentRunner(PluginConfig())
-        request = ChildAgentRequest(
-            id=1,
-            prompt="work",
-            label="worker",
-            phase=None,
-            toolsets=[],
-            provider="openai-codex",
-            model="gpt-5.6-luna",
-            reasoning_effort="high",
-        )
-        resolved_runtime = {
-            "provider": "openai-codex",
-            "model": "gpt-5.6-luna",
-            "api_mode": "codex_responses",
-        }
-
-        with (
-            patch(
-                "hermes_cli.runtime_provider.resolve_runtime_provider",
-                return_value=dict(resolved_runtime),
-            ) as resolve_runtime,
-            patch("hermes_cli.models.detect_provider_for_model") as detect_provider,
-            patch("hermes_cli.model_switch._ensure_direct_aliases") as ensure_aliases,
-        ):
-            runtime = runner._resolve_runtime(request)
-
-        resolve_runtime.assert_called_once_with(
-            requested="openai-codex",
-            target_model="gpt-5.6-luna",
-            explicit_base_url=None,
-        )
-        detect_provider.assert_not_called()
-        ensure_aliases.assert_not_called()
-        self.assertEqual(runtime["provider"], "openai-codex")
-        self.assertEqual(runtime["model"], "gpt-5.6-luna")
-        self.assertIsNone(runtime["fallback_model"])
-
-    def test_explicit_contract_resolves_without_an_override_setting(self):
-        runner = HermesChildAgentRunner(PluginConfig())
-        request = ChildAgentRequest(
-            id=1,
-            prompt="work",
-            label="worker",
-            phase=None,
-            toolsets=[],
-            provider="openai-codex",
-            model="gpt-5.6-luna",
-            reasoning_effort="high",
-        )
-        with patch(
-            "hermes_cli.runtime_provider.resolve_runtime_provider",
-            return_value={"provider": "openai-codex", "model": "gpt-5.6-luna"},
-        ):
-            runtime = runner._resolve_runtime(request)
-        self.assertEqual(runtime["provider"], "openai-codex")
-        self.assertEqual(runtime["model"], "gpt-5.6-luna")
-
-    def test_blocked_explicit_model_fails_before_child_launch(self):
-        runner = HermesChildAgentRunner(PluginConfig(blocked_models=("gpt-5.5",)))
-        with self.assertRaisesRegex(ChildAgentError, "blocked by policy: gpt-5.5"):
-            runner._assert_models_allowed({"model": "gpt-5.5"})
-
 
 class StructuredOutputContinuationTests(unittest.TestCase):
     def test_runner_binds_parent_approval_session_key_inside_child_thread(self):
         seen = []
         current = {"value": ""}
-        resets = []
 
         approval_mod = types.ModuleType("tools.approval")
 
@@ -1326,12 +1237,7 @@ class StructuredOutputContinuationTests(unittest.TestCase):
             current["value"] = value
             return previous
 
-        def reset_current_session_key(token):
-            resets.append(token)
-            current["value"] = token
-
         approval_mod.set_current_session_key = set_current_session_key
-        approval_mod.reset_current_session_key = reset_current_session_key
         terminal_mod = types.ModuleType("tools.terminal_tool")
         terminal_mod.set_approval_callback = lambda callback: None
         terminal_mod.register_task_env_overrides = lambda task_id, overrides: None
@@ -1361,10 +1267,9 @@ class StructuredOutputContinuationTests(unittest.TestCase):
             phase=None,
             toolsets=[],
             max_turns=10,
-            max_tool_calls=16,
-            max_tool_output_chars=200000,
         )
         lease = WorkspaceLease(task_id="approval-session-child", cwd="/tmp")
+        child = Child()
         runner = HermesChildAgentRunner(
             PluginConfig(),
             approval_session_key="parent-session",
@@ -1377,11 +1282,18 @@ class StructuredOutputContinuationTests(unittest.TestCase):
                 "tools.terminal_tool": terminal_mod,
             },
         ):
-            result = runner._run_child_with_timeout(child=Child(), request=request, lease=lease, agent_type=None, toolsets=[])
+            result = runner._run_child(
+                _legacy_core(child),
+                child,
+                request,
+                lease,
+                None,
+                [],
+                structured_tool=False,
+            )
 
         self.assertEqual(result.content, "done")
         self.assertEqual(seen, ["parent-session"])
-        self.assertEqual(resets, [""])
 
     def test_runner_continues_same_child_session_until_tool_submission(self):
         schema = {
@@ -1398,8 +1310,6 @@ class StructuredOutputContinuationTests(unittest.TestCase):
             schema=schema,
             structured_tool=True,
             max_turns=10,
-            max_tool_calls=16,
-            max_tool_output_chars=200000,
         )
         lease = WorkspaceLease(task_id="structured-child", cwd="/tmp")
 
@@ -1429,12 +1339,14 @@ class StructuredOutputContinuationTests(unittest.TestCase):
         child = Child()
         register_expectation(lease.task_id, schema)
         try:
-            result = HermesChildAgentRunner(PluginConfig())._run_child_with_timeout(
+            result = HermesChildAgentRunner(PluginConfig())._run_child(
+                _legacy_core(child),
                 child,
                 request,
                 lease,
                 None,
                 ["workflow_structured"],
+                structured_tool=True,
             )
         finally:
             clear_expectation(lease.task_id)
@@ -1457,8 +1369,6 @@ class StructuredOutputContinuationTests(unittest.TestCase):
             schema=schema,
             structured_tool=True,
             max_turns=10,
-            max_tool_calls=16,
-            max_tool_output_chars=200000,
         )
         lease = WorkspaceLease(task_id="structured-child-fail", cwd="/tmp")
 
@@ -1481,12 +1391,14 @@ class StructuredOutputContinuationTests(unittest.TestCase):
         register_expectation(lease.task_id, schema)
         try:
             with self.assertRaises(ChildAgentError) as ctx:
-                HermesChildAgentRunner(PluginConfig())._run_child_with_timeout(
+                HermesChildAgentRunner(PluginConfig())._run_child(
+                    _legacy_core(child),
                     child,
                     request,
                     lease,
                     None,
                     ["workflow_structured"],
+                    structured_tool=True,
                 )
         finally:
             clear_expectation(lease.task_id)
@@ -1495,113 +1407,13 @@ class StructuredOutputContinuationTests(unittest.TestCase):
         self.assertEqual(child.calls, MAX_STRUCTURED_OUTPUT_RETRIES)
 
 
-class ReasoningEffortRunnerTests(unittest.TestCase):
-    def test_runner_rejects_request_without_resolved_contract(self):
-        runner = HermesChildAgentRunner(PluginConfig())
-        request = ChildAgentRequest(1, "work", "worker", None, [])
-
-        with patch.object(
-            runner,
-            "_resolve_runtime",
-            side_effect=AssertionError("runtime resolution reached"),
-        ) as resolve_runtime:
-            with self.assertRaisesRegex(
-                ChildAgentError,
-                "explicit provider, model, reasoning effort, or child budgets",
-            ):
-                runner.run(request)
-
-        resolve_runtime.assert_not_called()
-
-    def test_build_agent_uses_child_effort_and_scrubs_parent_overrides(self):
-        seen = []
-
-        class FakeAIAgent:
-            def __init__(self, **kwargs):
-                seen.append(kwargs)
-
-        run_agent_mod = types.ModuleType("run_agent")
-        run_agent_mod.AIAgent = FakeAIAgent
-        runner = HermesChildAgentRunner(PluginConfig())
-        lease = WorkspaceLease(task_id="reasoning-child", cwd="/tmp")
-        runtime = {
-            "model": "test-model",
-            "reasoning_config": {"enabled": True, "effort": "xhigh"},
-            "request_overrides": {
-                "reasoning": {"effort": "xhigh"},
-                "reasoning_effort": "xhigh",
-                "reasoning_config": {"enabled": True, "effort": "xhigh"},
-                "extra_body": {
-                    "reasoning": {"effort": "xhigh"},
-                    "reasoning_effort": "xhigh",
-                    "routing": "session",
-                },
-            },
-        }
-        request = ChildAgentRequest(
-            1,
-            "work",
-            "worker",
-            None,
-            [],
-            reasoning_effort="low",
-        )
-
-        with patch.dict(sys.modules, {"run_agent": run_agent_mod}):
-            runner._build_agent(request, runtime, [], lease, None)
-
-        self.assertEqual(seen[0]["reasoning_config"], {"enabled": True, "effort": "low"})
-        self.assertEqual(
-            seen[0]["request_overrides"],
-            {"extra_body": {"routing": "session"}},
-        )
-
-    def test_build_agent_sets_effort_without_parent_reasoning_state(self):
-        seen = []
-
-        class FakeAIAgent:
-            def __init__(self, **kwargs):
-                seen.append(kwargs)
-
-        run_agent_mod = types.ModuleType("run_agent")
-        run_agent_mod.AIAgent = FakeAIAgent
-        runner = HermesChildAgentRunner(PluginConfig())
-        request = ChildAgentRequest(
-            1,
-            "work",
-            "worker",
-            None,
-            [],
-            model="other-model",
-            reasoning_effort="high",
-        )
-
-        with patch.dict(sys.modules, {"run_agent": run_agent_mod}):
-            runner._build_agent(
-                request,
-                {"model": "other-model"},
-                [],
-                WorkspaceLease(task_id="reasoning-model-override", cwd="/tmp"),
-                None,
-            )
-
-        self.assertEqual(seen[0]["reasoning_config"], {"enabled": True, "effort": "high"})
-
-
 class MaxTurnsRunnerTests(unittest.TestCase):
     def _request(
         self,
         max_turns: int = 2,
         *,
         structured=True,
-        max_tool_calls: int = 16,
-        max_tool_output_chars: int = 200000,
     ):
-        agent_type = AgentTypeSpec(
-            name="general-purpose",
-            instructions="Work.",
-            source="test",
-        )
         return ChildAgentRequest(
             id=1,
             prompt="return status",
@@ -1613,18 +1425,6 @@ class MaxTurnsRunnerTests(unittest.TestCase):
             schema={"type": "object"} if structured else None,
             structured_tool=structured,
             max_turns=max_turns,
-            max_tool_calls=max_tool_calls,
-            max_tool_output_chars=max_tool_output_chars,
-            resolved=ResolvedAgentSpec(
-                requested_agent_type="general-purpose",
-                agent_type_spec=agent_type,
-                provider="openai-codex",
-                model="gpt-5.6-luna",
-                reasoning_effort="high",
-                max_turns=max_turns,
-                max_tool_calls=max_tool_calls,
-                max_tool_output_chars=max_tool_output_chars,
-            ),
             reasoning_effort="high",
         )
 
@@ -1632,8 +1432,14 @@ class MaxTurnsRunnerTests(unittest.TestCase):
         lease = WorkspaceLease(task_id=task_id, cwd="/tmp")
         register_expectation(task_id, request.schema)
         try:
-            return HermesChildAgentRunner(PluginConfig())._run_child_with_timeout(
-                child, request, lease, None, ["workflow_structured"]
+            return HermesChildAgentRunner(PluginConfig())._run_child(
+                _legacy_core(child),
+                child,
+                request,
+                lease,
+                None,
+                ["workflow_structured"],
+                structured_tool=True,
             )
         finally:
             clear_expectation(task_id)
@@ -1769,34 +1575,6 @@ class MaxTurnsRunnerTests(unittest.TestCase):
         self._run_structured(child, self._request(2), task_id)
         self.assertEqual(child.caps, [2, 2])
 
-    def test_does_not_continue_after_consuming_final_tool_call(self):
-        class Child:
-            session_prompt_tokens = session_completion_tokens = 0
-            session_reasoning_tokens = session_cache_read_tokens = 0
-            session_cache_write_tokens = 0
-            model = "test"
-
-            def __init__(self):
-                self.calls = 0
-
-            def run_conversation(self, **_):
-                self.calls += 1
-                return {
-                    "final_response": "done",
-                    "messages": [
-                        {"role": "assistant", "tool_calls": [{"id": "one"}]},
-                        {"role": "tool", "content": "x"},
-                    ],
-                    "completed": True,
-                    "api_calls": 1,
-                }
-
-        child = Child()
-        request = self._request(3, max_tool_calls=1)
-        with self.assertRaisesRegex(ChildAgentError, "maxToolCalls=1"):
-            self._run_structured(child, request, "structured-tool-limit")
-        self.assertEqual(child.calls, 1)
-
     def test_failed_structured_child_emits_terminal_token_metadata(self):
         events = []
 
@@ -1820,16 +1598,20 @@ class MaxTurnsRunnerTests(unittest.TestCase):
                     "api_calls": 1,
                 }
 
-        request = replace(
-            self._request(3, max_tool_calls=1),
-            on_update=events.append,
-        )
+        request = replace(self._request(1), on_update=events.append)
         lease = WorkspaceLease(task_id="structured-failed-metadata", cwd="/tmp")
+        child = Child()
         register_expectation(lease.task_id, request.schema or {})
         try:
-            with self.assertRaisesRegex(ChildAgentError, "maxToolCalls=1"):
-                HermesChildAgentRunner(PluginConfig())._run_child_with_timeout(
-                    Child(), request, lease, None, ["workflow_structured"]
+            with self.assertRaisesRegex(ChildAgentError, "maxTurns=1"):
+                HermesChildAgentRunner(PluginConfig())._run_child(
+                    _legacy_core(child),
+                    child,
+                    request,
+                    lease,
+                    None,
+                    ["workflow_structured"],
+                    structured_tool=True,
                 )
         finally:
             clear_expectation(lease.task_id)
@@ -1842,32 +1624,6 @@ class MaxTurnsRunnerTests(unittest.TestCase):
         self.assertEqual(terminal["cache_read_tokens"], 30)
         self.assertEqual(terminal["cache_write_tokens"], 4)
         self.assertEqual(terminal["tool_calls"], 1)
-        self.assertEqual(terminal["stop_reason"], "maxToolCalls")
-
-    def test_does_not_continue_after_consuming_output_character_budget(self):
-        class Child:
-            session_prompt_tokens = session_completion_tokens = 0
-            session_reasoning_tokens = session_cache_read_tokens = 0
-            session_cache_write_tokens = 0
-            model = "test"
-
-            def __init__(self):
-                self.calls = 0
-
-            def run_conversation(self, **_):
-                self.calls += 1
-                return {
-                    "final_response": "done",
-                    "messages": [{"role": "tool", "content": "four"}],
-                    "completed": True,
-                    "api_calls": 1,
-                }
-
-        child = Child()
-        request = self._request(3, max_tool_output_chars=4)
-        with self.assertRaisesRegex(ChildAgentError, "maxToolOutputChars=4"):
-            self._run_structured(child, request, "structured-output-limit")
-        self.assertEqual(child.calls, 1)
 
     def test_continuation_history_is_counted_once(self):
         task_id = "structured-history-budget"
@@ -1906,225 +1662,12 @@ class MaxTurnsRunnerTests(unittest.TestCase):
         child = Child()
         result = self._run_structured(
             child,
-            self._request(3, max_tool_calls=2, max_tool_output_chars=8),
+            self._request(3),
             task_id,
         )
         self.assertEqual(child.calls, 2)
         self.assertEqual(result.metadata["tool_calls"], 1)
         self.assertEqual(result.metadata["tool_output_chars"], 4)
-
-    def test_core_tool_budget_exhaustion_fails_unstructured_child(self):
-        class Child:
-            session_prompt_tokens = session_completion_tokens = 0
-            session_reasoning_tokens = session_cache_read_tokens = 0
-            session_cache_write_tokens = 0
-            model = "test"
-
-            def run_conversation(self, **_kwargs):
-                return {
-                    "final_response": "Tool budget exhausted",
-                    "messages": [],
-                    "completed": False,
-                    "api_calls": 1,
-                    "tool_budget": {
-                        "calls_used": 1,
-                        "output_chars_used": 4,
-                        "exhausted": True,
-                        "exhaustion_reason": "max_calls",
-                    },
-                }
-
-        request = self._request(3, structured=False, max_tool_calls=1)
-        lease = WorkspaceLease(task_id="unstructured-tool-budget", cwd="/tmp")
-        with self.assertRaisesRegex(ChildAgentError, "maxToolCalls=1"):
-            HermesChildAgentRunner(PluginConfig())._run_child_with_timeout(
-                Child(), request, lease, None, []
-            )
-
-    def test_codex_runtime_rejected_before_agent_construction(self):
-        runner = HermesChildAgentRunner(PluginConfig())
-        request = self._request(2, structured=False)
-        with (
-            patch(
-                "hermes_dynamic_workflows.child.runner.create_workspace_lease"
-            ) as create_lease,
-            patch.object(
-                runner,
-                "_resolve_runtime",
-                return_value={"api_mode": "codex_app_server", "model": "test"},
-            ),
-            patch.object(runner, "_build_agent") as build_agent,
-        ):
-            with self.assertRaisesRegex(ChildAgentError, "codex_app_server"):
-                runner.run(request)
-        create_lease.assert_not_called()
-        build_agent.assert_not_called()
-
-    def test_codex_runtime_rejects_unsupported_effort(self):
-        runner = HermesChildAgentRunner(PluginConfig())
-        request = self._request(2, structured=False)
-        with (
-            patch(
-                "hermes_dynamic_workflows.child.runner.create_workspace_lease"
-            ) as create_lease,
-            patch.object(
-                runner,
-                "_resolve_runtime",
-                return_value={"api_mode": "codex_app_server", "model": "test"},
-            ),
-            patch.object(runner, "_build_agent") as build_agent,
-        ):
-            with self.assertRaisesRegex(ChildAgentError, "reasoningEffort.*codex_app_server"):
-                runner.run(request)
-        create_lease.assert_not_called()
-        build_agent.assert_not_called()
-
-    def test_bedrock_primary_and_fallback_rejected_before_workspace_creation(self):
-        request = self._request(2, structured=False)
-        runtimes = (
-            {"provider": "bedrock", "api_mode": "bedrock_converse", "model": "claude"},
-            {
-                "provider": "openai-codex",
-                "api_mode": "codex_responses",
-                "model": "gpt",
-                "fallback_model": [{"provider": "aws-bedrock", "model": "claude"}],
-            },
-        )
-        for runtime in runtimes:
-            with self.subTest(runtime=runtime):
-                runner = HermesChildAgentRunner(PluginConfig())
-                with (
-                    patch(
-                        "hermes_dynamic_workflows.child.runner.create_workspace_lease"
-                    ) as create_lease,
-                    patch.object(runner, "_resolve_runtime", return_value=runtime),
-                    patch.object(runner, "_build_agent") as build_agent,
-                ):
-                    with self.assertRaisesRegex(ChildAgentError, "reasoningEffort.*bedrock"):
-                        runner.run(request)
-                create_lease.assert_not_called()
-                build_agent.assert_not_called()
-
-    def test_constructor_kwarg_only_present_for_explicit_cap(self):
-        seen = []
-
-        class FakeAIAgent:
-            def __init__(self, **kwargs):
-                seen.append(kwargs)
-
-        run_agent_mod = types.ModuleType("run_agent")
-        run_agent_mod.AIAgent = FakeAIAgent
-        runner = HermesChildAgentRunner(PluginConfig())
-        lease = WorkspaceLease(task_id="build-capped", cwd="/tmp")
-        runtime = {"model": "test-model"}
-        with patch.dict(sys.modules, {"run_agent": run_agent_mod}):
-            runner._build_agent(
-                ChildAgentRequest(
-                    1,
-                    "work",
-                    "uncapped",
-                    None,
-                    [],
-                    reasoning_effort="high",
-                ),
-                runtime,
-                [],
-                lease,
-                None,
-            )
-            runner._build_agent(
-                ChildAgentRequest(
-                    2,
-                    "work",
-                    "capped",
-                    None,
-                    [],
-                    max_turns=7,
-                    reasoning_effort="high",
-                ),
-                runtime,
-                [],
-                lease,
-                None,
-            )
-        self.assertNotIn("max_iterations", seen[0])
-        self.assertEqual(seen[1]["max_iterations"], 7)
-
-    def test_constructor_receives_shared_tool_budget(self):
-        seen = []
-
-        class FakeAIAgent:
-            def __init__(self, **kwargs):
-                seen.append(kwargs)
-
-        class FakeToolBudget:
-            def __init__(self, *, max_calls, max_output_chars):
-                self.max_calls = max_calls
-                self.max_output_chars = max_output_chars
-
-        run_agent_mod = types.ModuleType("run_agent")
-        setattr(run_agent_mod, "AIAgent", FakeAIAgent)
-        budget_mod = types.ModuleType("agent.tool_budget")
-        setattr(budget_mod, "ToolBudget", FakeToolBudget)
-        request = ChildAgentRequest(
-            1,
-            "work",
-            "budgeted",
-            None,
-            [],
-            max_turns=7,
-            max_tool_calls=3,
-            max_tool_output_chars=42,
-            reasoning_effort="high",
-        )
-
-        with patch.dict(
-            sys.modules,
-            {"run_agent": run_agent_mod, "agent.tool_budget": budget_mod},
-        ):
-            HermesChildAgentRunner(PluginConfig())._build_agent(
-                request,
-                {"model": "test-model"},
-                [],
-                WorkspaceLease(task_id="build-budgeted", cwd="/tmp"),
-                None,
-            )
-
-        budget = seen[0]["tool_budget"]
-        self.assertIsInstance(budget, FakeToolBudget)
-        self.assertEqual(budget.max_calls, 3)
-        self.assertEqual(budget.max_output_chars, 42)
-
-    def test_capped_constructor_disables_core_exhaustion_summary_call(self):
-        summary_calls = []
-
-        class FakeAIAgent:
-            def __init__(self, **_kwargs):
-                self._handle_max_iterations = lambda *_: summary_calls.append("provider")
-
-        run_agent_mod = types.ModuleType("run_agent")
-        setattr(run_agent_mod, "AIAgent", FakeAIAgent)
-        runner = HermesChildAgentRunner(PluginConfig())
-        lease = WorkspaceLease(task_id="build-capped-summary", cwd="/tmp")
-        with patch.dict(sys.modules, {"run_agent": run_agent_mod}):
-            child = runner._build_agent(
-                ChildAgentRequest(
-                    1,
-                    "work",
-                    "capped",
-                    None,
-                    [],
-                    max_turns=1,
-                    reasoning_effort="high",
-                ),
-                {"model": "test-model"},
-                [],
-                lease,
-                None,
-            )
-
-        self.assertIsNone(child._handle_max_iterations([], 1))
-        self.assertEqual(summary_calls, [])
 
     def test_unstructured_capped_exhaustion_is_a_failure(self):
         class Child:
@@ -2144,10 +1687,17 @@ class MaxTurnsRunnerTests(unittest.TestCase):
 
         request = self._request(1, structured=False)
         lease = WorkspaceLease(task_id="unstructured-exhausted", cwd="/tmp")
+        child = Child()
 
         with self.assertRaisesRegex(ChildAgentError, "maxTurns=1"):
-            HermesChildAgentRunner(PluginConfig())._run_child_with_timeout(
-                Child(), request, lease, None, []
+            HermesChildAgentRunner(PluginConfig())._run_child(
+                _legacy_core(child),
+                child,
+                request,
+                lease,
+                None,
+                [],
+                structured_tool=False,
             )
 
 
@@ -2324,251 +1874,170 @@ class ChildApprovalPolicyTests(unittest.TestCase):
             self.assertEqual(cb("rm -rf build", "recursive delete"), "once")
 
 
-def _real_core_root() -> Path | None:
-    """Locate the Hermes checkout used by the real-core compatibility test."""
-    candidates = []
-    configured = os.environ.get("HERMES_AGENT_ROOT")
-    if configured:
-        candidates.append(Path(configured))
-    candidates.extend(Path(entry) for entry in sys.path if entry)
-    candidates.append(Path.home() / ".hermes" / "hermes-agent")
-    for root in candidates:
-        if (root / "run_agent.py").is_file() and (root / "agent" / "tool_budget.py").is_file():
-            return root.resolve()
-    return None
-
-
-def _load_real_core_types():
-    """Import AIAgent and ToolBudget from the selected Hermes checkout."""
-    root = _real_core_root()
-    if root is None:
-        raise ImportError("Hermes core checkout with run_agent.py is unavailable")
-    root_text = str(root)
-    if root_text not in sys.path:
-        sys.path.insert(0, root_text)
-    importlib.invalidate_caches()
-    from agent.tool_budget import ToolBudget
-    from run_agent import AIAgent
-
-    return AIAgent, ToolBudget
-
-
-def _real_core_tool_budget_importable() -> bool:
-    try:
-        _load_real_core_types()
-        return True
-    except Exception:
-        return False
-
-
-@unittest.skipUnless(
-    _real_core_tool_budget_importable(),
-    "Hermes core checkout with AIAgent and ToolBudget is not importable",
-)
-class RealCoreToolBudgetCompatibilityTests(unittest.TestCase):
-    """Exercise the plugin's budgeted child path with the real Hermes core.
-
-    RED provenance: before core commit feda20626d0baf1acd0247577d65ffc92935599d,
-    the same constructor call raised ``TypeError: unexpected keyword argument
-    'tool_budget'`` because the core AIAgent signature did not accept the
-    plugin's ToolBudget. The RED check uses ``HERMES_AGENT_ROOT`` to point at a
-    disposable checkout of that parent commit; it never resets the installed
-    live core checkout.
-    """
-
-    def test_budgeted_child_uses_real_core_constructor_and_stores_budget(self):
-        AIAgent, ToolBudget = _load_real_core_types()
-        request = ChildAgentRequest(
+class SharedCoreChildExecutionTests(unittest.TestCase):
+    def _request(self, *, structured=False):
+        return ChildAgentRequest(
             id=1,
-            prompt="work",
-            label="real-core-budget",
+            prompt="do the work",
+            label="child",
             phase=None,
             toolsets=[],
-            provider="openrouter",
-            model="test-model",
-            max_turns=7,
-            max_tool_calls=3,
-            max_tool_output_chars=42,
-            reasoning_effort="high",
+            profile=None,
+            provider=None,
+            model=None,
+            schema={"type": "object"} if structured else None,
+            cwd="/tmp/workflow-child",
+            structured_tool=structured,
+            max_turns=3,
         )
-        runtime = {
-            "provider": "openrouter",
-            "model": "test-model",
-            "base_url": "https://openrouter.ai/api/v1",
-            "api_key": "test-key",
-            "api_mode": "chat_completions",
-        }
 
-        with (
+    def _patch_runner_setup(self, child):
+        lease = types.SimpleNamespace(
+            task_id="workflow-test",
+            cwd="/tmp/workflow-child",
+            isolation=None,
+            path=None,
+            branch=None,
+            cleanup=lambda: None,
+        )
+        return (
+            lease,
+            patch(
+                "hermes_dynamic_workflows.child.runner.create_workspace_lease",
+                return_value=lease,
+            ),
+            patch("hermes_dynamic_workflows.child.runner._prepare_mcp_tool_registry"),
+            patch("hermes_dynamic_workflows.child.runner._configure_child_tools"),
+            patch("hermes_dynamic_workflows.child.runner._register_task_cwd"),
+            patch("hermes_dynamic_workflows.child.runner._cleanup_task_cwd"),
             patch("hermes_dynamic_workflows.child.runner._create_session_db", return_value=None),
-            patch("run_agent.get_tool_definitions", return_value=[]),
-            patch("run_agent.OpenAI"),
-        ):
-            child = HermesChildAgentRunner(PluginConfig())._build_agent(
-                request,
-                runtime,
-                [],
-                WorkspaceLease(task_id="real-core-budget", cwd="/tmp"),
-                None,
-            )
-
-        self.assertIsInstance(child, AIAgent)
-        self.assertIsInstance(child.tool_budget, ToolBudget)
-        self.assertEqual(child.tool_budget.max_calls, 3)
-        self.assertEqual(child.tool_budget.max_output_chars, 42)
-
-
-def _core_refresh_importable() -> bool:
-    """True iff the host Hermes core exposes the between-turns MCP refresh.
-
-    The integration test below drives the REAL core refresh, so it only runs
-    when the plugin is installed against a Hermes checkout (the normal case).
-    Standalone plugin checkouts without the core on sys.path skip it cleanly.
-    """
-    try:
-        from tools.mcp_tool import (  # noqa: F401
-            has_registered_mcp_tools,
-            refresh_agent_mcp_tools,
+            patch(
+                "hermes_dynamic_workflows.child.runner._resolve_child_toolsets",
+                return_value=[],
+            ),
+            patch("hermes_dynamic_workflows.child.runner._stdout_is_tty", return_value=False),
         )
-        from tools.registry import registry  # noqa: F401
 
-        return True
-    except Exception:
-        return False
+    def test_create_and_run_use_unresolved_core_route_and_parent_session(self):
+        child = types.SimpleNamespace(
+            tools=[],
+            valid_tool_names=set(),
+            model=None,
+            provider=None,
+            base_url=None,
+            reasoning_config=None,
+            session_input_tokens=0,
+            session_output_tokens=0,
+            session_prompt_tokens=0,
+            session_completion_tokens=0,
+            session_reasoning_tokens=0,
+        )
+        setup = self._patch_runner_setup(child)
+        with setup[1], setup[2], setup[3], setup[4], setup[5], setup[6], setup[7], setup[8], \
+             patch("agent.child_execution.create_child", return_value=child) as create_child, \
+             patch(
+                 "agent.child_execution.run_child",
+                 return_value={"final_response": "done", "messages": []},
+             ) as run_child:
+            result = HermesChildAgentRunner(
+                PluginConfig(), parent_runtime={"session_id": "parent-session"}
+            ).run(self._request())
 
+        self.assertEqual(result.content, "done")
+        spec = create_child.call_args.args[1]
+        self.assertIsNone(spec["profile"])
+        self.assertIsNone(spec["provider"])
+        self.assertIsNone(spec["model"])
+        self.assertIsNone(spec["reasoning_effort"])
+        self.assertNotIn("resolved_credentials", spec)
+        self.assertEqual(spec["session_id"], "workflow-test")
+        context = create_child.call_args.kwargs["context"]
+        self.assertEqual(context["cwd"], "/tmp/workflow-child")
+        self.assertEqual(context["parent_session_id"], "parent-session")
+        run_kwargs = run_child.call_args.kwargs
+        self.assertIsNone(run_kwargs["conversation_history"])
+        self.assertTrue(callable(run_kwargs["initializer"]))
+        self.assertTrue(run_child.call_args.args[1].endswith("do the work"))
 
-@unittest.skipUnless(
-    _core_refresh_importable(),
-    "host Hermes core (tools.mcp_tool / tools.registry) not importable",
-)
-class StructuredOutputSurvivesRealMcpRefreshTests(unittest.TestCase):
-    """E2E guard against the regression that mocks could not catch.
-
-    Schema workflow children died with "structured_output does not exist"
-    because the core's per-turn between-turns refresh
-    (agent/turn_context.py -> tools.mcp_tool.refresh_agent_mcp_tools) rebuilt
-    the child's tool surface from get_tool_definitions(enabled_toolsets=...)
-    and re-appended only the memory + context-engine families, silently
-    dropping the post-build structured_output injection. Unit tests passed
-    because they mutated a mock object and never ran the REAL refresh against
-    a child built by _build_agent. These tests close that gap: they register a
-    real MCP tool (so has_registered_mcp_tools() is True — the trigger), build
-    a real child, and run the REAL refresh, asserting the fix
-    (_skip_mcp_refresh) preserves structured_output while the absence of the
-    fix reproduces the wipe.
-    """
-
-    MCP_TOOL = "mcp_test_probe_tool"
-
-    def _register_probe_mcp_tool(self):
-        from tools import mcp_tool
-        from tools.registry import registry
-
-        schema = {
-            "name": self.MCP_TOOL,
-            "description": "probe",
-            "parameters": {"type": "object", "properties": {}},
-        }
-        # Register into the real registry AND mark it as MCP-sourced so
-        # has_registered_mcp_tools() reports True (the per-turn trigger).
-        if registry.get_entry(self.MCP_TOOL) is None:
-            registry.register(
-                name=self.MCP_TOOL,
-                toolset="mcp-probe",
-                schema=schema,
-                handler=lambda **kw: "ok",
-                description="probe",
+    def test_core_timeout_is_translated_to_workflow_timeout(self):
+        child = types.SimpleNamespace(
+            tools=[],
+            valid_tool_names=set(),
+            model=None,
+            provider=None,
+            base_url=None,
+            reasoning_config=None,
+            session_input_tokens=0,
+            session_output_tokens=0,
+            session_prompt_tokens=0,
+            session_completion_tokens=0,
+            session_reasoning_tokens=0,
+        )
+        setup = self._patch_runner_setup(child)
+        with setup[1], setup[2], setup[3], setup[4], setup[5], setup[6], setup[7], setup[8], \
+             patch("agent.child_execution.create_child", return_value=child), \
+             patch(
+                 "agent.child_execution.run_child",
+                 return_value={"status": "timeout", "exit_reason": "timeout"},
+             ):
+            with self.assertRaises(WorkflowTimeout):
+                HermesChildAgentRunner(PluginConfig()).run(self._request())
+    def test_schema_retry_reuses_exact_previous_conversation_history(self):
+        child = types.SimpleNamespace(
+            tools=[],
+            valid_tool_names=set(),
+            model=None,
+            provider=None,
+            base_url=None,
+            reasoning_config=None,
+            session_input_tokens=0,
+            session_output_tokens=0,
+            session_prompt_tokens=0,
+            session_completion_tokens=0,
+            session_reasoning_tokens=0,
+        )
+        history = [{"role": "user", "content": "first"}]
+        core = types.SimpleNamespace(
+            run_child=MagicMock(
+                side_effect=[
+                    {"final_response": "retry", "messages": history, "api_calls": 1},
+                    {
+                        "final_response": "done",
+                        "messages": history + [{"role": "assistant", "content": "done"}],
+                        "api_calls": 1,
+                    },
+                ]
             )
-        with mcp_tool._lock:
-            mcp_tool._mcp_tool_server_names[self.MCP_TOOL] = "probe-server"
-
-    def _cleanup_probe_mcp_tool(self):
-        from tools import mcp_tool
-        from tools.registry import registry
-
-        with mcp_tool._lock:
-            mcp_tool._mcp_tool_server_names.pop(self.MCP_TOOL, None)
-        try:
-            registry.deregister(self.MCP_TOOL)
-        except Exception:
-            pass
-
-    def _build_child(self):
-        class FakeAIAgent:
-            def __init__(self, **kwargs):
-                self.model = kwargs.get("model")
-                self.enabled_toolsets = kwargs.get("enabled_toolsets")
-                self.disabled_toolsets = kwargs.get("disabled_toolsets")
-                self.quiet_mode = kwargs.get("quiet_mode", True)
-                self.tools = []
-                self.valid_tool_names = set()
-                self._tool_snapshot_generation = 0
-
-        run_agent_mod = types.ModuleType("run_agent")
-        run_agent_mod.AIAgent = FakeAIAgent
+        )
         runner = HermesChildAgentRunner(PluginConfig())
-        request = ChildAgentRequest(
-            id=1,
-            prompt="work",
-            label="schema-agent",
-            phase=None,
-            toolsets=["file"],
-            reasoning_effort="high",
+        lease = types.SimpleNamespace(
+            task_id="workflow-retry",
+            cwd="/tmp/workflow-child",
+            isolation=None,
+            path=None,
+            branch=None,
         )
-        lease = WorkspaceLease(task_id="workflow-int001", cwd="/tmp")
-        runtime = {"model": "test-model"}
-        with patch.dict(sys.modules, {"run_agent": run_agent_mod}):
-            child = runner._build_agent(request, runtime, ["file"], lease, None)
-        # Seed the deliberately-assembled surface run() would publish for a
-        # schema child: structured_output injected on top of the toolset.
-        child.tools = [
-            {"type": "function", "function": {"name": "read_file", "parameters": {}}},
-            {"type": "function", "function": {"name": "structured_output", "parameters": {}}},
-        ]
-        child.valid_tool_names = {"read_file", "structured_output"}
-        return child
-
-    def _run_core_guard(self, child):
-        """Replicate agent/turn_context.py's between-turns refresh guard exactly."""
-        from tools.mcp_tool import has_registered_mcp_tools, refresh_agent_mcp_tools
-
-        self.assertTrue(
-            has_registered_mcp_tools(),
-            "probe MCP tool should make has_registered_mcp_tools() True",
-        )
-        if not getattr(child, "_skip_mcp_refresh", False):
-            refresh_agent_mcp_tools(child, quiet_mode=True)
-
-    def test_real_refresh_preserves_structured_output_with_flag(self):
-        self._register_probe_mcp_tool()
-        try:
-            child = self._build_child()
-            self.assertTrue(getattr(child, "_skip_mcp_refresh", False))
-            self._run_core_guard(child)
-            # Fix holds: the real refresh was skipped, surface intact.
-            self.assertIn("structured_output", child.valid_tool_names)
-        finally:
-            self._cleanup_probe_mcp_tool()
-
-    def test_real_refresh_wipes_structured_output_without_flag(self):
-        # Characterizes the bug: with the flag cleared, the REAL refresh runs
-        # and strips structured_output (it is not in the re-appended families).
-        # This is the failure the fix prevents; if this assertion ever flips,
-        # the core refresh started preserving the tool and the guard could be
-        # revisited.
-        self._register_probe_mcp_tool()
-        try:
-            child = self._build_child()
-            child._skip_mcp_refresh = False  # simulate pre-fix behavior
-            self._run_core_guard(child)
-            self.assertNotIn(
-                "structured_output",
-                child.valid_tool_names,
-                "real refresh unexpectedly preserved structured_output; "
-                "the _skip_mcp_refresh guard's premise may have changed",
+        request = self._request(structured=True)
+        with patch(
+            "hermes_dynamic_workflows.child.runner.peek_result",
+            side_effect=[(False, None, 0), (True, {"value": 1}, 1)],
+        ), patch("hermes_dynamic_workflows.adapters.hooks.register_child_observer"), patch(
+            "hermes_dynamic_workflows.child.runner._stdout_is_tty", return_value=False
+        ):
+            result = runner._run_child(
+                core,
+                child,
+                request,
+                lease,
+                None,
+                [],
+                structured_tool=True,
             )
-        finally:
-            self._cleanup_probe_mcp_tool()
+
+        self.assertEqual(result.content, "done")
+        self.assertEqual(core.run_child.call_count, 2)
+        self.assertIsNone(core.run_child.call_args_list[0].kwargs["conversation_history"])
+        self.assertIs(core.run_child.call_args_list[1].kwargs["conversation_history"], history)
 
 
 if __name__ == "__main__":

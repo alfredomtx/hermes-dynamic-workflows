@@ -1217,10 +1217,15 @@ def _capture_parent_runtime(parent_agent: Any, *, plugin_context: Any = None) ->
         return None
 
     model = str(getattr(agent, "model", "") or "").strip()
-    if not model:
-        return None
-
-    runtime: dict[str, Any] = {"model": model}
+    runtime: dict[str, Any] = {}
+    if model:
+        runtime["model"] = model
+    session_id = str(getattr(agent, "session_id", "") or "").strip()
+    if not session_id:
+        cli_ref = _plugin_context_cli_ref(plugin_context)
+        session_id = str(getattr(cli_ref, "session_id", "") or "").strip()
+    if session_id:
+        runtime["session_id"] = session_id
     for key in (
         "provider",
         "base_url",
@@ -1230,6 +1235,13 @@ def _capture_parent_runtime(parent_agent: Any, *, plugin_context: Any = None) ->
         "reasoning_config",
         "service_tier",
         "max_tokens",
+        "providers_allowed",
+        "providers_ignored",
+        "providers_order",
+        "provider_sort",
+        "provider_require_parameters",
+        "provider_data_collection",
+        "openrouter_min_coding_score",
     ):
         value = getattr(agent, key, None)
         if value is not None:
@@ -1258,7 +1270,7 @@ def _capture_parent_runtime(parent_agent: Any, *, plugin_context: Any = None) ->
     request_overrides = getattr(agent, "request_overrides", None)
     if isinstance(request_overrides, dict) and request_overrides:
         runtime["request_overrides"] = dict(request_overrides)
-    return runtime
+    return runtime or None
 
 
 def _gateway_running_agent() -> Any:
