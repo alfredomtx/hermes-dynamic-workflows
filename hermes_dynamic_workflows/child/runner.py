@@ -1,9 +1,7 @@
-"""Standalone Hermes AIAgent runner used by workflow agent()."""
+"""Workflow child adapter backed by Hermes core child execution."""
 
 from __future__ import annotations
 
-import importlib
-import inspect
 import os
 import re
 import shutil
@@ -13,8 +11,8 @@ import unicodedata
 import uuid
 import logging
 from contextlib import nullcontext
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 
 from .presets import AgentTypeSpec, list_agent_types, resolve_agent_type
@@ -126,7 +124,7 @@ class _WorkflowApprovalCoordinator:
 
 
 class HermesChildAgentRunner(ChildAgentRunner):
-    """Create standalone Hermes AIAgent children without native delegation."""
+    """Create workflow children through the shared Hermes core seam."""
 
     def __init__(
         self,
@@ -155,49 +153,21 @@ class HermesChildAgentRunner(ChildAgentRunner):
         self._progress_print_lock = threading.RLock()
 
     def run(self, request: ChildAgentRequest) -> ChildAgentResult:
+        # Import lazily so plugin-only environments can load without the shared core.
+        from agent import child_execution
+
         task_id = f"workflow-{uuid.uuid4().hex[:12]}"
         base_cwd = request.cwd or os.environ.get("TERMINAL_CWD") or os.getcwd()
-        resolved = request.resolved
-        if (
-            resolved is None
-            or request.reasoning_effort is None
-            or not (request.provider or "").strip()
-            or not (request.model or "").strip()
-            or request.max_turns is None
-            or request.max_tool_calls is None
-            or request.max_tool_output_chars is None
-        ):
-            raise ChildAgentError(
-                "workflow child request is missing validated explicit provider, model, reasoning effort, or child budgets"
-            )
-        if (
-            request.provider != resolved.provider
-            or request.model != resolved.model
-            or request.max_turns != resolved.max_turns
-            or request.max_tool_calls != resolved.max_tool_calls
-            or request.max_tool_output_chars != resolved.max_tool_output_chars
-        ):
-            raise ChildAgentError("workflow child routing or budgets do not match its resolved specification")
-        agent_type = resolved.agent_type_spec
+        agent_type = request.agent_type_spec
+        if agent_type is None and request.agent_type:
+            agent_type = resolve_agent_type(request.agent_type, cwd=base_cwd)
         if request.agent_type and agent_type is None:
             available = ", ".join(spec.name for spec in list_agent_types(cwd=base_cwd)) or "none"
             raise ChildAgentError(
                 f"agent({{agentType}}): agent type '{request.agent_type}' not found. "
                 f"Available agents: {available}"
             )
-        if resolved is None:
-            request = _apply_agent_type_defaults(request, agent_type)
-        runtime = self._resolve_runtime(request)
-        unsupported_runtime = _runtime_without_reasoning_effort(runtime)
-        if unsupported_runtime is not None:
-            raise ChildAgentError(
-                "reasoningEffort is not supported by workflow child runtime "
-                f"'{unsupported_runtime}'"
-            )
-        if request.max_turns is not None and runtime.get("api_mode") == "codex_app_server":
-            raise ChildAgentError(
-                "maxTurns is not supported by the codex_app_server runtime"
-            )
+        request = _apply_agent_type_defaults(request, agent_type)
         lease = create_workspace_lease(
             cwd=base_cwd,
             isolation=request.isolation,
@@ -206,38 +176,75 @@ class HermesChildAgentRunner(ChildAgentRunner):
             keep_worktree=self.config.keep_worktrees,
         )
         _prepare_mcp_tool_registry(self.config)
-        if resolved is not None:
-            toolsets = list(resolved.toolsets)
-            allowed_tools = resolved.allowed_tools
-            allowed_tools_explicit = resolved.allowed_tools_explicit
-            disallowed_tools = resolved.disallowed_tools
-        else:
-            toolsets = _resolve_child_toolsets(
-                self.config,
-                request.toolsets,
-                agent_type.toolsets if agent_type else (),
-                requested_explicit=bool(request.toolsets),
-                agent_type_toolsets_explicit=bool(
-                    getattr(agent_type, "toolsets_explicit", False)
-                    or (agent_type.toolsets if agent_type else ())
-                ),
-                include_discoverable=(
-                    agent_type is None
-                    and not request.toolsets
-                ),
-            )
-            allowed_tools = agent_type.allowed_tools if agent_type else ()
-            allowed_tools_explicit = bool(
-                getattr(agent_type, "allowed_tools_explicit", False)
-                or (agent_type.allowed_tools if agent_type else ())
-            )
-            disallowed_tools = agent_type.disallowed_tools if agent_type else ()
+        toolsets = _resolve_child_toolsets(
+            self.config,
+            request.toolsets,
+            agent_type.toolsets if agent_type else (),
+            requested_explicit=bool(request.toolsets),
+            agent_type_toolsets_explicit=bool(
+                getattr(agent_type, "toolsets_explicit", False)
+                or (agent_type.toolsets if agent_type else ())
+            ),
+            include_discoverable=agent_type is None and not request.toolsets,
+        )
+        allowed_tools = request.allowed_tools or (
+            tuple(agent_type.allowed_tools) if agent_type else ()
+        )
+        allowed_tools_explicit = request.allowed_tools_explicit or bool(
+            getattr(agent_type, "allowed_tools_explicit", False)
+            or (agent_type.allowed_tools if agent_type else ())
+        )
+        disallowed_tools = request.disallowed_tools or (
+            tuple(agent_type.disallowed_tools) if agent_type else ()
+        )
         structured_tool = bool(request.structured_tool and request.schema)
         if structured_tool and STRUCTURED_OUTPUT_TOOLSET not in toolsets:
             toolsets = toolsets + [STRUCTURED_OUTPUT_TOOLSET]
         tool_scope = structured_output_tool_scope() if structured_tool else nullcontext()
         with tool_scope:
-            child = self._build_agent(request, runtime, toolsets, lease, agent_type)
+            _register_task_cwd(lease.task_id, lease.cwd, agent_type)
+            parent_proxy = _parent_agent_proxy(self._parent_runtime)
+            instructions = build_child_system_prompt(
+                agent_type,
+                structured_output=structured_tool,
+            )
+            if not instructions and request.instructions:
+                instructions = request.instructions
+            callbacks = {
+                "progress": self._make_core_progress_callback(request, lease),
+                "thinking": _child_thinking_callback,
+                "clarify": _child_clarify_callback,
+            }
+            child_spec = {
+                "profile": request.profile,
+                "provider": request.provider,
+                "model": request.model,
+                "reasoning_effort": request.reasoning_effort,
+                "instructions": instructions,
+                "enabled_toolsets": toolsets,
+                "disabled_toolsets": list(self.config.blocked_child_toolsets),
+                "request_overrides": _without_reasoning_overrides(
+                    request.request_overrides
+                ),
+                "session_id": lease.task_id,
+            }
+            child_context = {
+                "cwd": lease.cwd,
+                "max_iterations": request.max_turns,
+                "session_db": _create_session_db(),
+                "parent_session_id": (self._parent_runtime or {}).get("session_id"),
+                "log_prefix": "[dynamic-workflow-child]",
+                "platform": "subagent",
+            }
+            child = child_execution.create_child(
+                parent_proxy,
+                child_spec,
+                callbacks=callbacks,
+                context=child_context,
+            )
+            # Freeze the deliberate workflow tool surface because MCP refreshes
+            # cannot reproduce its workflow-specific mutations.
+            child._skip_mcp_refresh = True
             _configure_child_tools(
                 child,
                 toolsets=toolsets,
@@ -261,8 +268,18 @@ class HermesChildAgentRunner(ChildAgentRunner):
                     request.schema,
                     interrupt if callable(interrupt) else None,
                 )
+            with self._active_lock:
+                self._active_children[lease.task_id] = child
             try:
-                result = self._run_child_with_timeout(child, request, lease, agent_type, toolsets)
+                result = self._run_child(
+                    child_execution,
+                    child,
+                    request,
+                    lease,
+                    agent_type,
+                    toolsets,
+                    structured_tool=structured_tool,
+                )
                 if self._consume_skipped(task_id):
                     raise ChildAgentSkipped(f"child agent {task_id} was skipped")
                 if structured_tool and isinstance(result, ChildAgentResult):
@@ -277,172 +294,25 @@ class HermesChildAgentRunner(ChildAgentRunner):
                     raise ChildAgentSkipped(f"child agent {task_id} was skipped") from None
                 raise
             finally:
-                self._clear_skipped(task_id)
                 if structured_tool:
                     clear_expectation(lease.task_id)
+                try:
+                    from ..adapters.hooks import unregister_child_observer
 
-    def supports_request_overrides(self) -> bool:
-        try:
-            from run_agent import AIAgent
-        except Exception:
-            return False
-        return _callable_accepts_keyword(AIAgent, "request_overrides")
+                    unregister_child_observer(lease.task_id)
+                except Exception:
+                    pass
+                with self._active_lock:
+                    self._active_children.pop(lease.task_id, None)
+                _cleanup_task_cwd(lease.task_id)
+                lease.cleanup()
 
-    def _resolve_runtime(self, request: ChildAgentRequest) -> dict[str, Any]:
-        requested_provider = (request.provider or "").strip().lower()
-        requested_model = (request.model or "").strip()
-        if not requested_provider:
-            raise ChildAgentError("workflow child request is missing an explicit provider")
-        if not requested_model or requested_model.lower() == "inherit":
-            raise ChildAgentError("workflow child request is missing an exact model")
-        try:
-            from hermes_cli.runtime_provider import resolve_runtime_provider
-        except Exception as exc:
-            raise ChildAgentError(f"could not import Hermes runtime helpers: {exc}") from exc
-
-        runtime = resolve_runtime_provider(
-            requested=requested_provider,
-            target_model=requested_model,
-            explicit_base_url=None,
-        )
-        resolved_provider = str(runtime.get("provider") or requested_provider).strip().lower()
-        resolved_model = str(runtime.get("model") or requested_model).strip()
-        if resolved_provider != requested_provider or resolved_model != requested_model:
-            raise ChildAgentError(
-                "workflow child provider/model pair did not resolve exactly as requested"
-            )
-        runtime["model"] = requested_model
-        runtime["fallback_model"] = None
-        self._assert_models_allowed(runtime)
-        return runtime
-
-    def _assert_models_allowed(self, runtime: dict[str, Any]) -> None:
-        blocked = tuple(model.strip().lower() for model in self.config.blocked_models if model.strip())
-        if not blocked:
-            return
-
-        configured = [runtime.get("model")]
-        fallback = runtime.get("fallback_model") or []
-        if isinstance(fallback, dict):
-            fallback = [fallback]
-        configured.extend(item.get("model") if isinstance(item, dict) else item for item in fallback)
-
-        for model in configured:
-            normalized = str(model or "").strip().lower().rsplit("/", 1)[-1]
-            if any(normalized == denied or normalized.startswith(denied + "-") for denied in blocked):
-                raise ChildAgentError(f"workflow child model is blocked by policy: {model}")
-
-    def _build_agent(
-        self,
-        request: ChildAgentRequest,
-        runtime: dict[str, Any],
-        toolsets: list[str],
-        lease: WorkspaceLease,
-        agent_type: AgentTypeSpec | None,
-    ):
-        if request.reasoning_effort is None:
-            raise ChildAgentError(
-                "workflow child request is missing a validated resolved reasoning effort"
-            )
-        try:
-            from run_agent import AIAgent
-        except Exception as exc:
-            raise ChildAgentError(f"could not import Hermes AIAgent: {exc}") from exc
-
-        child_prompt = build_child_system_prompt(
-            agent_type,
-            structured_output=request.structured_tool,
-        )
-        try:
-            session_db = _create_session_db()
-        except Exception:
-            session_db = None
-
-        kwargs = {
-            "api_key": runtime.get("api_key"),
-            "base_url": runtime.get("base_url"),
-            "provider": runtime.get("provider"),
-            "api_mode": runtime.get("api_mode"),
-            "acp_command": runtime.get("acp_command"),
-            "acp_args": runtime.get("acp_args"),
-            "model": runtime.get("model"),
-            "credential_pool": runtime.get("credential_pool"),
-            "fallback_model": runtime.get("fallback_model"),
-            "max_tokens": runtime.get("max_tokens"),
-            "enabled_toolsets": toolsets,
-            "disabled_toolsets": list(self.config.blocked_child_toolsets),
-            "quiet_mode": True,
-            "platform": "cli",
-            "tool_progress_callback": self._make_tool_progress_callback(request, lease),
-            "thinking_callback": _child_thinking_callback,
-            "skip_context_files": True,
-            "skip_memory": True,
-            "clarify_callback": _child_clarify_callback,
-            "ephemeral_system_prompt": child_prompt,
-            "session_db": session_db,
-            "session_id": lease.task_id,
-        }
-        request_overrides = _without_reasoning_overrides(
-            request.request_overrides or runtime.get("request_overrides")
-        )
-        if request_overrides and _callable_accepts_keyword(AIAgent, "request_overrides"):
-            kwargs["request_overrides"] = request_overrides
-        kwargs["reasoning_config"] = {
-            "enabled": True,
-            "effort": request.reasoning_effort,
-        }
-        if runtime.get("service_tier") is not None:
-            kwargs["service_tier"] = runtime["service_tier"]
-        if request.max_turns is not None:
-            kwargs["max_iterations"] = request.max_turns
-        if request.max_tool_calls is not None and request.max_tool_output_chars is not None:
-            try:
-                ToolBudget = importlib.import_module("agent.tool_budget").ToolBudget
-            except Exception as exc:
-                raise ChildAgentError(
-                    "Hermes core does not support workflow child tool budgets"
-                ) from exc
-            kwargs["tool_budget"] = ToolBudget(
-                max_calls=request.max_tool_calls,
-                max_output_chars=request.max_tool_output_chars,
-            )
-        child = AIAgent(**kwargs)
-        if request.max_turns is not None:
-            # A capped child cannot spend an unreported provider call after its final turn.
-            child._handle_max_iterations = _capped_child_exhaustion_response
-        # Freeze this child's tool surface against the between-turns MCP refresh.
-        #
-        # run() assembles a deliberate surface AFTER construction via
-        # _configure_child_tools (agentType allow/deny filter + forced Tool
-        # Search) and, for schema agents, injects the synthetic structured_output
-        # tool onto child.tools / child.valid_tool_names. The core's per-turn
-        # prologue (agent/turn_context.py) otherwise calls
-        # refresh_agent_mcp_tools() on every turn when ANY MCP server is
-        # registered, doing a naive `agent.tools = get_tool_definitions(...)`
-        # rebuild that re-appends only the memory + context-engine families.
-        # That rebuild does NOT reproduce our post-build mutations, so on the
-        # child's very FIRST turn it would silently wipe structured_output (and
-        # re-leak skill_manage / drop Tool Search) — the exact cause of
-        # "structured_output does not exist" / "Failed to provide valid
-        # structured output after 5 attempts" in schema workflows.
-        #
-        # Safe to skip for these children: _prepare_mcp_tool_registry() runs
-        # before _configure_child_tools in run(), so the build-time surface
-        # already contains every registered MCP tool (reachable via Tool
-        # Search). The refresh only adds servers that connect AFTER build — not
-        # worth clobbering the whole assembled surface for in a short-lived,
-        # single-task child. turn_context.py honors this flag at its guard.
-        child._skip_mcp_refresh = True
-        return child
-
-    def _make_tool_progress_callback(self, request: ChildAgentRequest, lease: WorkspaceLease):
+    def _make_tool_progress_callback(self, request, lease):
         label = (request.label or "").strip() or lease.task_id
         print_lock = self._progress_print_lock
 
-        def _callback(event: str, tool_name: str, _preview: Any = None, args: Any = None, **_: Any) -> None:
-            if event != "tool.started":
-                return
-            if not _stdout_is_tty():
+        def _callback(event, tool_name=None, _preview=None, args=None, **_kwargs):
+            if event != "tool.started" or not _stdout_is_tty():
                 return
             line = _compact_tool_progress_line(
                 label,
@@ -458,86 +328,52 @@ class HermesChildAgentRunner(ChildAgentRunner):
 
         return _callback
 
-    def _run_child_with_timeout(
+    def _make_core_progress_callback(self, request, lease):
+        printer = self._make_tool_progress_callback(request, lease)
+
+        def _callback(event, tool_name=None, preview=None, args=None, **kwargs):
+            printer(event, tool_name, preview, args, **kwargs)
+            _emit_progress = {
+                "type": "tool_call" if event == "tool.started" else str(event),
+                "tool_name": tool_name,
+                "preview": preview,
+                "args": args,
+                **kwargs,
+            }
+            _emit_request_update(request, _emit_progress)
+
+        return _callback
+
+    def _run_child(
         self,
-        child: Any,
-        request: ChildAgentRequest,
-        lease: WorkspaceLease,
-        agent_type: AgentTypeSpec | None,
-        toolsets: list[str],
+        child_execution,
+        child,
+        request,
+        lease,
+        agent_type,
+        toolsets,
+        *,
+        structured_tool,
     ) -> ChildAgentResult:
         timeout = self.config.child_timeout_seconds
         live_lock = threading.RLock()
-        live_tool_calls = 0
-        latest = {
-            "result": {},
-            "tool_calls": 0,
-            "tool_output_chars": 0,
-            "stop_reason": None,
-        }
-
-        def _emit_terminal_metadata() -> None:
-            with live_lock:
-                metadata = _child_metadata(
-                    child,
-                    latest["result"],
-                    lease,
-                    agent_type,
-                    toolsets,
-                )
-                metadata["tool_calls"] = max(
-                    int(metadata.get("tool_calls") or 0),
-                    int(latest["tool_calls"] or 0),
-                    live_tool_calls,
-                )
-                metadata["tool_output_chars"] = max(
-                    int(metadata.get("tool_output_chars") or 0),
-                    int(latest["tool_output_chars"] or 0),
-                )
-                if latest["stop_reason"]:
-                    metadata["stop_reason"] = latest["stop_reason"]
-            _emit_request_update(request, metadata)
-
-        def _emit_progress(event: dict[str, Any]) -> None:
-            nonlocal live_tool_calls
-            with live_lock:
-                if event.get("type") == "tool_call":
-                    live_tool_calls += 1
-                metadata = _child_metadata(child, {}, lease, agent_type, toolsets)
-                metadata["tool_calls"] = max(
-                    int(metadata.get("tool_calls") or 0),
-                    live_tool_calls,
-                )
-                if event.get("activity"):
-                    metadata["activity"] = str(event["activity"])
-                if event.get("type") == "approval":
-                    metadata["approval"] = dict(event)
-            _emit_request_update(request, metadata)
-
-        def _record_core_budget_stop_reason(core_budget: Any) -> None:
-            if not isinstance(core_budget, dict) or not core_budget.get("exhausted"):
-                return
-            latest["stop_reason"] = (
-                "maxToolOutputChars"
-                if core_budget.get("exhaustion_reason") == "max_output_chars"
-                else "maxToolCalls"
-            )
-
-        interactive_callback = self._approval_coordinator.callback_for(
-            lease.task_id,
-            _emit_progress,
-        )
+        latest: dict[str, Any] = {}
+        tool_calls_used = 0
+        tool_output_chars_used = 0
+        history = None
+        message = build_child_task_message(request, workspace=lease.cwd)
+        remaining_turns = request.max_turns
+        stop_attempts = 0
         approval_callback = _make_child_approval_callback(
             self.config.child_approval_policy,
             getattr(self.config, "ask_fallback", "smart"),
-            interactive_callback=interactive_callback,
+            interactive_callback=self._approval_coordinator.callback_for(
+                lease.task_id,
+                lambda event: _emit_request_update(request, event),
+            ),
         )
 
-        def _init_worker() -> None:
-            # Install the approval callback on the worker thread itself, so the
-            # child's terminal tool has it when a flagged command would prompt.
-            # Mirrors tools/delegate_tool.py's ThreadPoolExecutor(initializer=...)
-            # pattern (see GHSA-qg5c-hvr5-hjgr).
+        def initializer() -> None:
             if approval_callback is not None:
                 try:
                     from tools.terminal_tool import set_approval_callback
@@ -545,9 +381,6 @@ class HermesChildAgentRunner(ChildAgentRunner):
                     set_approval_callback(approval_callback)
                 except Exception:
                     pass
-            # Re-apply the launching gateway session context (contextvars don't
-            # cross into detached threads) so check_all_command_guards can route
-            # a flagged command to the originating user for mid-run approval.
             if self._session_context:
                 try:
                     from ..host import gateway as host_gateway
@@ -555,243 +388,121 @@ class HermesChildAgentRunner(ChildAgentRunner):
                     host_gateway.set_session_vars(**self._session_context)
                 except Exception:
                     pass
-
-        def _run() -> dict[str, Any]:
-            approval_token = None
-            reset_current_session_key = None
             if self._approval_session_key:
                 try:
-                    from tools.approval import (
-                        reset_current_session_key as _reset_current_session_key,
-                        set_current_session_key,
-                    )
+                    from tools.approval import set_current_session_key
 
-                    approval_token = set_current_session_key(self._approval_session_key)
-                    reset_current_session_key = _reset_current_session_key
+                    set_current_session_key(self._approval_session_key)
                 except Exception:
                     pass
-            try:
-                _register_task_cwd(lease.task_id, lease.cwd, agent_type)
-                message = build_child_task_message(request, workspace=lease.cwd)
-                history = None
-                stop_attempts = 0
-                remaining_turns = request.max_turns
-                tool_calls_used = 0
-                tool_output_chars_used = 0
-                tool_call_limit = request.max_tool_calls
-                tool_output_limit = request.max_tool_output_chars
-                if tool_call_limit is None or tool_output_limit is None:
-                    raise ChildAgentError("workflow child request is missing child budgets")
-                while True:
-                    if remaining_turns is not None:
-                        child.max_iterations = remaining_turns
-                    input_history = history
-                    result = child.run_conversation(
-                        user_message=message,
-                        conversation_history=history,
-                        task_id=lease.task_id,
-                    )
-                    latest["result"] = result if isinstance(result, dict) else {}
-                    core_budget = result.get("tool_budget") if isinstance(result, dict) else None
-                    if isinstance(core_budget, dict):
-                        tool_calls_used = _nonnegative_int(core_budget.get("calls_used"))
-                        tool_output_chars_used = _nonnegative_int(
-                            core_budget.get("output_chars_used")
-                        )
-                    else:
-                        incremental_result = _incremental_result(result, input_history)
-                        tool_calls_used += _tool_call_count(incremental_result)
-                        tool_output_chars_used += _tool_output_chars(incremental_result)
-                    usage = {
-                        "tool_calls": tool_calls_used,
-                        "tool_output_chars": tool_output_chars_used,
-                    }
-                    latest["tool_calls"] = tool_calls_used
-                    latest["tool_output_chars"] = tool_output_chars_used
-                    _emit_request_update(request, usage)
-                    if tool_calls_used > tool_call_limit:
-                        latest["stop_reason"] = "maxToolCalls"
-                        _emit_request_update(
-                            request,
-                            {
-                                **usage,
-                                "stop_reason": "maxToolCalls",
-                            },
-                        )
-                        raise ChildAgentError(
-                            f"child exhausted maxToolCalls={tool_call_limit}"
-                        )
-                    if tool_output_chars_used > tool_output_limit:
-                        latest["stop_reason"] = "maxToolOutputChars"
-                        _emit_request_update(
-                            request,
-                            {
-                                **usage,
-                                "stop_reason": "maxToolOutputChars",
-                            },
-                        )
-                        raise ChildAgentError(
-                            f"child exhausted maxToolOutputChars={tool_output_limit}"
-                        )
-                    if isinstance(result, dict):
-                        result["_workflow_tool_calls"] = tool_calls_used
-                        result["_workflow_tool_output_chars"] = tool_output_chars_used
-                    capped_exhaustion = (
-                        request.max_turns is not None and _capped_child_exhausted(result)
-                    )
-                    if not request.structured_tool:
-                        _record_core_budget_stop_reason(core_budget)
-                        _raise_for_core_tool_budget_exhaustion(
-                            core_budget,
-                            tool_call_limit,
-                            tool_output_limit,
-                        )
-                        if capped_exhaustion:
-                            latest["stop_reason"] = "maxTurns"
-                            raise ChildAgentError(
-                                f"child exhausted maxTurns={request.max_turns} before completing"
-                            )
-                        return result
 
-                    if remaining_turns is not None:
-                        api_calls = result.get("api_calls") if isinstance(result, dict) else None
-                        if type(api_calls) is not int or api_calls < 0:
-                            raise ChildAgentError(
-                                "capped structured child must report non-negative integer api_calls"
-                            )
-                        remaining_turns -= api_calls
+        def stream_callback(text: str) -> None:
+            if text:
+                _emit_request_update(request, {"stream": text})
 
-                    captured, _value, tool_attempts = peek_result(lease.task_id)
-                    if captured:
-                        return result
-                    _record_core_budget_stop_reason(core_budget)
-                    _raise_for_core_tool_budget_exhaustion(
-                        core_budget,
-                        tool_call_limit,
-                        tool_output_limit,
-                    )
-                    if capped_exhaustion or (
-                        remaining_turns is not None and remaining_turns <= 0
-                    ):
-                        latest["stop_reason"] = "maxTurns"
-                        raise ChildAgentError(
-                            f"child exhausted maxTurns={request.max_turns} before providing "
-                            "valid structured output"
-                        )
-
-                    # The schema tool is a runner-owned side channel: runner.run()
-                    # registers an expectation in this process before the child
-                    # starts, and structured_output_handler captures into that
-                    # broker. If the tool says no expectation exists, another
-                    # runtime boundary (or timeout cleanup racing a still-running
-                    # child) invoked the tool outside the registered broker. That
-                    # is non-retryable. Re-prompting just burns model turns with
-                    # the same broken side channel.
-                    if _structured_output_missing_expectation(result):
-                        raise ChildAgentError(
-                            "structured_output tool was invoked without the "
-                            f"registered expectation for workflow child {lease.task_id}; "
-                            "aborting instead of retrying"
-                        )
-                    if getattr(child, "_interrupt_requested", False):
-                        raise ChildAgentError(
-                            "child was interrupted before providing structured output"
-                        )
-
-                    if tool_calls_used >= tool_call_limit:
-                        latest["stop_reason"] = "maxToolCalls"
-                        _emit_request_update(
-                            request,
-                            {
-                                **usage,
-                                "stop_reason": "maxToolCalls",
-                            },
-                        )
-                        raise ChildAgentError(
-                            f"child exhausted maxToolCalls={tool_call_limit}"
-                        )
-                    if tool_output_chars_used >= tool_output_limit:
-                        latest["stop_reason"] = "maxToolOutputChars"
-                        _emit_request_update(
-                            request,
-                            {
-                                **usage,
-                                "stop_reason": "maxToolOutputChars",
-                            },
-                        )
-                        raise ChildAgentError(
-                            f"child exhausted maxToolOutputChars={tool_output_limit}"
-                        )
-                    stop_attempts += 1
-                    if (
-                        tool_attempts >= MAX_STRUCTURED_OUTPUT_RETRIES
-                        or stop_attempts >= MAX_STRUCTURED_OUTPUT_RETRIES
-                    ):
-                        raise ChildAgentError(
-                            "Failed to provide valid structured output after "
-                            f"{MAX_STRUCTURED_OUTPUT_RETRIES} attempts"
-                        )
-
-                    previous_messages = result.get("messages") if isinstance(result, dict) else None
-                    if isinstance(previous_messages, list):
-                        history = previous_messages
-                    message = STRUCTURED_OUTPUT_CONTINUE_MESSAGE
-            finally:
-                if approval_token is not None and reset_current_session_key is not None:
-                    try:
-                        reset_current_session_key(approval_token)
-                    except Exception:
-                        pass
-
-        executor = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="dw-child-agent",
-            initializer=_init_worker,
-        )
         try:
             from ..adapters.hooks import register_child_observer
 
-            register_child_observer(lease.task_id, _emit_progress)
+            register_child_observer(
+                lease.task_id,
+                lambda event: _emit_request_update(request, event),
+            )
         except Exception:
             pass
-        with self._active_lock:
-            self._active_children[lease.task_id] = child
-        future = executor.submit(_run)
-        result: dict[str, Any] | None = None
-        try:
-            result = future.result(timeout=timeout) or {}
+
+        while True:
+            if remaining_turns is not None:
+                child.max_iterations = remaining_turns
+            input_history = history
+            raw = child_execution.run_child(
+                child,
+                message,
+                task_id=lease.task_id,
+                timeout=timeout,
+                stream_callback=stream_callback,
+                conversation_history=input_history,
+                initializer=initializer,
+                initargs=(),
+            )
+            result = raw if isinstance(raw, dict) else {"final_response": raw}
+            latest = result
+            if result.get("status") == "timeout" or result.get("exit_reason") == "timeout":
+                metadata = _child_metadata(child, result, lease, agent_type, toolsets)
+                _emit_request_update(request, metadata)
+                raise WorkflowTimeout(f"child agent timed out after {timeout:.0f}s")
             content = str(result.get("final_response") or "")
-            # A hard child failure (e.g. a non-retryable API error) returns an
-            # "error" string and no usable final_response. Surface it as a real
-            # failure instead of a silent empty "success", so the agent shows as
-            # error in /workflows rather than masking the failure.
             failure = _child_failure_message(result, content)
             if failure:
+                _emit_request_update(
+                    request,
+                    _child_metadata(child, result, lease, agent_type, toolsets),
+                )
                 raise ChildAgentError(failure)
-            metadata = _child_metadata(child, result, lease, agent_type, toolsets)
-            return ChildAgentResult(content=content, metadata=metadata)
-        except ChildAgentError:
-            _emit_terminal_metadata()
-            raise
-        except FuturesTimeoutError as exc:
-            try:
-                if hasattr(child, "interrupt"):
-                    child.interrupt()
-            finally:
-                _emit_terminal_metadata()
-                raise WorkflowTimeout(f"child agent timed out after {timeout:.0f}s") from exc
-        finally:
-            try:
-                from ..adapters.hooks import unregister_child_observer
 
-                unregister_child_observer(lease.task_id)
-            except Exception:
-                pass
-            with self._active_lock:
-                self._active_children.pop(lease.task_id, None)
-            _cleanup_task_cwd(lease.task_id)
-            lease.cleanup()
-            executor.shutdown(wait=False, cancel_futures=True)
+            delta = result
+            messages = result.get("messages")
+            if (
+                isinstance(messages, list)
+                and isinstance(input_history, list)
+                and messages[: len(input_history)] == input_history
+            ):
+                delta = {**result, "messages": messages[len(input_history) :]}
+            tool_calls_used += _tool_call_count(delta)
+            tool_output_chars_used += _tool_output_chars(delta)
+            usage = {
+                "tool_calls": tool_calls_used,
+                "tool_output_chars": tool_output_chars_used,
+            }
+            with live_lock:
+                metadata = _child_metadata(child, result, lease, agent_type, toolsets)
+                metadata.update(usage)
+            _emit_request_update(request, metadata)
+
+            capped_exhaustion = request.max_turns is not None and _capped_child_exhausted(result)
+            if not structured_tool:
+                if capped_exhaustion:
+                    raise ChildAgentError(
+                        f"child exhausted maxTurns={request.max_turns} before completing"
+                    )
+                return ChildAgentResult(content=content, metadata=metadata)
+
+            if remaining_turns is not None:
+                api_calls = result.get("api_calls")
+                if type(api_calls) is not int or api_calls < 0:
+                    raise ChildAgentError(
+                        "capped structured child must report non-negative integer api_calls"
+                    )
+                remaining_turns -= api_calls
+            captured, _value, tool_attempts = peek_result(lease.task_id)
+            if captured:
+                return ChildAgentResult(content=content, metadata=metadata)
+            if capped_exhaustion or (remaining_turns is not None and remaining_turns <= 0):
+                raise ChildAgentError(
+                    f"child exhausted maxTurns={request.max_turns} before providing "
+                    "valid structured output"
+                )
+            if _structured_output_missing_expectation(result):
+                raise ChildAgentError(
+                    "structured_output tool was invoked without the registered "
+                    f"expectation for workflow child {lease.task_id}; aborting instead of retrying"
+                )
+            if getattr(child, "_interrupt_requested", False):
+                raise ChildAgentError(
+                    "child was interrupted before providing structured output"
+                )
+            stop_attempts += 1
+            if (
+                tool_attempts >= MAX_STRUCTURED_OUTPUT_RETRIES
+                or stop_attempts >= MAX_STRUCTURED_OUTPUT_RETRIES
+            ):
+                raise ChildAgentError(
+                    "Failed to provide valid structured output after "
+                    f"{MAX_STRUCTURED_OUTPUT_RETRIES} attempts"
+                )
+            previous_messages = result.get("messages")
+            if isinstance(previous_messages, list):
+                history = previous_messages
+            message = STRUCTURED_OUTPUT_CONTINUE_MESSAGE
 
     def interrupt_all(self) -> None:
         with self._active_lock:
@@ -833,6 +544,43 @@ class HermesChildAgentRunner(ChildAgentRunner):
     def _clear_skipped(self, task_id: str) -> None:
         with self._active_lock:
             self._skipped_children.discard(task_id)
+
+
+def _parent_agent_proxy(runtime: dict[str, Any] | None) -> Any:
+    values = dict(runtime or {})
+    defaults = {
+        "model": None,
+        "provider": None,
+        "base_url": None,
+        "api_key": None,
+        "api_mode": None,
+        "request_overrides": {},
+        "reasoning_config": None,
+        "service_tier": None,
+        "max_tokens": None,
+        "session_id": None,
+        "_session_db": None,
+        "_fallback_chain": values.get("fallback_model"),
+        "providers_allowed": None,
+        "providers_ignored": None,
+        "providers_order": None,
+        "provider_sort": None,
+        "provider_require_parameters": False,
+        "provider_data_collection": None,
+        "openrouter_min_coding_score": None,
+        "credential_pool": None,
+        "max_iterations": 90,
+        "prefill_messages": None,
+        "acp_command": None,
+        "acp_args": [],
+    }
+    for key, default in defaults.items():
+        values.setdefault(key, default)
+    values.setdefault(
+        "_client_kwargs",
+        {"api_key": values.get("api_key"), "base_url": values.get("base_url")},
+    )
+    return SimpleNamespace(**values)
 
 
 def build_child_system_prompt(
@@ -1492,16 +1240,8 @@ def _child_metadata(
         # how much each child reused vs wrote to the cache.
         "cache_read_tokens": _int_attr(child, "session_cache_read_tokens"),
         "cache_write_tokens": _int_attr(child, "session_cache_write_tokens"),
-        "tool_calls": (
-            _nonnegative_int(result.get("_workflow_tool_calls"))
-            if isinstance(result, dict) and "_workflow_tool_calls" in result
-            else _tool_call_count(result)
-        ),
-        "tool_output_chars": (
-            _nonnegative_int(result.get("_workflow_tool_output_chars"))
-            if isinstance(result, dict) and "_workflow_tool_output_chars" in result
-            else _tool_output_chars(result)
-        ),
+        "tool_calls": _tool_call_count(result),
+        "tool_output_chars": _tool_output_chars(result),
     }
     return metadata
 
@@ -1526,42 +1266,6 @@ def _reasoning_effort_of(child: Any) -> str | None:
     effort = cfg.get("effort")
     return str(effort).strip() or None if effort else None
 
-
-def _nonnegative_int(value: Any) -> int:
-    try:
-        return max(0, int(value))
-    except (TypeError, ValueError):
-        return 0
-
-
-def _raise_for_core_tool_budget_exhaustion(
-    core_budget: Any,
-    tool_call_limit: int,
-    tool_output_limit: int,
-) -> None:
-    if not isinstance(core_budget, dict) or not core_budget.get("exhausted"):
-        return
-    reason = core_budget.get("exhaustion_reason")
-    if reason == "max_output_chars":
-        raise ChildAgentError(
-            f"child exhausted maxToolOutputChars={tool_output_limit}"
-        )
-    raise ChildAgentError(f"child exhausted maxToolCalls={tool_call_limit}")
-
-
-def _incremental_result(
-    result: dict[str, Any],
-    input_history: list[dict[str, Any]] | None,
-) -> dict[str, Any]:
-    messages = result.get("messages") if isinstance(result, dict) else None
-    if (
-        not isinstance(messages, list)
-        or not isinstance(input_history, list)
-        or len(messages) < len(input_history)
-        or messages[: len(input_history)] != input_history
-    ):
-        return result
-    return {**result, "messages": messages[len(input_history) :]}
 
 
 def _tool_output_chars(result: dict[str, Any]) -> int:
@@ -1646,28 +1350,6 @@ def _structured_output_missing_expectation(result: dict[str, Any] | Any) -> bool
     return False
 
 
-def _runtime_without_reasoning_effort(runtime: dict[str, Any]) -> str | None:
-    candidates = [runtime]
-    fallback = runtime.get("fallback_model") or []
-    if isinstance(fallback, dict):
-        fallback = [fallback]
-    candidates.extend(item for item in fallback if isinstance(item, dict))
-
-    for candidate in candidates:
-        api_mode = str(candidate.get("api_mode") or "").strip().lower()
-        provider = str(candidate.get("provider") or "").strip().lower()
-        if api_mode == "codex_app_server":
-            return "codex_app_server"
-        if api_mode == "bedrock_converse" or provider in {
-            "amazon",
-            "amazon-bedrock",
-            "aws",
-            "aws-bedrock",
-            "bedrock",
-        }:
-            return "bedrock"
-    return None
-
 
 def _without_reasoning_overrides(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
@@ -1684,16 +1366,3 @@ def _without_reasoning_overrides(value: Any) -> dict[str, Any]:
         else:
             cleaned[key] = item
     return cleaned
-
-
-def _callable_accepts_keyword(target: Any, keyword: str) -> bool:
-    try:
-        signature = inspect.signature(target)
-    except (TypeError, ValueError):
-        return False
-    for parameter in signature.parameters.values():
-        if parameter.kind == inspect.Parameter.VAR_KEYWORD:
-            return True
-        if parameter.name == keyword:
-            return True
-    return False
