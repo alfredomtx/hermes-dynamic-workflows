@@ -31,6 +31,7 @@ from hermes_dynamic_workflows.run.manager import (
     _progress_signal,
     _render_gateway_launch_message,
     _seed_progress_bubble,
+    _harvest_journal_cache,
 )
 from hermes_dynamic_workflows.view.render import render_agent_overview
 from hermes_dynamic_workflows.core.types import ChildAgentRequest, ChildAgentResult, ChildAgentRunner
@@ -2399,12 +2400,17 @@ return await agent("do it", {
                 if line.strip()
             ]
 
-        self.assertEqual([event["type"] for event in events], ["started", "result"])
-        self.assertTrue(events[0]["key"].startswith("v2:"))
-        self.assertEqual(events[0]["agentId"], "1")
-        self.assertEqual(events[1]["agentId"], "1")
+        workflow_events = [
+            event for event in events if event["type"] != "agent_lifecycle"
+        ]
         self.assertEqual(
-            events[1]["result"],
+            [event["type"] for event in workflow_events], ["started", "result"]
+        )
+        self.assertTrue(workflow_events[0]["key"].startswith("v2:"))
+        self.assertEqual(workflow_events[0]["agentId"], "1")
+        self.assertEqual(workflow_events[1]["agentId"], "1")
+        self.assertEqual(
+            workflow_events[1]["result"],
             {
                 "items": [
                     {
@@ -3931,6 +3937,124 @@ class WorkflowGatewayWakeEventTests(unittest.TestCase):
             _enqueue_gateway_wake_event(managed, managed.record, "n", None)
             count = pr.completion_queue.qsize()
         self.assertEqual(count, 0)
+
+    def test_run_record_persists_handles_without_credentials(self):
+        script = """
+meta = {"name": "durable-handles", "description": "handles"}
+
+handle = await start_agent("persist me", {
+    "provider": "openai-codex",
+    "model": "gpt-5.6-luna",
+    "reasoningEffort": "medium",
+    "maxTurns": 10,
+})
+return await wait_agent(handle)
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = WorkflowStore(Path(tmp) / "store")
+            manager = WorkflowRunManager(
+                store=store,
+                config=PluginConfig(require_launch_approval=False),
+            )
+            parent = SimpleNamespace(
+                model="parent-model",
+                provider="parent-provider",
+                api_key="do-not-persist",
+                _credential_pool=object(),
+            )
+            with patch(
+                "hermes_dynamic_workflows.child.runner.HermesChildAgentRunner",
+                return_value=CountingRunner(),
+            ):
+                record = manager.start_from_params(
+                    {"script": script},
+                    cwd=tmp,
+                    parent_agent=parent,
+                )
+                final = manager.wait(record["runId"], timeout=2)
+            persisted = store.load_run(record["runId"])
+
+        self.assertIsNotNone(final)
+        self.assertIsNotNone(persisted)
+        handles = persisted["agentHandles"]
+        self.assertEqual(len(handles), 1)
+        self.assertEqual(next(iter(handles.values()))["status"], "completed")
+        encoded = json.dumps(persisted, default=str)
+        self.assertNotIn("do-not-persist", encoded)
+        self.assertNotIn("credential_pool", encoded)
+        self.assertNotIn("parent_runtime", encoded)
+
+    def test_lifecycle_journal_does_not_pollute_resume_cache(self):
+        script = """
+meta = {"name": "lifecycle-journal", "description": "handles"}
+
+handle = await start_agent("journal me", {
+    "provider": "openai-codex",
+    "model": "gpt-5.6-luna",
+    "reasoningEffort": "medium",
+    "maxTurns": 10,
+})
+return await wait_agent(handle)
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = WorkflowStore(root / "store")
+            manager = WorkflowRunManager(
+                store=store,
+                config=PluginConfig(require_launch_approval=False),
+            )
+            with patch(
+                "hermes_dynamic_workflows.child.runner.HermesChildAgentRunner",
+                return_value=CountingRunner(),
+            ):
+                record = manager.start_from_params({"script": script}, cwd=tmp)
+                final = manager.wait(record["runId"], timeout=2)
+            events = [
+                json.loads(line)
+                for line in Path(final["journalFile"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            harvested = _harvest_journal_cache(final)
+
+        lifecycle = [event for event in events if event["type"] == "agent_lifecycle"]
+        self.assertGreaterEqual(len(lifecycle), 3)
+        self.assertTrue(all(not str(event.get("key") or "").startswith("v2:") for event in lifecycle))
+        self.assertTrue(harvested)
+        self.assertTrue(all(not key.startswith("agent") for key in harvested))
+
+    def test_resume_rejects_handle_origin_session_mismatch(self):
+        script = """
+meta = {"name": "resume-lineage", "description": "handles"}
+handle = await start_agent("persist", {
+    "provider": "openai-codex",
+    "model": "gpt-5.6-luna",
+    "reasoningEffort": "medium",
+    "maxTurns": 10,
+})
+return await wait_agent(handle)
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = WorkflowStore(Path(tmp) / "store")
+            manager = WorkflowRunManager(
+                store=store,
+                config=PluginConfig(require_launch_approval=False),
+            )
+            with patch(
+                "hermes_dynamic_workflows.child.runner.HermesChildAgentRunner",
+                return_value=CountingRunner(),
+            ):
+                first = manager.start_from_params(
+                    {"script": script},
+                    cwd=tmp,
+                    host_session_id="origin-session",
+                )
+                manager.wait(first["runId"], timeout=2)
+                with self.assertRaisesRegex(WorkflowRuntimeError, "origin.*session"):
+                    manager.start_from_params(
+                        {"script": script, "resumeFromRunId": first["runId"]},
+                        cwd=tmp,
+                        host_session_id="different-session",
+                    )
 
 
 if __name__ == "__main__":

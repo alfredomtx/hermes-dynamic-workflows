@@ -71,6 +71,140 @@ def _tool_name(definition: dict) -> str:
     return str((definition.get("function") or {}).get("name") or "")
 
 
+class SharedChildExecutionSeamTests(unittest.TestCase):
+    def _request(self, **overrides):
+        resolved = ResolvedAgentSpec(
+            requested_agent_type=None,
+            provider="openrouter",
+            model="test-model",
+            max_turns=2,
+            reasoning_effort="high",
+        )
+        values = {
+            "id": 1,
+            "prompt": "continue the work",
+            "label": "child",
+            "phase": None,
+            "toolsets": [],
+            "provider": "openrouter",
+            "model": "test-model",
+            "resolved": resolved,
+            "max_turns": 2,
+            "reasoning_effort": "high",
+        }
+        values.update(overrides)
+        return ChildAgentRequest(**values)
+
+    def _run_with_shared_seam(self, request, *, session_db=None):
+        child = types.SimpleNamespace(
+            tools=[],
+            valid_tool_names=set(),
+            model="test-model",
+            provider="openrouter",
+            base_url="https://openrouter.example.test/v1",
+            reasoning_config={"enabled": True, "effort": "high"},
+            session_input_tokens=0,
+            session_output_tokens=0,
+            session_prompt_tokens=0,
+            session_completion_tokens=0,
+            session_reasoning_tokens=0,
+            session_cache_read_tokens=0,
+            session_cache_write_tokens=0,
+            run_conversation=lambda **_kwargs: {
+                "final_response": "done",
+                "messages": [],
+            },
+        )
+        runtime = {
+            "provider": "openrouter",
+            "model": "test-model",
+            "base_url": "https://openrouter.example.test/v1",
+            "api_key": "test-key",
+            "api_mode": "chat_completions",
+            "credential_pool": None,
+            "fallback_model": None,
+            "max_tokens": 128,
+            "request_overrides": {},
+            "service_tier": None,
+            "acp_command": None,
+            "acp_args": [],
+        }
+        setup = [
+            patch(
+                "hermes_dynamic_workflows.child.runner.create_workspace_lease",
+                return_value=WorkspaceLease(task_id="workflow-seam", cwd="/tmp/workflow"),
+            ),
+            patch("hermes_dynamic_workflows.child.runner._prepare_mcp_tool_registry"),
+            patch("hermes_dynamic_workflows.child.runner._configure_child_tools"),
+            patch("hermes_dynamic_workflows.child.runner._register_task_cwd"),
+            patch("hermes_dynamic_workflows.child.runner._cleanup_task_cwd"),
+            patch(
+                "hermes_dynamic_workflows.child.runner._create_session_db",
+                return_value=session_db,
+            ),
+            patch.object(
+                HermesChildAgentRunner,
+                "_resolve_runtime",
+                return_value=runtime,
+            ),
+        ]
+        for item in setup:
+            item.start()
+        create_child = patch("agent.child_execution.create_child", return_value=child)
+        run_child = patch(
+            "agent.child_execution.run_child",
+            return_value={"final_response": "done", "messages": []},
+        )
+        direct_agent = patch("run_agent.AIAgent", return_value=child)
+        create_child_mock = create_child.start()
+        run_child_mock = run_child.start()
+        direct_agent.start()
+        try:
+            result = HermesChildAgentRunner(PluginConfig()).run(request)
+        finally:
+            direct_agent.stop()
+            run_child.stop()
+            create_child.stop()
+            for item in reversed(setup):
+                item.stop()
+        return result, create_child_mock, run_child_mock
+
+    def test_initial_execution_uses_shared_create_and_run_child_seam(self):
+        result, create_child, run_child = self._run_with_shared_seam(self._request())
+
+        self.assertEqual(result.content, "done")
+        create_child.assert_called_once()
+        run_child.assert_called_once()
+
+    def test_continuation_forwards_explicit_session_and_exact_history(self):
+        history = [{"role": "assistant", "content": "prior result"}]
+        _result, create_child, run_child = self._run_with_shared_seam(
+            self._request(session_id="child-session", conversation_history=history)
+        )
+
+        self.assertEqual(create_child.call_args.args[1]["session_id"], "child-session")
+        self.assertIs(
+            run_child.call_args.kwargs["conversation_history"],
+            history,
+        )
+
+    def test_fork_forwards_new_session_and_parent_session_metadata(self):
+        _result, create_child, _run_child = self._run_with_shared_seam(
+            self._request(
+                session_id="fork-session",
+                parent_session_id="original-session",
+                parent_handle_id="original-handle",
+                lineage_id="workflow-lineage",
+            ),
+            session_db=object(),
+        )
+
+        spec = create_child.call_args.args[1]
+        context = create_child.call_args.kwargs["context"]
+        self.assertEqual(spec["session_id"], "fork-session")
+        self.assertEqual(context["parent_session_id"], "original-session")
+
+
 class ChildAgentTests(unittest.TestCase):
     def test_register_task_cwd_records_launch_agent_type(self):
         with patch("tools.terminal_tool.register_task_env_overrides") as register:

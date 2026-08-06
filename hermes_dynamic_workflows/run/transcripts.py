@@ -86,6 +86,27 @@ class SessionTranscriptReader:
             except Exception:
                 pass
 
+    def stable_messages(self, session_id: str) -> list[dict[str, Any]]:
+        """Return the persisted conversation for continuation/fork operations.
+
+        This is intentionally a public SessionDB read. A missing database or
+        unsupported reader is an explicit failure; durable handles must never
+        silently start a fresh conversation.
+        """
+        clean = str(session_id or "").strip()
+        if not clean:
+            raise ValueError("Hermes session id is required")
+        getter = getattr(self._db, "get_messages", None)
+        if not callable(getter):
+            raise RuntimeError("SessionDB stable-message reader is unavailable")
+        try:
+            messages = getter(clean, include_inactive=True)
+        except TypeError:
+            messages = getter(clean)
+        if not isinstance(messages, list):
+            raise RuntimeError("SessionDB returned an invalid stable transcript")
+        return [dict(message) for message in messages if isinstance(message, dict)]
+
     def read(self, target: LiveTranscriptTarget, *, force_rebuild: bool = False) -> TranscriptRead:
         if target.export_mode == "full_fallback" or self._incremental_reason:
             reason = target.fallback_reason or self._incremental_reason or "incremental mode disabled"

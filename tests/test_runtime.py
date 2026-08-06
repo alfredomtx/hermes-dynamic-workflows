@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import os
+import threading
 import unittest
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from hermes_dynamic_workflows.engine.cache import ResumeCache, agent_fingerprint, is_cache_miss
+from hermes_dynamic_workflows.engine.api import WorkflowAPI
+from hermes_dynamic_workflows.engine.context import PauseGate, WorkflowExecutionContext
 from hermes_dynamic_workflows.core.config import PluginConfig, load_config
 from hermes_dynamic_workflows.core.errors import (
     ChildAgentError,
@@ -16,7 +22,13 @@ from hermes_dynamic_workflows.core.errors import (
     WorkflowRuntimeError,
 )
 from hermes_dynamic_workflows.engine.runtime import WorkflowOptions, run_workflow
-from hermes_dynamic_workflows.core.types import ChildAgentRequest, ChildAgentResult, ChildAgentRunner
+from hermes_dynamic_workflows.core.types import (
+    AgentHandleRecord,
+    ChildAgentRequest,
+    ChildAgentResult,
+    ChildAgentRunner,
+    WorkflowFrame,
+)
 from hermes_dynamic_workflows.adapters.workflow import DYNAMIC_WORKFLOW_SCHEMA
 from hermes_dynamic_workflows.storage.store import WorkflowStore
 
@@ -156,6 +168,70 @@ class SkippingRunner(ChildAgentRunner):
         raise ChildAgentSkipped("skipped by user")
 
 
+class DurableHandleRunner(ChildAgentRunner):
+    def __init__(self, *, block=False):
+        self.block = block
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.requests: list[ChildAgentRequest] = []
+        self.calls = 0
+
+    def run(self, request: ChildAgentRequest):
+        self.requests.append(request)
+        self.calls += 1
+        self.started.set()
+        if self.block:
+            self.release.wait(timeout=5)
+        session_id = request.session_id or f"session-{self.calls}"
+        return ChildAgentResult(
+            content=f"result:{request.prompt}",
+            metadata={
+                "task_id": f"task-{self.calls}",
+                "session_id": session_id,
+                "hermes_session_id": session_id,
+                "workspace": request.cwd,
+            },
+        )
+
+
+class InterruptibleHandleRunner(DurableHandleRunner):
+    def __init__(self, *, acknowledge=False):
+        super().__init__(block=True)
+        self.acknowledge = acknowledge
+        self.interrupt_ids: list[str] = []
+
+    def skip_child(self, task_id: str) -> bool:
+        self.interrupt_ids.append(task_id)
+        if self.acknowledge:
+            self.release.set()
+        return self.acknowledge
+
+
+def _durable_api(
+    runner,
+    *,
+    cwd="/workspace",
+    events=None,
+    agent_handles=None,
+    handle_lineage_id=None,
+):
+    root = WorkflowFrame(id="root", meta={"name": "handles"}, args=None, cwd=cwd)
+    context = WorkflowExecutionContext(
+        config=PluginConfig(),
+        runner=runner,
+        codex_runner=SimpleNamespace(),
+        stop_event=threading.Event(),
+        pause_gate=PauseGate(),
+        resume_cache=ResumeCache(),
+        deadline=10**12,
+        root=root,
+        on_journal=(events.append if events is not None else None),
+        initial_agent_handles=agent_handles or {},
+        handle_lineage_id=handle_lineage_id or "lineage-test",
+    )
+    return WorkflowAPI(context=context, frame=root)
+
+
 class RuntimeTests(unittest.TestCase):
     def test_live_child_updates_refresh_snapshot_and_journal(self):
         events = []
@@ -173,8 +249,14 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(agent["tool_calls"], 2)
         self.assertEqual(agent["model"], "gpt-5.6-luna")
         self.assertEqual(agent["reasoning_effort"], "medium")
-        self.assertEqual([event["type"] for event in events], ["started", "activity", "result"])
-        self.assertIn("pwd", events[1]["activity"])
+        workflow_events = [
+            event for event in events if event["type"] != "agent_lifecycle"
+        ]
+        self.assertEqual(
+            [event["type"] for event in workflow_events],
+            ["started", "activity", "result"],
+        )
+        self.assertIn("pwd", workflow_events[1]["activity"])
 
     def test_runs_strict_async_script_body(self):
         script = """
@@ -1795,6 +1877,347 @@ return [mine, nested]
                     ),
                 )
         self.assertIn("agent count exceeded (2)", str(ctx.exception))
+
+
+class DurableAgentHandleTests(unittest.TestCase):
+    _opts = {
+        "provider": "openai-codex",
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "medium",
+        "maxTurns": 10,
+    }
+
+    def test_handle_snapshot_round_trip_uses_wall_clock_time(self):
+        record = AgentHandleRecord(handle="ah:h:1", lineage_id="h")
+        snapshot = record.snapshot()
+        restored = AgentHandleRecord.from_snapshot(snapshot)
+
+        self.assertIsNotNone(restored)
+        self.assertGreater(snapshot["created_at"], 1_000_000_000)
+        self.assertEqual(restored.snapshot(), snapshot)
+
+    def test_resume_rehydrates_terminal_handle_in_same_lineage(self):
+        record = AgentHandleRecord(
+            handle="ah:lineage-test:terminal",
+            lineage_id="lineage-test",
+            state="completed",
+            result="persisted",
+        )
+        api = _durable_api(
+            DurableHandleRunner(),
+            agent_handles={record.handle: record.snapshot()},
+            handle_lineage_id=record.lineage_id,
+        )
+
+        self.assertEqual(api.agent_status(record.handle)["status"], "completed")
+        self.assertEqual(asyncio.run(api.wait_agent(record.handle)), "persisted")
+
+    def test_resume_marks_active_handle_interrupted_without_replay(self):
+        record = AgentHandleRecord(
+            handle="ah:lineage-test:active",
+            lineage_id="lineage-test",
+            state="running",
+            session_id="session-active",
+        )
+        runner = DurableHandleRunner()
+        api = _durable_api(
+            runner,
+            agent_handles={record.handle: record.snapshot()},
+            handle_lineage_id=record.lineage_id,
+        )
+
+        snapshot = api.agent_status(record.handle)
+        self.assertEqual(snapshot["status"], "interrupted")
+        self.assertIn("process/restart interrupted the turn", snapshot["error"])
+        self.assertEqual(runner.calls, 0)
+
+    def test_wait_restored_interrupted_handle_fails_without_hanging(self):
+        record = AgentHandleRecord(
+            handle="ah:lineage-test:interrupted",
+            lineage_id="lineage-test",
+            state="interrupted",
+            error="process/restart interrupted the turn",
+        )
+        api = _durable_api(
+            DurableHandleRunner(),
+            agent_handles={record.handle: record.snapshot()},
+            handle_lineage_id=record.lineage_id,
+        )
+
+        with self.assertRaisesRegex(WorkflowRuntimeError, "interrupted"):
+            asyncio.run(api.wait_agent(record.handle))
+
+    def test_continue_restored_handle_uses_stable_session_history(self):
+        history = [{"role": "assistant", "content": "stable"}]
+        runner = DurableHandleRunner()
+        with tempfile.TemporaryDirectory() as workspace:
+            record = AgentHandleRecord(
+                handle="ah:lineage-test:continue",
+                lineage_id="lineage-test",
+                state="interrupted",
+                session_id="session-restored",
+                workspace=workspace,
+                workspace_ownership="workflow-owned",
+                route={**self._opts, "isolation": "worktree"},
+            )
+            api = _durable_api(
+                runner,
+                cwd=workspace,
+                agent_handles={record.handle: record.snapshot()},
+                handle_lineage_id=record.lineage_id,
+            )
+
+            async def scenario():
+                with patch(
+                    "hermes_dynamic_workflows.engine.api.SessionTranscriptReader.stable_messages",
+                    return_value=history,
+                ):
+                    handle = await api.continue_agent(record.handle, "continue")
+                    await api.wait_agent(handle)
+
+            asyncio.run(scenario())
+
+        self.assertEqual(runner.requests[0].session_id, "session-restored")
+        self.assertIs(runner.requests[0].conversation_history, history)
+        self.assertEqual(runner.requests[0].cwd, workspace)
+        self.assertIsNone(runner.requests[0].isolation)
+
+    def test_stop_running_handle_stays_stopping_until_worker_exits(self):
+        runner = InterruptibleHandleRunner(acknowledge=False)
+        api = _durable_api(runner)
+
+        async def scenario():
+            handle = await api.start_agent("work", self._opts)
+            self.assertTrue(await asyncio.to_thread(runner.started.wait, 1))
+            await api.stop_agent(handle)
+            self.assertEqual(api.agent_status(handle)["status"], "stopping")
+            self.assertFalse(api.context.handle_futures[handle].done())
+            runner.release.set()
+            with self.assertRaises(WorkflowRuntimeError):
+                await api.wait_agent(handle)
+            return handle
+
+        handle = asyncio.run(scenario())
+        self.assertEqual(runner.interrupt_ids, [handle])
+
+    def test_stop_acknowledged_handle_becomes_stopped(self):
+        runner = InterruptibleHandleRunner(acknowledge=True)
+        api = _durable_api(runner)
+
+        async def scenario():
+            handle = await api.start_agent("work", self._opts)
+            self.assertTrue(await asyncio.to_thread(runner.started.wait, 1))
+            await api.stop_agent(handle)
+            with self.assertRaisesRegex(WorkflowRuntimeError, "stopped"):
+                await api.wait_agent(handle)
+            return handle
+
+        handle = asyncio.run(scenario())
+        self.assertEqual(api.agent_status(handle)["status"], "stopped")
+        self.assertEqual(runner.interrupt_ids, [handle])
+
+    def test_stop_unacknowledged_handle_preserves_future_and_workspace(self):
+        runner = InterruptibleHandleRunner(acknowledge=False)
+        with tempfile.TemporaryDirectory() as workspace:
+            api = _durable_api(runner, cwd=workspace)
+
+            async def scenario():
+                handle = await api.start_agent("work", self._opts)
+                self.assertTrue(await asyncio.to_thread(runner.started.wait, 1))
+                future = api.context.handle_futures[handle]
+                await api.stop_agent(handle)
+                self.assertIs(api.context.handle_futures[handle], future)
+                self.assertEqual(api.agent_status(handle)["status"], "stopping")
+                self.assertEqual(api.agent_status(handle)["workspace"], workspace)
+                runner.release.set()
+                with self.assertRaises(WorkflowRuntimeError):
+                    await api.wait_agent(handle)
+
+            asyncio.run(scenario())
+
+    def test_runner_targeted_interrupt_uses_persisted_handle_task_id(self):
+        runner = InterruptibleHandleRunner(acknowledge=False)
+        api = _durable_api(runner)
+
+        async def scenario():
+            handle = await api.start_agent("work", self._opts)
+            self.assertTrue(await asyncio.to_thread(runner.started.wait, 1))
+            await api.stop_agent(handle)
+            runner.release.set()
+            with self.assertRaises(WorkflowRuntimeError):
+                await api.wait_agent(handle)
+            return handle
+
+        handle = asyncio.run(scenario())
+        self.assertEqual(runner.requests[0].handle_id, handle)
+        self.assertEqual(runner.interrupt_ids, [handle])
+
+    def test_continue_reuses_workflow_owned_workspace_without_new_worktree(self):
+        runner = DurableHandleRunner()
+        with tempfile.TemporaryDirectory() as workspace:
+            record = AgentHandleRecord(
+                handle="ah:lineage-test:owned",
+                lineage_id="lineage-test",
+                state="completed",
+                session_id="session-owned",
+                workspace=workspace,
+                workspace_ownership="workflow-owned",
+                route={**self._opts, "isolation": "worktree"},
+            )
+            api = _durable_api(
+                runner,
+                cwd=workspace,
+                agent_handles={record.handle: record.snapshot()},
+                handle_lineage_id=record.lineage_id,
+            )
+
+            async def scenario():
+                with patch(
+                    "hermes_dynamic_workflows.engine.api.SessionTranscriptReader.stable_messages",
+                    return_value=[],
+                ):
+                    handle = await api.continue_agent(record.handle, "next")
+                    await api.wait_agent(handle)
+
+            asyncio.run(scenario())
+
+        self.assertEqual(runner.requests[0].cwd, workspace)
+        self.assertIsNone(runner.requests[0].isolation)
+
+    def test_stop_never_cleans_borrowed_workspace(self):
+        runner = InterruptibleHandleRunner(acknowledge=True)
+        with tempfile.TemporaryDirectory() as workspace:
+            api = _durable_api(runner, cwd=workspace)
+
+            async def scenario():
+                handle = await api.start_agent("work", self._opts)
+                self.assertTrue(await asyncio.to_thread(runner.started.wait, 1))
+                await api.stop_agent(handle)
+                with self.assertRaises(WorkflowRuntimeError):
+                    await api.wait_agent(handle)
+
+            asyncio.run(scenario())
+            self.assertTrue(Path(workspace).is_dir())
+
+    def test_start_agent_returns_lineage_scoped_handle_before_completion(self):
+        runner = DurableHandleRunner(block=True)
+        api = _durable_api(runner)
+
+        async def scenario():
+            handle = await api.start_agent("work", self._opts)
+            snapshot = api.agent_status(handle)
+            self.assertIsInstance(handle, str)
+            self.assertEqual(snapshot["status"], "queued")
+            self.assertEqual(snapshot["lineage_id"], api.context.handle_lineage_id)
+            runner.release.set()
+            return handle
+
+        handle = asyncio.run(scenario())
+        self.assertIsInstance(handle, str)
+
+    def test_agent_is_start_then_wait(self):
+        runner = DurableHandleRunner()
+        api = _durable_api(runner)
+
+        async def scenario():
+            return await api.agent("work", self._opts)
+
+        self.assertEqual(asyncio.run(scenario()), "result:work")
+        self.assertEqual(runner.calls, 1)
+
+    def test_wait_agent_returns_completed_result(self):
+        runner = DurableHandleRunner()
+        api = _durable_api(runner)
+
+        async def scenario():
+            handle = await api.start_agent("work", self._opts)
+            result = await api.wait_agent(handle)
+            self.assertEqual(api.agent_status(handle)["status"], "completed")
+            return result
+
+        self.assertEqual(asyncio.run(scenario()), "result:work")
+
+    def test_agent_status_rejects_unknown_or_cross_lineage_handle(self):
+        api_one = _durable_api(DurableHandleRunner())
+        api_two = _durable_api(DurableHandleRunner())
+
+        async def scenario():
+            return await api_one.start_agent("work", self._opts)
+
+        handle = asyncio.run(scenario())
+        with self.assertRaisesRegex(WorkflowRuntimeError, "unknown or cross-lineage"):
+            api_one.agent_status("agent-handle:unknown")
+        with self.assertRaisesRegex(WorkflowRuntimeError, "unknown or cross-lineage"):
+            api_two.agent_status(handle)
+
+    def test_continue_requires_prompt_and_rejects_running_handle_before_reservation(self):
+        runner = DurableHandleRunner(block=True)
+        api = _durable_api(runner)
+
+        async def scenario():
+            handle = await api.start_agent("first", self._opts)
+            with self.assertRaisesRegex(WorkflowRuntimeError, "non-empty prompt"):
+                await api.continue_agent(handle, " ")
+            await asyncio.sleep(0)
+            self.assertTrue(runner.started.wait(timeout=1))
+            with self.assertRaisesRegex(WorkflowRuntimeError, "queued or running"):
+                await api.continue_agent(handle, "second")
+            self.assertEqual(api.context.agent_count, 1)
+            runner.release.set()
+            await api.wait_agent(handle)
+
+        asyncio.run(scenario())
+
+    def test_continue_reuses_handle_session_history_and_workspace(self):
+        runner = DurableHandleRunner()
+        history = [{"role": "assistant", "content": "stable"}]
+
+        with tempfile.TemporaryDirectory() as workspace:
+            api = _durable_api(runner, cwd=workspace)
+
+            async def scenario():
+                handle = await api.start_agent("first", self._opts)
+                await api.wait_agent(handle)
+                with patch(
+                    "hermes_dynamic_workflows.engine.api.SessionTranscriptReader.stable_messages",
+                    return_value=history,
+                ):
+                    same = await api.continue_agent(handle, "second")
+                    self.assertEqual(same, handle)
+                    await api.wait_agent(handle)
+
+            asyncio.run(scenario())
+        self.assertEqual(runner.requests[1].session_id, runner.requests[0].session_id)
+        self.assertIs(runner.requests[1].conversation_history, history)
+        self.assertEqual(runner.requests[1].cwd, workspace)
+
+    def test_fork_creates_new_handle_session_from_stable_history_without_workspace_clone(self):
+        runner = DurableHandleRunner()
+        history = [{"role": "user", "content": "source"}]
+
+        with tempfile.TemporaryDirectory() as source_workspace, tempfile.TemporaryDirectory() as fork_workspace:
+            api = _durable_api(runner, cwd=source_workspace)
+
+            async def scenario():
+                source = await api.start_agent("source", self._opts)
+                await api.wait_agent(source)
+                api.frame.cwd = fork_workspace
+                with patch(
+                    "hermes_dynamic_workflows.engine.api.SessionTranscriptReader.stable_messages",
+                    return_value=history,
+                ):
+                    fork = await api.fork_agent(source, "fork", self._opts)
+                    await api.wait_agent(fork)
+                return source, fork
+
+            source, fork = asyncio.run(scenario())
+        self.assertNotEqual(source, fork)
+        self.assertNotEqual(runner.requests[1].session_id, runner.requests[0].session_id)
+        self.assertIs(runner.requests[1].conversation_history, history)
+        self.assertEqual(runner.requests[1].parent_session_id, runner.requests[0].session_id)
+        self.assertEqual(runner.requests[1].parent_handle_id, source)
+        self.assertEqual(runner.requests[1].cwd, fork_workspace)
+        self.assertNotEqual(runner.requests[1].cwd, source_workspace)
 
 
 if __name__ == "__main__":

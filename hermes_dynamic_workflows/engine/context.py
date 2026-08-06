@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 import threading
+import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from time import monotonic
@@ -17,7 +19,13 @@ from ..core.errors import (
     WorkflowLimitExceeded,
     WorkflowStopped,
 )
-from ..core.types import ChildAgentRunner, WorkflowFrame, WorkflowState, normalize_phase_specs
+from ..core.types import (
+    AgentHandleRecord,
+    ChildAgentRunner,
+    WorkflowFrame,
+    WorkflowState,
+    normalize_phase_specs,
+)
 
 
 class PauseGate:
@@ -89,11 +97,41 @@ class WorkflowExecutionContext:
     _agent_count: int = 0
     _spent_tokens: int = 0
     _loop_ticks: int = 0
+    # Durable handles belong to the run context, not an individual frame. This
+    # keeps nested workflow frames in one root lineage and avoids a second
+    # registry or persistence layer.
+    handle_lineage_id: str = field(default_factory=lambda: f"lineage-{uuid.uuid4().hex}")
+    agent_handles: dict[str, AgentHandleRecord] = field(default_factory=dict)
+    handle_futures: dict[str, Any] = field(default_factory=dict)
+    initial_agent_handles: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         self.state = WorkflowState(self.root)
         concurrency = min(self.config.concurrency, self.config.max_concurrency)
         self._agent_slots = threading.BoundedSemaphore(max(1, concurrency))
+        self._restore_agent_handles(self.initial_agent_handles)
+
+    def _restore_agent_handles(self, snapshots: Any) -> None:
+        if not isinstance(snapshots, dict):
+            return
+        restored_ids: list[int] = []
+        for key, snapshot in snapshots.items():
+            record = AgentHandleRecord.from_snapshot(snapshot)
+            if record is None or str(key) != record.handle:
+                continue
+            if record.lineage_id != self.handle_lineage_id:
+                continue
+            if record.state in {"queued", "running", "stopping"}:
+                record.state = "interrupted"
+                record.error = "process/restart interrupted the turn"
+                record.ended_at = time.time()
+            self.agent_handles[record.handle] = record
+            if record.agent_id is not None:
+                restored_ids.append(record.agent_id)
+            if record.state == "interrupted" and record.error == "process/restart interrupted the turn":
+                self.journal_handle(record)
+        if restored_ids:
+            self._agent_counter = max(restored_ids)
 
     @property
     def spent_tokens(self) -> int:
@@ -213,3 +251,8 @@ class WorkflowExecutionContext:
             self.on_journal(event)
         except Exception:
             pass
+
+    def journal_handle(self, handle: AgentHandleRecord) -> None:
+        """Persist one lifecycle transition through the existing run journal."""
+        self.journal({"type": "agent_lifecycle", **handle.snapshot()})
+        self.notify()

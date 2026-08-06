@@ -9,6 +9,7 @@ import os
 import threading
 import time
 import traceback
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -199,12 +200,40 @@ class WorkflowRunManager:
                 f'Workflow "{meta.get("name") or "workflow"}" was not launched: {reason}. '
                 "Do not retry; tell the user it needs their approval."
             )
-        run_id = new_run_id()
-        task_id = new_task_id()
         workflow_session_id = _resolve_workflow_session_id(
             plugin_context,
             host_session_id=host_session_id,
         )
+        previous = self.store.load_run(resume_from) if resume_from else None
+        previous_handles = previous.get("agentHandles") if previous else {}
+        if previous_handles is None:
+            previous_handles = {}
+        if not isinstance(previous_handles, dict):
+            raise WorkflowRuntimeError(
+                f"Workflow {resume_from} has malformed persisted agent handles; resume refused"
+            )
+        if previous_handles:
+            origin_session = str(previous.get("workflowSessionId") or "").strip()
+            if origin_session != workflow_session_id:
+                raise WorkflowRuntimeError(
+                    f"Workflow {resume_from} agent handles belong to origin workflow session "
+                    f"{origin_session or '<missing>'}, not {workflow_session_id}"
+                )
+        handle_lineage_id = str(previous.get("handleLineageId") or "").strip() if previous else ""
+        if not handle_lineage_id and previous_handles:
+            lineage_ids = {
+                str(value.get("lineage_id") or "").strip()
+                for value in previous_handles.values()
+                if isinstance(value, dict) and str(value.get("lineage_id") or "").strip()
+            }
+            if len(lineage_ids) != 1:
+                raise WorkflowRuntimeError(
+                    f"Workflow {resume_from} has no stable persisted handle lineage; resume refused"
+                )
+            handle_lineage_id = lineage_ids.pop()
+        handle_lineage_id = handle_lineage_id or f"lineage-{uuid.uuid4().hex}"
+        run_id = new_run_id()
+        task_id = new_task_id()
         saved_path = self._script_path_for_source(
             source,
             run_id=run_id,
@@ -216,7 +245,6 @@ class WorkflowRunManager:
         journal_path = transcript_dir / "journal.jsonl"
         transcript_dir.mkdir(parents=True, exist_ok=True)
         journal_path.touch(exist_ok=True)
-        previous = self.store.load_run(resume_from) if resume_from else None
         resume_cache = ResumeCache.from_run(previous)
         args = params["args"] if "args" in params else (previous.get("args") if previous else None)
         token_budget = (
@@ -265,6 +293,7 @@ class WorkflowRunManager:
             },
             "resumeFromRunId": resume_from,
             "restartedFromRunId": restart_from_run_id,
+            "handleLineageId": handle_lineage_id,
             "args": args,
             "tokenBudget": token_budget,
             # Routing-only gateway context (platform/chat/thread/user — never
@@ -281,6 +310,7 @@ class WorkflowRunManager:
             "display": "",
             "workflow": None,
             "agentCache": {},
+            "agentHandles": dict(previous_handles),
             "outputFile": None,
             "transcriptFiles": [],
             "transcriptMetaFiles": [],
@@ -826,6 +856,8 @@ class WorkflowRunManager:
                     token_budget_total=token_budget,
                     source_ref=str(managed.record.get("scriptPath") or ""),
                     store=self.store,
+                    agent_handles=managed.record.get("agentHandles") or {},
+                    handle_lineage_id=str(managed.record.get("handleLineageId") or "") or None,
                 ),
             )
             snapshot = result.state.snapshot()
@@ -963,14 +995,26 @@ class WorkflowRunManager:
 
     def _append_journal_event(self, managed: ManagedRun, event: dict[str, Any]) -> None:
         with managed.lock:
+            if event.get("type") == "agent_lifecycle":
+                handle = str(event.get("handle") or "").strip()
+                if handle:
+                    handles = managed.record.setdefault("agentHandles", {})
+                    if isinstance(handles, dict):
+                        handles[handle] = {
+                            key: value
+                            for key, value in event.items()
+                            if key != "type"
+                        }
             path_raw = str(managed.record.get("journalFile") or "")
             if not path_raw:
+                self.store.save_run(managed.record)
                 return
             path = Path(path_raw)
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 with path.open("a", encoding="utf-8") as fh:
                     fh.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+                self.store.save_run(managed.record)
             except Exception as exc:
                 managed.record["journalError"] = f"{type(exc).__name__}: {exc}"
 

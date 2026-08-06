@@ -181,6 +181,13 @@ return await agent("Synthesize the verified findings:\n" + json.dumps(findings),
   Presets define role instructions and tool permissions only; routing and budgets cannot
   come from presets. Current Bedrock and `codex_app_server` transports do not forward
   workflow reasoning effort, so those runtimes fail before child launch.
+- Durable execution uses `start_agent`, `wait_agent`, `agent_status`, `continue_agent`,
+  `fork_agent`, and `stop_agent`. Handles are scoped to the workflow lineage and retain
+  the child SessionDB transcript and workspace. After a restart, resume the workflow with
+  `resumeFromRunId`; active turns become `interrupted` and require an explicit
+  `continue_agent(handle, prompt)` call. Interrupted work is never replayed automatically.
+- `agent(prompt, opts)` remains the foreground shorthand for `start_agent` plus
+  `wait_agent`.
 - `pipeline` (default, no barrier) / `parallel` (with barrier) handle concurrency;
   `phase`/`log` report progress; `workflow()` runs a named workflow inline; `args` /
   `budget` access the input arguments and the token budget.

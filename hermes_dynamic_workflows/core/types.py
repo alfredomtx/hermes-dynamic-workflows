@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
+import json
+import time
 from dataclasses import dataclass, field
 from time import monotonic
 from typing import Any, Callable, Literal
 
 AgentStatus = Literal["queued", "running", "done", "error", "skipped"]
+HandleState = Literal[
+    "queued",
+    "running",
+    "stopping",
+    "completed",
+    "failed",
+    "stopped",
+    "interrupted",
+]
 
 
 @dataclass
@@ -92,6 +103,179 @@ class AgentRecord:
             "attempts": self.attempts,
             "structured": dict(self.structured),
         }
+
+
+@dataclass
+class AgentHandleRecord:
+    """Persistable, non-secret state for one durable child-agent handle."""
+
+    handle: str
+    lineage_id: str
+    state: HandleState = "queued"
+    session_id: str | None = None
+    task_id: str | None = None
+    parent_handle_id: str | None = None
+    parent_session_id: str | None = None
+    workspace: str | None = None
+    workspace_ownership: str | None = None
+    route: dict[str, Any] = field(default_factory=dict)
+    tools: dict[str, Any] = field(default_factory=dict)
+    schema: dict[str, Any] | None = None
+    turn: int = 1
+    agent_id: int | None = None
+    result: Any = None
+    error: str = ""
+    created_at: float = field(default_factory=time.time)
+    queued_at: float | None = field(default_factory=time.time)
+    started_at: float | None = None
+    ended_at: float | None = None
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "handle": self.handle,
+            "lineage_id": self.lineage_id,
+            "status": self.state,
+            "session_id": self.session_id,
+            "task_id": self.task_id,
+            "parent_handle_id": self.parent_handle_id,
+            "parent_session_id": self.parent_session_id,
+            "workspace": self.workspace,
+            "workspace_ownership": self.workspace_ownership,
+            "route": _json_safe(self.route),
+            "tools": _json_safe(self.tools),
+            "schema": _json_safe(self.schema),
+            "turn": self.turn,
+            "agent_id": self.agent_id,
+            "result": _json_safe(self.result),
+            "error": self.error,
+            "created_at": self.created_at,
+            "queued_at": self.queued_at,
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+        }
+
+    @classmethod
+    def from_snapshot(cls, snapshot: Any) -> "AgentHandleRecord | None":
+        """Load one persisted handle without turning corrupt data into a new handle.
+
+        The run record is user-visible durable state. A malformed entry is
+        therefore rejected as a whole; callers can continue with the other
+        valid entries, but must never silently replace this entry with a fresh
+        handle.
+        """
+        if not isinstance(snapshot, dict):
+            return None
+        handle = _snapshot_string(snapshot.get("handle"))
+        lineage_id = _snapshot_string(snapshot.get("lineage_id"))
+        state = snapshot.get("status", snapshot.get("state"))
+        if not handle or not lineage_id or state not in {
+            "queued",
+            "running",
+            "stopping",
+            "completed",
+            "failed",
+            "stopped",
+            "interrupted",
+        }:
+            return None
+        route = snapshot.get("route", {})
+        tools = snapshot.get("tools", {})
+        schema = snapshot.get("schema")
+        if not isinstance(route, dict) or not isinstance(tools, dict):
+            return None
+        if schema is not None and not isinstance(schema, dict):
+            return None
+        created_at = _snapshot_number(snapshot.get("created_at"))
+        queued_at = _snapshot_optional_number(snapshot.get("queued_at"))
+        started_at = _snapshot_optional_number(snapshot.get("started_at"))
+        ended_at = _snapshot_optional_number(snapshot.get("ended_at"))
+        if created_at is None or created_at < 1_000_000_000 or any(
+            value is not None and value < 0
+            for value in (created_at, queued_at, started_at, ended_at)
+        ):
+            return None
+        if any(
+            value is not None and value < 1_000_000_000
+            for value in (queued_at, started_at, ended_at)
+        ):
+            return None
+        turn = snapshot.get("turn", 1)
+        agent_id = snapshot.get("agent_id")
+        if type(turn) is not int or turn < 1:
+            return None
+        if agent_id is not None and type(agent_id) is not int:
+            return None
+        optional_strings = {}
+        for name in (
+            "session_id",
+            "task_id",
+            "parent_handle_id",
+            "parent_session_id",
+            "workspace",
+            "workspace_ownership",
+        ):
+            value = snapshot.get(name)
+            if value is not None and not isinstance(value, str):
+                return None
+            optional_strings[name] = value
+        if optional_strings["workspace_ownership"] == "worktree":
+            optional_strings["workspace_ownership"] = "workflow-owned"
+        error = snapshot.get("error", "")
+        if not isinstance(error, str):
+            return None
+        try:
+            return cls(
+                handle=handle,
+                lineage_id=lineage_id,
+                state=state,
+                session_id=optional_strings["session_id"],
+                task_id=optional_strings["task_id"],
+                parent_handle_id=optional_strings["parent_handle_id"],
+                parent_session_id=optional_strings["parent_session_id"],
+                workspace=optional_strings["workspace"],
+                workspace_ownership=optional_strings["workspace_ownership"],
+                route=dict(route),
+                tools=dict(tools),
+                schema=dict(schema) if schema is not None else None,
+                turn=turn,
+                agent_id=agent_id,
+                result=snapshot.get("result"),
+                error=error,
+                created_at=created_at,
+                queued_at=queued_at,
+                started_at=started_at,
+                ended_at=ended_at,
+            )
+        except (TypeError, ValueError):
+            return None
+
+
+def _snapshot_string(value: Any) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _snapshot_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _snapshot_optional_number(value: Any) -> float | None:
+    if value is None:
+        return None
+    return _snapshot_number(value)
+
+
+def _json_safe(value: Any) -> Any:
+    try:
+        json.dumps(value, ensure_ascii=False)
+        return value
+    except (TypeError, ValueError):
+        if isinstance(value, dict):
+            return {str(key): _json_safe(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_json_safe(item) for item in value]
+        return str(value)
 
 
 @dataclass
@@ -344,6 +528,13 @@ class ChildAgentRequest:
     resolved: ResolvedAgentSpec | None = None
     max_turns: int | None = None
     reasoning_effort: str | None = None
+    handle_id: str | None = None
+    lineage_id: str | None = None
+    parent_handle_id: str | None = None
+    session_id: str | None = None
+    parent_session_id: str | None = None
+    conversation_history: list[dict[str, Any]] | None = None
+    workspace_ownership: str | None = None
 
 
 class ChildAgentRunner:

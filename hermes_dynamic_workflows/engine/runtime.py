@@ -7,6 +7,7 @@ import json
 import math
 import os
 import threading
+import uuid
 from dataclasses import dataclass
 from time import monotonic
 from typing import Any, Callable
@@ -47,6 +48,8 @@ class WorkflowOptions:
     plugin_context: Any = None
     token_budget_total: int | None = None
     store: Any = None
+    agent_handles: dict[str, Any] | None = None
+    handle_lineage_id: str | None = None
 
 
 @dataclass
@@ -149,6 +152,11 @@ async def _run_workflow_async(script: str, options: WorkflowOptions | None = Non
             plugin_context=options.plugin_context,
             token_budget_total=options.token_budget_total,
             store=options.store,
+            handle_lineage_id=(
+                options.handle_lineage_id
+                or f"lineage-{uuid.uuid4().hex}"
+            ),
+            initial_agent_handles=dict(options.agent_handles or {}),
         )
         frame = root
     else:

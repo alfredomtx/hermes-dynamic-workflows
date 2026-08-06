@@ -12,8 +12,8 @@ import unicodedata
 import uuid
 import logging
 from contextlib import nullcontext
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 
 from .presets import AgentTypeSpec, list_agent_types, resolve_agent_type
@@ -154,7 +154,7 @@ class HermesChildAgentRunner(ChildAgentRunner):
         self._progress_print_lock = threading.RLock()
 
     def run(self, request: ChildAgentRequest) -> ChildAgentResult:
-        task_id = f"workflow-{uuid.uuid4().hex[:12]}"
+        task_id = request.handle_id or f"workflow-{uuid.uuid4().hex[:12]}"
         base_cwd = request.cwd or os.environ.get("TERMINAL_CWD") or os.getcwd()
         resolved = request.resolved
         if (
@@ -198,7 +198,10 @@ class HermesChildAgentRunner(ChildAgentRunner):
             isolation=request.isolation,
             label=request.label,
             task_id=task_id,
-            keep_worktree=self.config.keep_worktrees,
+            keep_worktree=(
+                self.config.keep_worktrees
+                or request.workspace_ownership == "workflow-owned"
+            ),
         )
         _prepare_mcp_tool_registry(self.config)
         if resolved is not None:
@@ -340,9 +343,9 @@ class HermesChildAgentRunner(ChildAgentRunner):
                 "workflow child request is missing a validated resolved reasoning effort"
             )
         try:
-            from run_agent import AIAgent
+            from agent import child_execution
         except Exception as exc:
-            raise ChildAgentError(f"could not import Hermes AIAgent: {exc}") from exc
+            raise ChildAgentError(f"could not import Hermes child execution: {exc}") from exc
 
         child_prompt = build_child_system_prompt(
             agent_type,
@@ -353,44 +356,59 @@ class HermesChildAgentRunner(ChildAgentRunner):
         except Exception:
             session_db = None
 
-        kwargs = {
-            "api_key": runtime.get("api_key"),
-            "base_url": runtime.get("base_url"),
-            "provider": runtime.get("provider"),
-            "api_mode": runtime.get("api_mode"),
-            "acp_command": runtime.get("acp_command"),
-            "acp_args": runtime.get("acp_args"),
-            "model": runtime.get("model"),
-            "credential_pool": runtime.get("credential_pool"),
-            "fallback_model": runtime.get("fallback_model"),
-            "max_tokens": runtime.get("max_tokens"),
-            "enabled_toolsets": toolsets,
-            "disabled_toolsets": list(self.config.blocked_child_toolsets),
-            "quiet_mode": True,
-            "platform": "cli",
-            "tool_progress_callback": self._make_tool_progress_callback(request, lease),
-            "thinking_callback": _child_thinking_callback,
-            "skip_context_files": True,
-            "skip_memory": True,
-            "clarify_callback": _child_clarify_callback,
-            "ephemeral_system_prompt": child_prompt,
-            "session_db": session_db,
-            "session_id": lease.task_id,
-        }
         request_overrides = _without_reasoning_overrides(
             request.request_overrides or runtime.get("request_overrides")
         )
-        if request_overrides and _callable_accepts_keyword(AIAgent, "request_overrides"):
-            kwargs["request_overrides"] = request_overrides
-        kwargs["reasoning_config"] = {
-            "enabled": True,
-            "effort": request.reasoning_effort,
+        child_spec = {
+            "provider": runtime.get("provider"),
+            "model": runtime.get("model"),
+            "reasoning_config": {
+                "enabled": True,
+                "effort": request.reasoning_effort,
+            },
+            "reasoning_effort": request.reasoning_effort,
+            "instructions": child_prompt,
+            "enabled_toolsets": toolsets,
+            "disabled_toolsets": list(self.config.blocked_child_toolsets),
+            "request_overrides": request_overrides,
+            "max_tokens": runtime.get("max_tokens"),
+            "session_id": request.session_id or lease.task_id,
+            "resolved_credentials": {
+                "api_key": runtime.get("api_key"),
+                "base_url": runtime.get("base_url"),
+                "provider": runtime.get("provider"),
+                "api_mode": runtime.get("api_mode"),
+                "model": runtime.get("model"),
+                "credential_pool": runtime.get("credential_pool"),
+                "request_overrides": request_overrides,
+                "max_output_tokens": runtime.get("max_tokens"),
+                "command": runtime.get("acp_command"),
+                "args": runtime.get("acp_args"),
+            },
         }
-        if runtime.get("service_tier") is not None:
-            kwargs["service_tier"] = runtime["service_tier"]
+        child_context = {
+            "cwd": lease.cwd,
+            "session_db": session_db,
+            "parent_session_id": request.parent_session_id,
+            "log_prefix": "[dynamic-workflow-child]",
+            "platform": "cli",
+            "workspace_ownership": request.workspace_ownership,
+            "handle_id": request.handle_id,
+            "lineage_id": request.lineage_id,
+            "parent_handle_id": request.parent_handle_id,
+        }
         if request.max_turns is not None:
-            kwargs["max_iterations"] = request.max_turns
-        child = AIAgent(**kwargs)
+            child_context["max_iterations"] = request.max_turns
+        child = child_execution.create_child(
+            _parent_agent_proxy(runtime),
+            child_spec,
+            callbacks={
+                "progress": self._make_tool_progress_callback(request, lease),
+                "thinking": _child_thinking_callback,
+                "clarify": _child_clarify_callback,
+            },
+            context=child_context,
+        )
         if request.max_turns is not None:
             # A capped child cannot spend an unreported provider call after its final turn.
             child._handle_max_iterations = _capped_child_exhaustion_response
@@ -530,6 +548,13 @@ class HermesChildAgentRunner(ChildAgentRunner):
                     host_gateway.set_session_vars(**self._session_context)
                 except Exception:
                     pass
+            if self._approval_session_key:
+                try:
+                    from tools.approval import set_current_session_key
+
+                    set_current_session_key(self._approval_session_key)
+                except Exception:
+                    pass
 
         def _run() -> dict[str, Any]:
             approval_token = None
@@ -546,9 +571,11 @@ class HermesChildAgentRunner(ChildAgentRunner):
                 except Exception:
                     pass
             try:
+                from agent import child_execution
+
                 _register_task_cwd(lease.task_id, lease.cwd, agent_type)
                 message = build_child_task_message(request, workspace=lease.cwd)
-                history = None
+                history = request.conversation_history
                 stop_attempts = 0
                 remaining_turns = request.max_turns
                 tool_calls_used = 0
@@ -557,11 +584,26 @@ class HermesChildAgentRunner(ChildAgentRunner):
                     if remaining_turns is not None:
                         child.max_iterations = remaining_turns
                     input_history = history
-                    result = child.run_conversation(
-                        user_message=message,
-                        conversation_history=history,
+                    result = child_execution.run_child(
+                        child,
+                        message,
+                        timeout=timeout,
                         task_id=lease.task_id,
+                        conversation_history=history,
+                        initializer=_init_worker,
+                        initargs=(),
                     )
+                    if (
+                        isinstance(result, dict)
+                        and (
+                            result.get("status") == "timeout"
+                            or result.get("exit_reason") == "timeout"
+                        )
+                    ):
+                        latest["result"] = result
+                        raise WorkflowTimeout(
+                            f"child agent timed out after {timeout:.0f}s"
+                        )
                     latest["result"] = result if isinstance(result, dict) else {}
                     core_budget = result.get("tool_budget") if isinstance(result, dict) else None
                     if isinstance(core_budget, dict):
@@ -654,11 +696,6 @@ class HermesChildAgentRunner(ChildAgentRunner):
                     except Exception:
                         pass
 
-        executor = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="dw-child-agent",
-            initializer=_init_worker,
-        )
         try:
             from ..adapters.hooks import register_child_observer
 
@@ -667,10 +704,8 @@ class HermesChildAgentRunner(ChildAgentRunner):
             pass
         with self._active_lock:
             self._active_children[lease.task_id] = child
-        future = executor.submit(_run)
-        result: dict[str, Any] | None = None
         try:
-            result = future.result(timeout=timeout) or {}
+            result = _run() or {}
             content = str(result.get("final_response") or "")
             # A hard child failure (e.g. a non-retryable API error) returns an
             # "error" string and no usable final_response. Surface it as a real
@@ -684,13 +719,9 @@ class HermesChildAgentRunner(ChildAgentRunner):
         except ChildAgentError:
             _emit_terminal_metadata()
             raise
-        except FuturesTimeoutError as exc:
-            try:
-                if hasattr(child, "interrupt"):
-                    child.interrupt()
-            finally:
-                _emit_terminal_metadata()
-                raise WorkflowTimeout(f"child agent timed out after {timeout:.0f}s") from exc
+        except WorkflowTimeout:
+            _emit_terminal_metadata()
+            raise
         finally:
             try:
                 from ..adapters.hooks import unregister_child_observer
@@ -702,7 +733,6 @@ class HermesChildAgentRunner(ChildAgentRunner):
                 self._active_children.pop(lease.task_id, None)
             _cleanup_task_cwd(lease.task_id)
             lease.cleanup()
-            executor.shutdown(wait=False, cancel_futures=True)
 
     def interrupt_all(self) -> None:
         with self._active_lock:
@@ -713,6 +743,10 @@ class HermesChildAgentRunner(ChildAgentRunner):
                     child.interrupt()
             except Exception:
                 pass
+
+    def interrupt_child(self, task_id: str) -> bool:
+        """Target the runner's existing cooperative interrupt seam."""
+        return self.skip_child(task_id)
 
     def skip_child(self, task_id: str) -> bool:
         """Interrupt one active child and make its agent() call resolve to None."""
@@ -744,6 +778,43 @@ class HermesChildAgentRunner(ChildAgentRunner):
     def _clear_skipped(self, task_id: str) -> None:
         with self._active_lock:
             self._skipped_children.discard(task_id)
+
+
+def _parent_agent_proxy(runtime: dict[str, Any] | None) -> Any:
+    """Provide shared child execution with the resolved workflow runtime."""
+    values = dict(runtime or {})
+    defaults = {
+        "model": None,
+        "provider": None,
+        "base_url": None,
+        "api_key": None,
+        "api_mode": None,
+        "request_overrides": {},
+        "reasoning_config": None,
+        "service_tier": None,
+        "max_tokens": None,
+        "session_id": None,
+        "_session_db": None,
+        "_fallback_chain": values.get("fallback_model"),
+        "providers_allowed": None,
+        "providers_ignored": None,
+        "providers_order": None,
+        "provider_sort": None,
+        "provider_require_parameters": False,
+        "provider_data_collection": None,
+        "openrouter_min_coding_score": None,
+        "credential_pool": None,
+        "prefill_messages": None,
+        "acp_command": None,
+        "acp_args": [],
+    }
+    for key, default in defaults.items():
+        values.setdefault(key, default)
+    values.setdefault(
+        "_client_kwargs",
+        {"api_key": values.get("api_key"), "base_url": values.get("base_url")},
+    )
+    return SimpleNamespace(**values)
 
 
 def build_child_system_prompt(
@@ -1377,11 +1448,12 @@ def _child_metadata(
     # once at the cache rate). session_input_tokens is the clean uncached count.
     input_tokens = _int_attr(child, "session_input_tokens")
     output_tokens = _int_attr(child, "session_output_tokens") or completion_tokens
+    session_id = str(getattr(child, "session_id", None) or lease.task_id)
     metadata = {
         "runner": "standalone",
         "task_id": lease.task_id,
-        "session_id": lease.task_id,
-        "hermes_session_id": lease.task_id,
+        "session_id": session_id,
+        "hermes_session_id": session_id,
         "workspace": lease.cwd,
         "isolation": lease.isolation or "shared",
         "worktree_path": lease.path,

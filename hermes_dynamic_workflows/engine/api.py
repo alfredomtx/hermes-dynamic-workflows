@@ -8,7 +8,10 @@ import importlib
 import inspect
 import math
 import threading
+import time
+import uuid
 from contextvars import ContextVar
+from dataclasses import replace
 from pathlib import Path
 from time import monotonic
 from typing import Any, Callable
@@ -29,6 +32,7 @@ from ..core.errors import (
 )
 from ..core.schema import StructuredOutputError, validate_json_schema
 from ..core.types import (
+    AgentHandleRecord,
     AgentRecord,
     ChildAgentRequest,
     ChildAgentResult,
@@ -36,6 +40,7 @@ from ..core.types import (
     TopologyRecord,
     WorkflowFrame,
 )
+from ..run.transcripts import SessionTranscriptReader
 
 MAX_VM_ARRAY_ITEMS = 4096
 # Context-local topology membership. A copied mapping is installed whenever a
@@ -92,6 +97,12 @@ class WorkflowAPI:
     def globals(self) -> dict[str, Any]:
         return {
             "agent": self.agent,
+            "start_agent": self.start_agent,
+            "wait_agent": self.wait_agent,
+            "agent_status": self.agent_status,
+            "stop_agent": self.stop_agent,
+            "continue_agent": self.continue_agent,
+            "fork_agent": self.fork_agent,
             "codex": self.codex,
             "parallel": self.parallel,
             "pipeline": self.pipeline,
@@ -103,23 +114,431 @@ class WorkflowAPI:
         }
 
     async def agent(self, prompt: str, opts: dict[str, Any] | None = None) -> Any:
+        return await self.wait_agent(await self.start_agent(prompt, opts))
+
+    async def start_agent(self, prompt: str, opts: dict[str, Any] | None = None) -> str:
+        """Queue a durable child turn and return its lineage-scoped handle."""
+        opts = self._validate_handle_inputs(prompt, opts)
         topology: TopologyRecord | None = None
         topology_token = None
         if _active_topology(self.frame) is None:
             topology = self._begin_sequential_step()
-            # asyncio.to_thread() copies the current context into the worker,
-            # allowing _agent_sync() to associate the reserved ID before its
-            # first live notification.
             topology_token = _bind_topology(self.frame, topology)
         try:
-            return await asyncio.to_thread(self._agent_sync, prompt, opts)
+            handle = self._new_handle(opts)
+            task = asyncio.create_task(self._run_handle(handle, prompt, opts))
+            self.context.handle_futures[handle.handle] = task
+            return handle.handle
         finally:
             if topology_token is not None:
                 _ACTIVE_TOPOLOGIES.reset(topology_token)
             if topology is not None:
                 self._finish_topology(topology)
 
-    def _agent_sync(self, prompt: str, opts: dict[str, Any] | None = None) -> Any:
+    async def wait_agent(self, handle: str) -> Any:
+        record = self._get_handle(handle)
+        future = self.context.handle_futures.get(record.handle)
+        if future is not None:
+            try:
+                result = await future
+            except asyncio.CancelledError as exc:
+                if record.state == "stopped":
+                    raise WorkflowRuntimeError(
+                        f"agent handle {record.handle} was stopped"
+                    ) from exc
+                raise WorkflowRuntimeError(
+                    f"agent handle {record.handle} was interrupted"
+                ) from exc
+            if record.state in {"stopped", "interrupted", "failed"}:
+                raise WorkflowRuntimeError(
+                    record.error
+                    or f"agent handle {record.handle} ended in {record.state} state"
+                )
+            return result
+        if record.state == "completed":
+            return record.result
+        if record.state in {"failed", "interrupted", "stopped"}:
+            raise WorkflowRuntimeError(
+                record.error or f"agent handle {record.handle} ended in {record.state} state"
+            )
+        if record.state == "stopping":
+            raise WorkflowRuntimeError(
+                f"agent handle {record.handle} is stopping and has no active future"
+            )
+        raise WorkflowRuntimeError(
+            f"agent handle {record.handle} has no active future or terminal state"
+        )
+
+    def agent_status(self, handle: str) -> dict[str, Any]:
+        return self._get_handle(handle).snapshot()
+
+    async def stop_agent(self, handle: str) -> str:
+        """Request one child turn to stop without faking worker termination.
+
+        The asyncio task is cancelled only while it is still queued. Once a
+        worker may be running, the per-child runner seam is used and the
+        handle remains ``stopping`` until that worker future exits.
+        """
+        record = self._get_handle(handle)
+        if record.state in {"completed", "failed", "stopped", "interrupted"}:
+            return record.handle
+        if record.state == "stopping":
+            return record.handle
+        future = self.context.handle_futures.get(record.handle)
+        if record.state == "queued" and (future is None or future.cancel()):
+            self._finish_handle(record, "stopped", error="agent turn was stopped")
+            return record.handle
+
+        self._set_handle_state(record, "stopping")
+        task_id = record.task_id or record.handle
+        interrupt = getattr(self.runner, "interrupt_child", None)
+        if not callable(interrupt):
+            interrupt = getattr(self.runner, "skip_child", None)
+        if callable(interrupt):
+            try:
+                interrupt(task_id)
+            except Exception:
+                pass
+        return record.handle
+
+    async def continue_agent(self, handle: str, prompt: str) -> str:
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise WorkflowRuntimeError("continue_agent() expects a non-empty prompt string")
+        record = self._get_handle(handle)
+        if record.state in {"queued", "running", "stopping"}:
+            raise WorkflowRuntimeError(
+                f"agent handle {record.handle} is queued or running and cannot be continued"
+            )
+        if not record.session_id:
+            raise WorkflowRuntimeError(
+                f"agent handle {record.handle} has no persisted Hermes session"
+            )
+        workspace = self._required_workspace(record)
+        history = self._stable_history(record.session_id)
+        opts = self._options_from_handle(record, reuse_workspace=True)
+        self._reset_for_turn(record)
+        task = asyncio.create_task(
+            self._run_handle(
+                record,
+                prompt,
+                opts,
+                conversation_history=history,
+                cwd=workspace,
+                reuse_workspace=True,
+            )
+        )
+        self.context.handle_futures[record.handle] = task
+        return record.handle
+
+    async def fork_agent(
+        self,
+        handle: str,
+        prompt: str,
+        opts: dict[str, Any] | None = None,
+    ) -> str:
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise WorkflowRuntimeError("fork_agent() expects a non-empty prompt string")
+        source = self._get_handle(handle)
+        if not source.session_id:
+            raise WorkflowRuntimeError(
+                f"agent handle {source.handle} has no persisted Hermes session"
+            )
+        history = self._stable_history(source.session_id)
+        merged = self._options_from_handle(source)
+        if opts is not None:
+            if not isinstance(opts, dict):
+                raise WorkflowRuntimeError("fork_agent() options must be a dict")
+            merged.update(opts)
+        merged = self._validate_handle_inputs(prompt, merged)
+        # The fork uses the caller's current cwd and a fresh session. The
+        # source workspace is deliberately not copied or used as a worktree.
+        fork = self._new_handle(
+            merged,
+            parent_handle_id=source.handle,
+            parent_session_id=source.session_id,
+            cwd=self.frame.cwd,
+            conversation_history=history,
+        )
+        task = asyncio.create_task(
+            self._run_handle(
+                fork,
+                prompt,
+                merged,
+                conversation_history=history,
+                cwd=self.frame.cwd,
+            )
+        )
+        self.context.handle_futures[fork.handle] = task
+        return fork.handle
+
+    def _validate_handle_inputs(
+        self,
+        prompt: str,
+        opts: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise WorkflowRuntimeError("start_agent() expects a non-empty prompt string")
+        if opts is None:
+            opts = {}
+        if not isinstance(opts, dict):
+            raise WorkflowRuntimeError("start_agent() options must be a dict")
+        _validate_agent_opts(opts)
+        schema = opts.get("schema")
+        if schema is not None and not isinstance(schema, dict):
+            raise WorkflowRuntimeError("start_agent() schema option must be a dict")
+        if schema is not None:
+            try:
+                validate_json_schema(schema)
+            except StructuredOutputError as exc:
+                raise WorkflowRuntimeError(str(exc)) from exc
+        return dict(opts)
+
+    def _new_handle(
+        self,
+        opts: dict[str, Any],
+        *,
+        parent_handle_id: str | None = None,
+        parent_session_id: str | None = None,
+        cwd: str | None = None,
+        conversation_history: list[dict[str, Any]] | None = None,
+    ) -> AgentHandleRecord:
+        handle = f"ah:{self.context.handle_lineage_id}:{uuid.uuid4().hex}"
+        record = AgentHandleRecord(
+            handle=handle,
+            lineage_id=self.context.handle_lineage_id,
+            session_id=f"workflow-session-{uuid.uuid4().hex}",
+            task_id=handle,
+            parent_handle_id=parent_handle_id,
+            parent_session_id=parent_session_id,
+            workspace=str(cwd or self.frame.cwd),
+            workspace_ownership=(
+                "workflow-owned" if opts.get("isolation") == "worktree" else "shared"
+            ),
+            route={
+                key: opts.get(key)
+                for key in ("provider", "model", "isolation", "agentType", "maxTurns", "reasoningEffort")
+                if key in opts
+            },
+            tools={
+                "toolsets": list(opts.get("toolsets") or []),
+                "toolsets_explicit": "toolsets" in opts,
+                "allowed_tools": list(opts.get("allowedTools", opts.get("allowed_tools")) or []),
+                "allowed_tools_explicit": "allowedTools" in opts or "allowed_tools" in opts,
+                "disallowed_tools": list(
+                    opts.get("disallowedTools", opts.get("disallowed_tools")) or []
+                ),
+            },
+            schema=dict(opts["schema"]) if isinstance(opts.get("schema"), dict) else None,
+        )
+        with self.context._lock:
+            self.context.agent_handles[handle] = record
+        self.context.journal_handle(record)
+        return record
+
+    def _get_handle(self, handle: str) -> AgentHandleRecord:
+        if not isinstance(handle, str) or not handle.strip():
+            raise WorkflowRuntimeError("unknown or cross-lineage agent handle")
+        record = self.context.agent_handles.get(handle)
+        if record is None or record.lineage_id != self.context.handle_lineage_id:
+            raise WorkflowRuntimeError("unknown or cross-lineage agent handle")
+        return record
+
+    def _set_handle_state(self, record: AgentHandleRecord, state: str) -> None:
+        now = time.time()
+        with self.context._lock:
+            record.state = state  # type: ignore[assignment]
+            if state == "running":
+                record.started_at = now
+        self.context.journal_handle(record)
+
+    def _finish_handle(
+        self,
+        record: AgentHandleRecord,
+        state: str,
+        *,
+        result: Any = None,
+        error: str = "",
+    ) -> None:
+        with self.context._lock:
+            record.state = state  # type: ignore[assignment]
+            record.result = result
+            record.error = error
+            record.ended_at = time.time()
+        self.context.journal_handle(record)
+
+    def _reset_for_turn(self, record: AgentHandleRecord) -> None:
+        with self.context._lock:
+            record.turn += 1
+            record.state = "queued"
+            record.result = None
+            record.error = ""
+            record.queued_at = time.time()
+            record.started_at = None
+            record.ended_at = None
+        self.context.journal_handle(record)
+
+    def _apply_resolved_handle_contract(
+        self,
+        record: AgentHandleRecord,
+        resolved: ResolvedAgentSpec,
+        schema: dict[str, Any] | None,
+        cwd: str,
+    ) -> None:
+        with self.context._lock:
+            record.workspace = str(cwd)
+            if resolved.isolation == "worktree":
+                record.workspace_ownership = "workflow-owned"
+            elif record.workspace_ownership not in {"workflow-owned", "borrowed"}:
+                record.workspace_ownership = "shared"
+            record.route = {
+                "provider": resolved.provider,
+                "model": resolved.model,
+                "isolation": resolved.isolation,
+                "agentType": resolved.agent_type_name,
+                "maxTurns": resolved.max_turns,
+                "reasoningEffort": resolved.reasoning_effort,
+                "systemPromptHash": resolved.system_prompt_hash,
+            }
+            record.tools = {
+                "toolsets": list(resolved.toolsets),
+                "toolsets_explicit": resolved.toolsets_explicit,
+                "allowed_tools": list(resolved.allowed_tools),
+                "allowed_tools_explicit": resolved.allowed_tools_explicit,
+                "disallowed_tools": list(resolved.disallowed_tools),
+            }
+            record.schema = dict(schema) if isinstance(schema, dict) else record.schema
+        self.context.journal_handle(record)
+
+    def _apply_handle_metadata(
+        self,
+        record: AgentHandleRecord,
+        metadata: dict[str, Any],
+    ) -> None:
+        if not isinstance(metadata, dict):
+            return
+        changed = False
+        with self.context._lock:
+            for field_name, metadata_key in (
+                ("task_id", "task_id"),
+                ("workspace", "workspace"),
+            ):
+                value = metadata.get(metadata_key)
+                if value is not None and str(value).strip():
+                    if field_name != "task_id" or not record.task_id:
+                        setattr(record, field_name, str(value))
+                        changed = True
+            session_value = metadata.get("hermes_session_id") or metadata.get("session_id")
+            if session_value is not None and str(session_value).strip():
+                record.session_id = str(session_value)
+                changed = True
+            isolation = metadata.get("isolation")
+            if isolation is not None:
+                record.workspace_ownership = (
+                    "workflow-owned" if str(isolation) == "worktree" else str(isolation)
+                )
+                changed = True
+        if changed:
+            self.context.journal_handle(record)
+
+    def _options_from_handle(
+        self,
+        record: AgentHandleRecord,
+        *,
+        reuse_workspace: bool = False,
+    ) -> dict[str, Any]:
+        route = record.route
+        opts: dict[str, Any] = {
+            "provider": route.get("provider"),
+            "model": route.get("model"),
+            "maxTurns": route.get("maxTurns"),
+            "reasoningEffort": route.get("reasoningEffort"),
+        }
+        if record.tools.get("toolsets_explicit"):
+            opts["toolsets"] = list(record.tools.get("toolsets") or [])
+        if record.tools.get("allowed_tools_explicit"):
+            opts["allowedTools"] = list(record.tools.get("allowed_tools") or [])
+        if record.tools.get("disallowed_tools"):
+            opts["disallowedTools"] = list(record.tools.get("disallowed_tools") or [])
+        if route.get("isolation") is not None and not reuse_workspace:
+            opts["isolation"] = route["isolation"]
+        if route.get("agentType") is not None:
+            opts["agentType"] = route["agentType"]
+        if record.schema is not None:
+            opts["schema"] = dict(record.schema)
+        return opts
+
+    def _required_workspace(self, record: AgentHandleRecord) -> str:
+        workspace = str(record.workspace or "").strip()
+        if not workspace or not Path(workspace).is_dir():
+            raise WorkflowRuntimeError(
+                f"agent handle {record.handle} workspace is missing or unavailable"
+            )
+        return workspace
+
+    def _stable_history(self, session_id: str) -> list[dict[str, Any]]:
+        reader = SessionTranscriptReader()
+        try:
+            return reader.stable_messages(session_id)
+        except Exception as exc:
+            raise WorkflowRuntimeError(
+                f"could not read stable transcript for Hermes session {session_id}: {exc}"
+            ) from exc
+        finally:
+            reader.close()
+
+    async def _run_handle(
+        self,
+        handle: AgentHandleRecord,
+        prompt: str,
+        opts: dict[str, Any],
+        *,
+        conversation_history: list[dict[str, Any]] | None = None,
+        cwd: str | None = None,
+        reuse_workspace: bool = False,
+    ) -> Any:
+        self._set_handle_state(handle, "running")
+        try:
+            result = await asyncio.to_thread(
+                self._agent_sync,
+                prompt,
+                opts,
+                handle,
+                conversation_history,
+                cwd,
+                reuse_workspace,
+            )
+        except asyncio.CancelledError as exc:
+            state = "stopped" if handle.state == "stopping" else "interrupted"
+            self._finish_handle(handle, state, error=f"agent turn was {state}")
+            raise exc
+        except ChildAgentSkipped as exc:
+            if handle.state == "stopping":
+                self._finish_handle(handle, "stopped", error="agent turn was stopped")
+                return None
+            self._finish_handle(handle, "failed", error=f"{type(exc).__name__}: {exc}")
+            raise
+        except WorkflowHalt as exc:
+            self._finish_handle(handle, "interrupted", error=f"{type(exc).__name__}: {exc}")
+            raise
+        except BaseException as exc:
+            self._finish_handle(handle, "failed", error=f"{type(exc).__name__}: {exc}")
+            raise
+        else:
+            if handle.state == "stopping":
+                self._finish_handle(handle, "stopped", error="agent turn was stopped")
+                return None
+            self._finish_handle(handle, "completed", result=result)
+            return result
+
+    def _agent_sync(
+        self,
+        prompt: str,
+        opts: dict[str, Any] | None = None,
+        handle: AgentHandleRecord | None = None,
+        conversation_history: list[dict[str, Any]] | None = None,
+        cwd: str | None = None,
+        reuse_workspace: bool = False,
+    ) -> Any:
         self._check_deadline()
         opts = opts or {}
         if not isinstance(prompt, str) or not prompt.strip():
@@ -139,16 +558,29 @@ class WorkflowAPI:
         phase_name = str(opts.get("phase") or self.frame.current_phase or "") or None
         resolved = _resolve_agent_spec(
             opts,
-            cwd=self.frame.cwd,
+            cwd=cwd or self.frame.cwd,
             config=self.config,
             structured_output=schema is not None,
             runtime_agents=_runtime_agent_specs(self.frame.meta),
         )
+        if reuse_workspace and handle is not None:
+            resolved = replace(
+                resolved,
+                isolation=None,
+                workspace=str(Path(cwd or self.frame.cwd).expanduser().resolve()),
+            )
         for warning in resolved.warnings:
             self.log(f"⚠️ {warning}")
 
+        if handle is not None:
+            self._apply_resolved_handle_contract(handle, resolved, schema, cwd or self.frame.cwd)
+
         with self._lock:
             agent_id = self.context.reserve_agent()
+            if handle is not None:
+                with self.context._lock:
+                    handle.agent_id = agent_id
+                self.context.journal_handle(handle)
             label = str(opts.get("label") or f"agent-{agent_id}")
             record = AgentRecord(
                 id=agent_id,
@@ -200,11 +632,15 @@ class WorkflowAPI:
 
         def on_child_start(metadata: dict[str, Any]) -> None:
             _apply_child_metadata(record, metadata)
+            if handle is not None:
+                self._apply_handle_metadata(handle, metadata)
             self._notify()
 
         def on_child_update(metadata: dict[str, Any]) -> None:
             with self._lock:
                 _apply_child_metadata(record, metadata)
+                if handle is not None:
+                    self._apply_handle_metadata(handle, metadata)
                 activity = metadata.get("activity") if isinstance(metadata, dict) else None
                 if activity:
                     self._journal(
@@ -236,13 +672,20 @@ class WorkflowAPI:
             schema=schema,
             agent_type=resolved.agent_type_name,
             isolation=resolved.isolation,
-            cwd=self.frame.cwd,
+            cwd=cwd or self.frame.cwd,
             structured_tool=bool(schema),
             on_start=on_child_start,
             on_update=on_child_update,
             resolved=resolved,
             max_turns=resolved.max_turns,
             reasoning_effort=resolved.reasoning_effort,
+            handle_id=handle.handle if handle is not None else None,
+            lineage_id=handle.lineage_id if handle is not None else None,
+            parent_handle_id=handle.parent_handle_id if handle is not None else None,
+            session_id=handle.session_id if handle is not None else None,
+            parent_session_id=handle.parent_session_id if handle is not None else None,
+            conversation_history=conversation_history,
+            workspace_ownership=handle.workspace_ownership if handle is not None else None,
         )
         if schema:
             record.structured = {
