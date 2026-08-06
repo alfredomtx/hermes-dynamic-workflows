@@ -54,8 +54,7 @@ plugins:
         max_concurrency: 16           # 同時実行数のハードキャップ
         max_agents: 1000              # 1 回の実行あたりのエージェント総数の上限（暴走防止）
         max_turns: 150                # agent() が maxTurns を省略した場合のデフォルト論理ターン数（HERMES_DYNAMIC_WORKFLOWS_MAX_TURNS、1..1000 に制限）
-        max_tool_calls: 200             # agent() が maxToolCalls を省略した場合の子エージェントのデフォルト tool call 数（HERMES_DYNAMIC_WORKFLOWS_MAX_TOOL_CALLS、1..10000 に制限）
-        max_tool_output_chars: 2000000  # agent() が maxToolOutputChars を省略した場合の子エージェントのデフォルト出力文字数（HERMES_DYNAMIC_WORKFLOWS_MAX_TOOL_OUTPUT_CHARS、1..20000000 に制限）
+
         max_nesting_depth: 2          # workflow() の最大ネスト深度（ルート + N 階層）。実行全体の上限は全階層に適用される
         workflow_timeout_seconds: 900 # 実行全体のウォールクロックタイムアウト（一時停止時間を除く）
         child_timeout_seconds: 300    # 単一の子エージェントのタイムアウト
@@ -126,18 +125,17 @@ meta = {
 # (pipeline にはバリアがない: B がまだ review にいる間に A は verify にいられる)
 findings = await pipeline(
     args["targets"],
-    lambda t, _o, i: agent(f"バグをレビュー: {t}", {"label": f"review:{i}", "phase": "Review", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 8, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
-    lambda r, _o, i: agent(f"敵対的に検証: {json.dumps(r)}", {"label": f"verify:{i}", "phase": "Verify", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 8, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
+    lambda t, _o, i: agent(f"バグをレビュー: {t}", {"label": f"review:{i}", "phase": "Review", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "xhigh", "maxTurns": 8}),
+    lambda r, _o, i: agent(f"敵対的に検証: {json.dumps(r)}", {"label": f"verify:{i}", "phase": "Verify", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "xhigh", "maxTurns": 8}),
 )
-return await agent("検証済みの結果を統合する:\n" + json.dumps(findings), {"provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 6, "maxToolCalls": 8, "maxToolOutputChars": 120000})
+return await agent("検証済みの結果を統合する:\n" + json.dumps(findings), {"provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "xhigh", "maxTurns": 6})
 ```
 
 - `agent(prompt, opts)` は子エージェントを起動します。各呼び出しでは `provider`、正規の `model`、
-  `reasoningEffort` をインラインで必ず指定します。`maxTurns`、`maxToolCalls`、`maxToolOutputChars` は省略可能で、
-  省略時はプラグイン設定の `max_turns`（150）、`max_tool_calls`（200）、`max_tool_output_chars`（2000000）から解決され、
-  それぞれのハード上限内に制限されます。明示的なインライン値は設定されたデフォルトを上書きします。形式不正または
-  明示的／設定値の無効な予算は、エージェントの予約・起動前に失敗します。解決済みの予算はレジュームキャッシュの
-  識別子にも含まれます。preset はロール指示とツール権限だけを定義し、ルーティングや予算を提供できません。Bedrock と `codex_app_server` は workflow reasoning effort を転送しないため、子エージェント起動前に失敗します。
+  `reasoningEffort` をインラインで必ず指定します。`maxTurns` は省略可能で、省略時はプラグイン設定の
+  `max_turns`（150）から解決され、明示的なインライン値はそのデフォルトを上書きします。形式不正または
+  明示的な無効値は、エージェントの予約・起動前に失敗します。tool call 数と tool output 文字数は観測用の
+  テレメトリのみであり、子エージェントのハード上限ではありません。preset はルーティングや予算を提供しません。
 - `pipeline`（デフォルト、バリアなし）／`parallel`（バリアあり）が並行処理を扱います。
   `phase`／`log` は進捗を報告し、`workflow()` は名前付きワークフローをインラインで実行し、`args` /
   `budget` は入力引数とトークン予算にアクセスします。
@@ -170,8 +168,8 @@ meta = {
     },
 }
 
-findings = await agent("Review diff", {"agentType": "read-only-reviewer", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 8, "maxToolCalls": 16, "maxToolOutputChars": 200000})
-return await agent("Synthesize: " + json.dumps(findings), {"agentType": "synthesizer", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 6, "maxToolCalls": 8, "maxToolOutputChars": 120000})
+findings = await agent("Review diff", {"agentType": "read-only-reviewer", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "xhigh", "maxTurns": 8})
+return await agent("Synthesize: " + json.dumps(findings), {"agentType": "synthesizer", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "xhigh", "maxTurns": 6})
 ```
 
 解決順序は `meta["agents"]` → project `.hermes/dynamic-workflows/agents` → user `~/.hermes/dynamic-workflows/agents` → plugin built-ins です。明示された `agentType` が見つからない場合はデフォルトでエラーです。`missing_agent_type_policy: fallback_warn` なら警告を記録して `general-purpose` にフォールバックします。`toolsets` 省略は継承、`toolsets: []` はツールなし、inline/runtime の `toolsets` は discoverable MCP/plugin toolsets で拡張されません。`allowedTools` は preset と交差し、空リストは通常ツールを拒否します。

@@ -608,7 +608,7 @@ return "ok"
 meta = {"name": "budget-warning", "description": "Budget warning", "phases": ["Inspect", "Synthesize"]}
 
 phase("Inspect")
-return await agent("inspect", {"label": "hunter", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 20, "maxToolCalls": 16, "maxToolOutputChars": 200000})
+return await agent("inspect", {"label": "hunter", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 20})
 """
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -633,7 +633,7 @@ return await agent("inspect", {"label": "hunter", "provider": "openai-codex", "m
         script = """
 meta = {"name": "skip-one", "description": "Test workflow"}
 
-return await agent("wait", {"label": "worker", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
+return await agent("wait", {"label": "worker", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10})
 """
         runner = SkipAwareRunner()
         with tempfile.TemporaryDirectory() as tmp:
@@ -658,7 +658,7 @@ return await agent("wait", {"label": "worker", "provider": "openai-codex", "mode
         script = """
 meta = {"name": "from-path", "description": "Test workflow"}
 
-return await agent("work", {"label": "path-agent", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000})
+return await agent("work", {"label": "path-agent", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10})
 """
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -746,8 +746,8 @@ return args
 meta = {"name": "resume", "description": "Test workflow"}
 
 return [
-    await agent("a", {"label": "a", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
-    await agent("b", {"label": "b", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
+    await agent("a", {"label": "a", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10}),
+    await agent("b", {"label": "b", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10}),
 ]
 """
         with tempfile.TemporaryDirectory() as tmp:
@@ -775,7 +775,7 @@ return await agent(
         "label": "json",
         "provider": "openai-codex",
         "model": "gpt-5.6-luna",
-        "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000,
+        "reasoningEffort": "medium", "maxTurns": 10,
         "schema": {"type": "object", "required": ["ok", "label"]},
     },
 )
@@ -822,10 +822,8 @@ return await agent("inspect metadata", {
     "agentType": "researcher",
     "provider": "openai-codex",
     "model": "gpt-5.6-luna",
-    "reasoningEffort": "high",
+    "reasoningEffort": "xhigh",
     "maxTurns": 10,
-    "maxToolCalls": 16,
-    "maxToolOutputChars": 200000,
 })
 """
         with tempfile.TemporaryDirectory() as tmp:
@@ -871,9 +869,9 @@ return await agent("inspect metadata", {
 meta = {"name": "parallel-resume", "description": "Test workflow"}
 
 return await parallel([
-    lambda: agent("alpha", {"label": "a", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
-    lambda: agent("beta", {"label": "b", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
-    lambda: agent("gamma", {"label": "c", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
+    lambda: agent("alpha", {"label": "a", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10}),
+    lambda: agent("beta", {"label": "b", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10}),
+    lambda: agent("gamma", {"label": "c", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10}),
 ])
 """
         runner = RecordingRunner()
@@ -906,13 +904,13 @@ await agent("a", {
     "label": "a",
     "provider": "openai-codex",
     "model": "gpt-5.6-luna",
-    "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000,
+    "reasoningEffort": "medium", "maxTurns": 10,
 })
 return await agent("b", {
     "label": "b",
     "provider": "openai-codex",
     "model": "gpt-5.6-luna",
-    "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000,
+    "reasoningEffort": "medium", "maxTurns": 10,
 })
 """
         with tempfile.TemporaryDirectory() as tmp:
@@ -939,8 +937,8 @@ return await agent("b", {
 meta = {"name": "all-fail", "description": "Test workflow"}
 
 return await parallel([
-    lambda: agent("a", {"label": "a", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
-    lambda: agent("b", {"label": "b", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
+    lambda: agent("a", {"label": "a", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10}),
+    lambda: agent("b", {"label": "b", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10}),
 ])
 """
         with tempfile.TemporaryDirectory() as tmp:
@@ -962,8 +960,8 @@ return await parallel([
 meta = {"name": "partial", "description": "Test workflow"}
 
 return await parallel([
-    lambda: agent("a", {"label": "a", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
-    lambda: agent("b", {"label": "b", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
+    lambda: agent("a", {"label": "a", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10}),
+    lambda: agent("b", {"label": "b", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium", "maxTurns": 10}),
 ])
 """
         with tempfile.TemporaryDirectory() as tmp:
@@ -988,7 +986,7 @@ return await agent("do it", {
     "label": "worker",
     "provider": "openai-codex",
     "model": "gpt-5.6-luna",
-    "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000,
+    "reasoningEffort": "medium", "maxTurns": 10,
 })
 """
         ctx = RecordingCtx()
@@ -1025,7 +1023,7 @@ return await agent("do it", {
     "label": "worker",
     "provider": "openai-codex",
     "model": "gpt-5.6-luna",
-    "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000,
+    "reasoningEffort": "medium", "maxTurns": 10,
 })
 """
 
@@ -1113,7 +1111,7 @@ return await agent("do it", {
     "label": "worker",
     "provider": "openai-codex",
     "model": "gpt-5.6-luna",
-    "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000,
+    "reasoningEffort": "medium", "maxTurns": 10,
 })
 """
 
@@ -1197,7 +1195,7 @@ return await agent("do it", {
     "label": "worker",
     "provider": "openai-codex",
     "model": "gpt-5.6-luna",
-    "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000,
+    "reasoningEffort": "medium", "maxTurns": 10,
 })
 """
 
@@ -1316,7 +1314,7 @@ return await agent("do it", {
     "label": "worker",
     "provider": "openai-codex",
     "model": "gpt-5.6-luna",
-    "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000,
+    "reasoningEffort": "medium", "maxTurns": 10,
 })
 """
 
@@ -1425,7 +1423,7 @@ return await agent("do it", {
     "label": "worker",
     "provider": "openai-codex",
     "model": "gpt-5.6-luna",
-    "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000,
+    "reasoningEffort": "medium", "maxTurns": 10,
 })
 """
 
@@ -1530,7 +1528,7 @@ return await agent("do it", {
     "label": "worker",
     "provider": "openai-codex",
     "model": "gpt-5.6-luna",
-    "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000,
+    "reasoningEffort": "medium", "maxTurns": 10,
 })
 """
 
@@ -1631,7 +1629,7 @@ return await agent("do it", {
     "label": "worker",
     "provider": "openai-codex",
     "model": "gpt-5.6-luna",
-    "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000,
+    "reasoningEffort": "medium", "maxTurns": 10,
 })
 """
 
@@ -1743,7 +1741,7 @@ return await agent("do it", {
     "label": "worker",
     "provider": "openai-codex",
     "model": "gpt-5.6-luna",
-    "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000,
+    "reasoningEffort": "medium", "maxTurns": 10,
 })
 """
 
@@ -1894,7 +1892,7 @@ return await agent("do it", {
     "label": "worker",
     "provider": "openai-codex",
     "model": "gpt-5.6-luna",
-    "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000,
+    "reasoningEffort": "medium", "maxTurns": 10,
 })
 """
         runner = LiveTranscriptRunner()
@@ -2324,7 +2322,7 @@ return await agent("do it", {
     "label": "worker",
     "provider": "openai-codex",
     "model": "gpt-5.6-luna",
-    "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000,
+    "reasoningEffort": "medium", "maxTurns": 10,
 })
 """
         db = IncrementalTestDB()
@@ -2377,7 +2375,7 @@ return await agent("do it", {
     "label": "worker",
     "provider": "openai-codex",
     "model": "gpt-5.6-luna",
-    "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000,
+    "reasoningEffort": "medium", "maxTurns": 10,
 })
 """
         with tempfile.TemporaryDirectory() as tmp:
@@ -2426,7 +2424,7 @@ return await agent("do it", {
     "label": "worker",
     "provider": "openai-codex",
     "model": "gpt-5.6-luna",
-    "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000,
+    "reasoningEffort": "medium", "maxTurns": 10,
 })
 """
         ctx = RecordingCtx()
@@ -2452,7 +2450,7 @@ return await agent("do it", {
     "label": "worker",
     "provider": "openai-codex",
     "model": "gpt-5.6-luna",
-    "reasoningEffort": "medium", "maxTurns": 10, "maxToolCalls": 16, "maxToolOutputChars": 200000,
+    "reasoningEffort": "medium", "maxTurns": 10,
 })
 """
         ctx = RecordingCtx(fail=True)  # inject_message raises (e.g. gateway/edge)

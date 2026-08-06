@@ -310,10 +310,6 @@ def _reject_routing_fields(data: dict[str, Any], *, source: str) -> None:
         "agentType",
         "maxTurns",
         "max_turns",
-        "maxToolCalls",
-        "max_tool_calls",
-        "maxToolOutputChars",
-        "max_tool_output_chars",
     ):
         if key in data:
             raise ValueError(f"{source} {key} is not supported; set it inline on agent()")

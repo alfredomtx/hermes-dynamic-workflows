@@ -162,8 +162,6 @@ class WorkflowAPI:
                 model=resolved.model,
                 reasoning_effort=resolved.reasoning_effort,
                 max_turns=resolved.max_turns,
-                max_tool_calls=resolved.max_tool_calls,
-                max_tool_output_chars=resolved.max_tool_output_chars,
             )
             active_topology = _active_topology(self.frame)
             if active_topology is not None:
@@ -244,8 +242,6 @@ class WorkflowAPI:
             on_update=on_child_update,
             resolved=resolved,
             max_turns=resolved.max_turns,
-            max_tool_calls=resolved.max_tool_calls,
-            max_tool_output_chars=resolved.max_tool_output_chars,
             reasoning_effort=resolved.reasoning_effort,
         )
         if schema:
@@ -695,8 +691,6 @@ _PUBLIC_AGENT_OPT_KEYS = frozenset(
         "system_prompt",
         "description",
         "maxTurns",
-        "maxToolCalls",
-        "maxToolOutputChars",
         "reasoningEffort",
     }
 )
@@ -898,7 +892,7 @@ def _validate_agent_opts(opts: dict[str, Any]) -> None:
             + ", ".join(unknown)
             + ". Public workflow agent options are label, phase, schema, provider, model, "
             "isolation, agentType, toolsets, allowedTools, disallowedTools, "
-            "instructions, systemPrompt, maxTurns, maxToolCalls, maxToolOutputChars, "
+            "instructions, systemPrompt, maxTurns, "
             "and reasoningEffort. Runtime, timeout, and retry policy belong in "
             "Hermes/plugin configuration, not workflow scripts."
         )
@@ -931,14 +925,12 @@ def _validate_agent_opts(opts: dict[str, Any]) -> None:
         )
     if effort is None:
         raise WorkflowRuntimeError("agent() reasoningEffort is required")
+    if model.lower() == "gpt-5.6-luna" and effort == "high":
+        raise WorkflowRuntimeError(
+            "gpt-5.6-luna reasoningEffort must be xhigh or max; high is not supported"
+        )
     if "maxTurns" in opts:
         _required_limit(opts, "maxTurns", 1000)
-    for key, upper in (
-        ("maxToolCalls", 10000),
-        ("maxToolOutputChars", 20_000_000),
-    ):
-        if key in opts:
-            _required_limit(opts, key, upper)
 
 
 def _required_limit(opts: dict[str, Any], key: str, upper: int) -> int:
@@ -957,20 +949,6 @@ def _resolve_max_turns(opts: dict[str, Any], config: Any) -> int:
         return _required_limit(opts, "maxTurns", 1000)
     configured = getattr(config, "max_turns", 150)
     return _required_limit({"maxTurns": configured}, "maxTurns", 1000)
-
-
-def _resolve_tool_budget(
-    opts: dict[str, Any],
-    key: str,
-    config: Any,
-    config_attr: str,
-    default: int,
-    upper: int,
-) -> int:
-    if key in opts:
-        return _required_limit(opts, key, upper)
-    configured = getattr(config, config_attr, default)
-    return _required_limit({key: configured}, key, upper)
 
 
 def _check_vm_array_length(items: list[Any]) -> None:
@@ -1095,22 +1073,6 @@ def _resolve_agent_spec(
     )
     provider = str(opts["provider"]).strip()
     model = str(opts["model"]).strip()
-    max_tool_calls = _resolve_tool_budget(
-        opts,
-        "maxToolCalls",
-        config,
-        "max_tool_calls",
-        200,
-        10_000,
-    )
-    max_tool_output_chars = _resolve_tool_budget(
-        opts,
-        "maxToolOutputChars",
-        config,
-        "max_tool_output_chars",
-        2_000_000,
-        20_000_000,
-    )
     _prepare_mcp_tool_registry(config)
     has_inline_or_meta_tool_surface = _has_inline_tool_surface(opts) or (
         not explicit_type
@@ -1148,8 +1110,6 @@ def _resolve_agent_spec(
         workspace=str(Path(cwd).expanduser().resolve()),
         warnings=tuple(warnings),
         max_turns=max_turns,
-        max_tool_calls=max_tool_calls,
-        max_tool_output_chars=max_tool_output_chars,
         reasoning_effort=reasoning_effort,
     )
 

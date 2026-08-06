@@ -8,8 +8,6 @@ from typing import Any
 
 _BUDGET_LIMITS = (
     ("maxTurns", 20),
-    ("maxToolCalls", 20),
-    ("maxToolOutputChars", 200_000),
 )
 _NARROW_TOOLSETS = frozenset({"file", "web"})
 _TOOLSET_KEYS = ("toolsets",)

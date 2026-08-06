@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib
 import inspect
 import os
 import re
@@ -164,18 +163,14 @@ class HermesChildAgentRunner(ChildAgentRunner):
             or not (request.provider or "").strip()
             or not (request.model or "").strip()
             or request.max_turns is None
-            or request.max_tool_calls is None
-            or request.max_tool_output_chars is None
         ):
             raise ChildAgentError(
-                "workflow child request is missing validated explicit provider, model, reasoning effort, or child budgets"
+                "workflow child request is missing validated explicit provider, model, reasoning effort, or maxTurns"
             )
         if (
             request.provider != resolved.provider
             or request.model != resolved.model
             or request.max_turns != resolved.max_turns
-            or request.max_tool_calls != resolved.max_tool_calls
-            or request.max_tool_output_chars != resolved.max_tool_output_chars
         ):
             raise ChildAgentError("workflow child routing or budgets do not match its resolved specification")
         agent_type = resolved.agent_type_spec
@@ -395,17 +390,6 @@ class HermesChildAgentRunner(ChildAgentRunner):
             kwargs["service_tier"] = runtime["service_tier"]
         if request.max_turns is not None:
             kwargs["max_iterations"] = request.max_turns
-        if request.max_tool_calls is not None and request.max_tool_output_chars is not None:
-            try:
-                ToolBudget = importlib.import_module("agent.tool_budget").ToolBudget
-            except Exception as exc:
-                raise ChildAgentError(
-                    "Hermes core does not support workflow child tool budgets"
-                ) from exc
-            kwargs["tool_budget"] = ToolBudget(
-                max_calls=request.max_tool_calls,
-                max_output_chars=request.max_tool_output_chars,
-            )
         child = AIAgent(**kwargs)
         if request.max_turns is not None:
             # A capped child cannot spend an unreported provider call after its final turn.
@@ -514,15 +498,6 @@ class HermesChildAgentRunner(ChildAgentRunner):
                     metadata["approval"] = dict(event)
             _emit_request_update(request, metadata)
 
-        def _record_core_budget_stop_reason(core_budget: Any) -> None:
-            if not isinstance(core_budget, dict) or not core_budget.get("exhausted"):
-                return
-            latest["stop_reason"] = (
-                "maxToolOutputChars"
-                if core_budget.get("exhaustion_reason") == "max_output_chars"
-                else "maxToolCalls"
-            )
-
         interactive_callback = self._approval_coordinator.callback_for(
             lease.task_id,
             _emit_progress,
@@ -578,10 +553,6 @@ class HermesChildAgentRunner(ChildAgentRunner):
                 remaining_turns = request.max_turns
                 tool_calls_used = 0
                 tool_output_chars_used = 0
-                tool_call_limit = request.max_tool_calls
-                tool_output_limit = request.max_tool_output_chars
-                if tool_call_limit is None or tool_output_limit is None:
-                    raise ChildAgentError("workflow child request is missing child budgets")
                 while True:
                     if remaining_turns is not None:
                         child.max_iterations = remaining_turns
@@ -609,30 +580,6 @@ class HermesChildAgentRunner(ChildAgentRunner):
                     latest["tool_calls"] = tool_calls_used
                     latest["tool_output_chars"] = tool_output_chars_used
                     _emit_request_update(request, usage)
-                    if tool_calls_used > tool_call_limit:
-                        latest["stop_reason"] = "maxToolCalls"
-                        _emit_request_update(
-                            request,
-                            {
-                                **usage,
-                                "stop_reason": "maxToolCalls",
-                            },
-                        )
-                        raise ChildAgentError(
-                            f"child exhausted maxToolCalls={tool_call_limit}"
-                        )
-                    if tool_output_chars_used > tool_output_limit:
-                        latest["stop_reason"] = "maxToolOutputChars"
-                        _emit_request_update(
-                            request,
-                            {
-                                **usage,
-                                "stop_reason": "maxToolOutputChars",
-                            },
-                        )
-                        raise ChildAgentError(
-                            f"child exhausted maxToolOutputChars={tool_output_limit}"
-                        )
                     if isinstance(result, dict):
                         result["_workflow_tool_calls"] = tool_calls_used
                         result["_workflow_tool_output_chars"] = tool_output_chars_used
@@ -640,12 +587,6 @@ class HermesChildAgentRunner(ChildAgentRunner):
                         request.max_turns is not None and _capped_child_exhausted(result)
                     )
                     if not request.structured_tool:
-                        _record_core_budget_stop_reason(core_budget)
-                        _raise_for_core_tool_budget_exhaustion(
-                            core_budget,
-                            tool_call_limit,
-                            tool_output_limit,
-                        )
                         if capped_exhaustion:
                             latest["stop_reason"] = "maxTurns"
                             raise ChildAgentError(
@@ -664,12 +605,6 @@ class HermesChildAgentRunner(ChildAgentRunner):
                     captured, _value, tool_attempts = peek_result(lease.task_id)
                     if captured:
                         return result
-                    _record_core_budget_stop_reason(core_budget)
-                    _raise_for_core_tool_budget_exhaustion(
-                        core_budget,
-                        tool_call_limit,
-                        tool_output_limit,
-                    )
                     if capped_exhaustion or (
                         remaining_turns is not None and remaining_turns <= 0
                     ):
@@ -698,30 +633,6 @@ class HermesChildAgentRunner(ChildAgentRunner):
                             "child was interrupted before providing structured output"
                         )
 
-                    if tool_calls_used >= tool_call_limit:
-                        latest["stop_reason"] = "maxToolCalls"
-                        _emit_request_update(
-                            request,
-                            {
-                                **usage,
-                                "stop_reason": "maxToolCalls",
-                            },
-                        )
-                        raise ChildAgentError(
-                            f"child exhausted maxToolCalls={tool_call_limit}"
-                        )
-                    if tool_output_chars_used >= tool_output_limit:
-                        latest["stop_reason"] = "maxToolOutputChars"
-                        _emit_request_update(
-                            request,
-                            {
-                                **usage,
-                                "stop_reason": "maxToolOutputChars",
-                            },
-                        )
-                        raise ChildAgentError(
-                            f"child exhausted maxToolOutputChars={tool_output_limit}"
-                        )
                     stop_attempts += 1
                     if (
                         tool_attempts >= MAX_STRUCTURED_OUTPUT_RETRIES
@@ -1532,21 +1443,6 @@ def _nonnegative_int(value: Any) -> int:
         return max(0, int(value))
     except (TypeError, ValueError):
         return 0
-
-
-def _raise_for_core_tool_budget_exhaustion(
-    core_budget: Any,
-    tool_call_limit: int,
-    tool_output_limit: int,
-) -> None:
-    if not isinstance(core_budget, dict) or not core_budget.get("exhausted"):
-        return
-    reason = core_budget.get("exhaustion_reason")
-    if reason == "max_output_chars":
-        raise ChildAgentError(
-            f"child exhausted maxToolOutputChars={tool_output_limit}"
-        )
-    raise ChildAgentError(f"child exhausted maxToolCalls={tool_call_limit}")
 
 
 def _incremental_result(

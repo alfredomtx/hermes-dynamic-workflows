@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 import json
 import sys
 import os
@@ -550,8 +549,6 @@ class ChildAgentTests(unittest.TestCase):
             phase=None,
             toolsets=[],
             max_turns=10,
-            max_tool_calls=16,
-            max_tool_output_chars=200000,
         )
         spec = AgentTypeSpec(
             name="planner",
@@ -1039,8 +1036,6 @@ class StructuredOutputRunnerFailureTests(unittest.TestCase):
                 schema={"type": "object"},
                 structured_tool=True,
                 max_turns=10,
-                max_tool_calls=16,
-                max_tool_output_chars=200000,
             )
             lease = WorkspaceLease(task_id="workflow-test", cwd=tmp)
 
@@ -1206,8 +1201,6 @@ class ToolCallCountTests(unittest.TestCase):
             phase=None,
             toolsets=[],
             max_turns=10,
-            max_tool_calls=16,
-            max_tool_output_chars=200000,
         )
         lease = WorkspaceLease(task_id="workflow-abc123", cwd="/tmp")
         callback = runner._make_tool_progress_callback(request, lease)
@@ -1361,8 +1354,6 @@ class StructuredOutputContinuationTests(unittest.TestCase):
             phase=None,
             toolsets=[],
             max_turns=10,
-            max_tool_calls=16,
-            max_tool_output_chars=200000,
         )
         lease = WorkspaceLease(task_id="approval-session-child", cwd="/tmp")
         runner = HermesChildAgentRunner(
@@ -1398,8 +1389,6 @@ class StructuredOutputContinuationTests(unittest.TestCase):
             schema=schema,
             structured_tool=True,
             max_turns=10,
-            max_tool_calls=16,
-            max_tool_output_chars=200000,
         )
         lease = WorkspaceLease(task_id="structured-child", cwd="/tmp")
 
@@ -1457,8 +1446,6 @@ class StructuredOutputContinuationTests(unittest.TestCase):
             schema=schema,
             structured_tool=True,
             max_turns=10,
-            max_tool_calls=16,
-            max_tool_output_chars=200000,
         )
         lease = WorkspaceLease(task_id="structured-child-fail", cwd="/tmp")
 
@@ -1507,7 +1494,7 @@ class ReasoningEffortRunnerTests(unittest.TestCase):
         ) as resolve_runtime:
             with self.assertRaisesRegex(
                 ChildAgentError,
-                "explicit provider, model, reasoning effort, or child budgets",
+                "explicit provider, model, reasoning effort, or maxTurns",
             ):
                 runner.run(request)
 
@@ -1594,8 +1581,6 @@ class MaxTurnsRunnerTests(unittest.TestCase):
         max_turns: int = 2,
         *,
         structured=True,
-        max_tool_calls: int = 16,
-        max_tool_output_chars: int = 200000,
     ):
         agent_type = AgentTypeSpec(
             name="general-purpose",
@@ -1613,8 +1598,6 @@ class MaxTurnsRunnerTests(unittest.TestCase):
             schema={"type": "object"} if structured else None,
             structured_tool=structured,
             max_turns=max_turns,
-            max_tool_calls=max_tool_calls,
-            max_tool_output_chars=max_tool_output_chars,
             resolved=ResolvedAgentSpec(
                 requested_agent_type="general-purpose",
                 agent_type_spec=agent_type,
@@ -1622,8 +1605,6 @@ class MaxTurnsRunnerTests(unittest.TestCase):
                 model="gpt-5.6-luna",
                 reasoning_effort="high",
                 max_turns=max_turns,
-                max_tool_calls=max_tool_calls,
-                max_tool_output_chars=max_tool_output_chars,
             ),
             reasoning_effort="high",
         )
@@ -1769,34 +1750,6 @@ class MaxTurnsRunnerTests(unittest.TestCase):
         self._run_structured(child, self._request(2), task_id)
         self.assertEqual(child.caps, [2, 2])
 
-    def test_does_not_continue_after_consuming_final_tool_call(self):
-        class Child:
-            session_prompt_tokens = session_completion_tokens = 0
-            session_reasoning_tokens = session_cache_read_tokens = 0
-            session_cache_write_tokens = 0
-            model = "test"
-
-            def __init__(self):
-                self.calls = 0
-
-            def run_conversation(self, **_):
-                self.calls += 1
-                return {
-                    "final_response": "done",
-                    "messages": [
-                        {"role": "assistant", "tool_calls": [{"id": "one"}]},
-                        {"role": "tool", "content": "x"},
-                    ],
-                    "completed": True,
-                    "api_calls": 1,
-                }
-
-        child = Child()
-        request = self._request(3, max_tool_calls=1)
-        with self.assertRaisesRegex(ChildAgentError, "maxToolCalls=1"):
-            self._run_structured(child, request, "structured-tool-limit")
-        self.assertEqual(child.calls, 1)
-
     def test_failed_structured_child_emits_terminal_token_metadata(self):
         events = []
 
@@ -1821,13 +1774,13 @@ class MaxTurnsRunnerTests(unittest.TestCase):
                 }
 
         request = replace(
-            self._request(3, max_tool_calls=1),
+            self._request(3),
             on_update=events.append,
         )
         lease = WorkspaceLease(task_id="structured-failed-metadata", cwd="/tmp")
         register_expectation(lease.task_id, request.schema or {})
         try:
-            with self.assertRaisesRegex(ChildAgentError, "maxToolCalls=1"):
+            with self.assertRaisesRegex(ChildAgentError, "maxTurns=3"):
                 HermesChildAgentRunner(PluginConfig())._run_child_with_timeout(
                     Child(), request, lease, None, ["workflow_structured"]
                 )
@@ -1842,32 +1795,7 @@ class MaxTurnsRunnerTests(unittest.TestCase):
         self.assertEqual(terminal["cache_read_tokens"], 30)
         self.assertEqual(terminal["cache_write_tokens"], 4)
         self.assertEqual(terminal["tool_calls"], 1)
-        self.assertEqual(terminal["stop_reason"], "maxToolCalls")
-
-    def test_does_not_continue_after_consuming_output_character_budget(self):
-        class Child:
-            session_prompt_tokens = session_completion_tokens = 0
-            session_reasoning_tokens = session_cache_read_tokens = 0
-            session_cache_write_tokens = 0
-            model = "test"
-
-            def __init__(self):
-                self.calls = 0
-
-            def run_conversation(self, **_):
-                self.calls += 1
-                return {
-                    "final_response": "done",
-                    "messages": [{"role": "tool", "content": "four"}],
-                    "completed": True,
-                    "api_calls": 1,
-                }
-
-        child = Child()
-        request = self._request(3, max_tool_output_chars=4)
-        with self.assertRaisesRegex(ChildAgentError, "maxToolOutputChars=4"):
-            self._run_structured(child, request, "structured-output-limit")
-        self.assertEqual(child.calls, 1)
+        self.assertEqual(terminal["stop_reason"], "maxTurns")
 
     def test_continuation_history_is_counted_once(self):
         task_id = "structured-history-budget"
@@ -1906,40 +1834,12 @@ class MaxTurnsRunnerTests(unittest.TestCase):
         child = Child()
         result = self._run_structured(
             child,
-            self._request(3, max_tool_calls=2, max_tool_output_chars=8),
+            self._request(3),
             task_id,
         )
         self.assertEqual(child.calls, 2)
         self.assertEqual(result.metadata["tool_calls"], 1)
         self.assertEqual(result.metadata["tool_output_chars"], 4)
-
-    def test_core_tool_budget_exhaustion_fails_unstructured_child(self):
-        class Child:
-            session_prompt_tokens = session_completion_tokens = 0
-            session_reasoning_tokens = session_cache_read_tokens = 0
-            session_cache_write_tokens = 0
-            model = "test"
-
-            def run_conversation(self, **_kwargs):
-                return {
-                    "final_response": "Tool budget exhausted",
-                    "messages": [],
-                    "completed": False,
-                    "api_calls": 1,
-                    "tool_budget": {
-                        "calls_used": 1,
-                        "output_chars_used": 4,
-                        "exhausted": True,
-                        "exhaustion_reason": "max_calls",
-                    },
-                }
-
-        request = self._request(3, structured=False, max_tool_calls=1)
-        lease = WorkspaceLease(task_id="unstructured-tool-budget", cwd="/tmp")
-        with self.assertRaisesRegex(ChildAgentError, "maxToolCalls=1"):
-            HermesChildAgentRunner(PluginConfig())._run_child_with_timeout(
-                Child(), request, lease, None, []
-            )
 
     def test_codex_runtime_rejected_before_agent_construction(self):
         runner = HermesChildAgentRunner(PluginConfig())
@@ -2049,51 +1949,6 @@ class MaxTurnsRunnerTests(unittest.TestCase):
             )
         self.assertNotIn("max_iterations", seen[0])
         self.assertEqual(seen[1]["max_iterations"], 7)
-
-    def test_constructor_receives_shared_tool_budget(self):
-        seen = []
-
-        class FakeAIAgent:
-            def __init__(self, **kwargs):
-                seen.append(kwargs)
-
-        class FakeToolBudget:
-            def __init__(self, *, max_calls, max_output_chars):
-                self.max_calls = max_calls
-                self.max_output_chars = max_output_chars
-
-        run_agent_mod = types.ModuleType("run_agent")
-        setattr(run_agent_mod, "AIAgent", FakeAIAgent)
-        budget_mod = types.ModuleType("agent.tool_budget")
-        setattr(budget_mod, "ToolBudget", FakeToolBudget)
-        request = ChildAgentRequest(
-            1,
-            "work",
-            "budgeted",
-            None,
-            [],
-            max_turns=7,
-            max_tool_calls=3,
-            max_tool_output_chars=42,
-            reasoning_effort="high",
-        )
-
-        with patch.dict(
-            sys.modules,
-            {"run_agent": run_agent_mod, "agent.tool_budget": budget_mod},
-        ):
-            HermesChildAgentRunner(PluginConfig())._build_agent(
-                request,
-                {"model": "test-model"},
-                [],
-                WorkspaceLease(task_id="build-budgeted", cwd="/tmp"),
-                None,
-            )
-
-        budget = seen[0]["tool_budget"]
-        self.assertIsInstance(budget, FakeToolBudget)
-        self.assertEqual(budget.max_calls, 3)
-        self.assertEqual(budget.max_output_chars, 42)
 
     def test_capped_constructor_disables_core_exhaustion_summary_call(self):
         summary_calls = []
@@ -2322,100 +2177,6 @@ class ChildApprovalPolicyTests(unittest.TestCase):
         with patch.dict(sys.modules, {"tools": tools_pkg, "tools.approval": approval_mod}):
             cb = _make_child_approval_callback("inherit")
             self.assertEqual(cb("rm -rf build", "recursive delete"), "once")
-
-
-def _real_core_root() -> Path | None:
-    """Locate the Hermes checkout used by the real-core compatibility test."""
-    candidates = []
-    configured = os.environ.get("HERMES_AGENT_ROOT")
-    if configured:
-        candidates.append(Path(configured))
-    candidates.extend(Path(entry) for entry in sys.path if entry)
-    candidates.append(Path.home() / ".hermes" / "hermes-agent")
-    for root in candidates:
-        if (root / "run_agent.py").is_file() and (root / "agent" / "tool_budget.py").is_file():
-            return root.resolve()
-    return None
-
-
-def _load_real_core_types():
-    """Import AIAgent and ToolBudget from the selected Hermes checkout."""
-    root = _real_core_root()
-    if root is None:
-        raise ImportError("Hermes core checkout with run_agent.py is unavailable")
-    root_text = str(root)
-    if root_text not in sys.path:
-        sys.path.insert(0, root_text)
-    importlib.invalidate_caches()
-    from agent.tool_budget import ToolBudget
-    from run_agent import AIAgent
-
-    return AIAgent, ToolBudget
-
-
-def _real_core_tool_budget_importable() -> bool:
-    try:
-        _load_real_core_types()
-        return True
-    except Exception:
-        return False
-
-
-@unittest.skipUnless(
-    _real_core_tool_budget_importable(),
-    "Hermes core checkout with AIAgent and ToolBudget is not importable",
-)
-class RealCoreToolBudgetCompatibilityTests(unittest.TestCase):
-    """Exercise the plugin's budgeted child path with the real Hermes core.
-
-    RED provenance: before core commit feda20626d0baf1acd0247577d65ffc92935599d,
-    the same constructor call raised ``TypeError: unexpected keyword argument
-    'tool_budget'`` because the core AIAgent signature did not accept the
-    plugin's ToolBudget. The RED check uses ``HERMES_AGENT_ROOT`` to point at a
-    disposable checkout of that parent commit; it never resets the installed
-    live core checkout.
-    """
-
-    def test_budgeted_child_uses_real_core_constructor_and_stores_budget(self):
-        AIAgent, ToolBudget = _load_real_core_types()
-        request = ChildAgentRequest(
-            id=1,
-            prompt="work",
-            label="real-core-budget",
-            phase=None,
-            toolsets=[],
-            provider="openrouter",
-            model="test-model",
-            max_turns=7,
-            max_tool_calls=3,
-            max_tool_output_chars=42,
-            reasoning_effort="high",
-        )
-        runtime = {
-            "provider": "openrouter",
-            "model": "test-model",
-            "base_url": "https://openrouter.ai/api/v1",
-            "api_key": "test-key",
-            "api_mode": "chat_completions",
-        }
-
-        with (
-            patch("hermes_dynamic_workflows.child.runner._create_session_db", return_value=None),
-            patch("run_agent.get_tool_definitions", return_value=[]),
-            patch("run_agent.OpenAI"),
-        ):
-            child = HermesChildAgentRunner(PluginConfig())._build_agent(
-                request,
-                runtime,
-                [],
-                WorkspaceLease(task_id="real-core-budget", cwd="/tmp"),
-                None,
-            )
-
-        self.assertIsInstance(child, AIAgent)
-        self.assertIsInstance(child.tool_budget, ToolBudget)
-        self.assertEqual(child.tool_budget.max_calls, 3)
-        self.assertEqual(child.tool_budget.max_output_chars, 42)
 
 
 def _core_refresh_importable() -> bool:

@@ -56,8 +56,7 @@ plugins:
         max_concurrency: 16           # Hard cap on concurrency
         max_agents: 1000              # Max total agents per run (runaway guard)
         max_turns: 150                # Default logical turns when agent() omits maxTurns (HERMES_DYNAMIC_WORKFLOWS_MAX_TURNS; clamped to 1..1000)
-        max_tool_calls: 200             # Default child tool calls when agent() omits maxToolCalls (HERMES_DYNAMIC_WORKFLOWS_MAX_TOOL_CALLS; clamped to 1..10000)
-        max_tool_output_chars: 2000000  # Default child tool-output chars when agent() omits maxToolOutputChars (HERMES_DYNAMIC_WORKFLOWS_MAX_TOOL_OUTPUT_CHARS; clamped to 1..20000000)
+
         max_nesting_depth: 2          # Max workflow() nesting depth (root + N levels); run-wide caps still bind across all levels
         workflow_timeout_seconds: 900 # Wall-clock timeout for the whole run (excludes paused time)
         child_timeout_seconds: 300    # Timeout for a single child agent
@@ -167,19 +166,18 @@ meta = {
 # (pipeline has no barrier: A can be at verify while B is still at review)
 findings = await pipeline(
     args["targets"],
-    lambda t, _o, i: agent(f"Review for bugs: {t}", {"label": f"review:{i}", "phase": "Review", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 8, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
-    lambda r, _o, i: agent(f"Verify adversarially: {json.dumps(r)}", {"label": f"verify:{i}", "phase": "Verify", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 8, "maxToolCalls": 16, "maxToolOutputChars": 200000}),
+    lambda t, _o, i: agent(f"Review for bugs: {t}", {"label": f"review:{i}", "phase": "Review", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "xhigh", "maxTurns": 8}),
+    lambda r, _o, i: agent(f"Verify adversarially: {json.dumps(r)}", {"label": f"verify:{i}", "phase": "Verify", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "xhigh", "maxTurns": 8}),
 )
-return await agent("Synthesize the verified findings:\n" + json.dumps(findings), {"provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 6, "maxToolCalls": 8, "maxToolOutputChars": 120000})
+return await agent("Synthesize the verified findings:\n" + json.dumps(findings), {"provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "xhigh", "maxTurns": 6})
 ```
 
 - `agent(prompt, opts)` spawns a child agent. Every call requires inline `provider`,
-  canonical `model`, and `reasoningEffort`. `maxTurns`, `maxToolCalls`, and
-  `maxToolOutputChars` are optional: omitted values resolve from plugin config
-  `max_turns` (150), `max_tool_calls` (200), and `max_tool_output_chars` (2000000),
-  each clamped to its hard ceiling; explicit inline values override the configured
-  defaults. Malformed or invalid explicit/configured values fail before reservation
-  and launch. Resolved budgets are included in resume-cache identity.
+  canonical `model`, and `reasoningEffort`. `maxTurns` is optional: omitted values
+  resolve from plugin config `max_turns` (150), and explicit inline values override
+  that default. Malformed or invalid explicit values fail before reservation and
+  child launch. Tool-call and tool-output counts remain observational telemetry;
+  they are not workflow child limits. Presets cannot provide routing or budgets.
   Presets define role instructions and tool permissions only; routing and budgets cannot
   come from presets. Current Bedrock and `codex_app_server` transports do not forward
   workflow reasoning effort, so those runtimes fail before child launch.
@@ -204,10 +202,9 @@ await agent(
         "instructions": "You are a read-only security reviewer. Return blockers only.",
         "provider": "openai-codex",
         "model": "gpt-5.6-luna",
-        "reasoningEffort": "high",
+        "reasoningEffort": "xhigh",
         "maxTurns": 8,
-        "maxToolCalls": 16,
-        "maxToolOutputChars": 200000,
+
         "toolsets": ["file", "terminal"],
         "allowedTools": ["read_file", "search_files", "terminal", "process"],
     },
@@ -233,8 +230,8 @@ meta = {
     },
 }
 
-findings = await agent("Review diff", {"agentType": "read-only-reviewer", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 8, "maxToolCalls": 16, "maxToolOutputChars": 200000})
-return await agent("Synthesize: " + json.dumps(findings), {"agentType": "synthesizer", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "high", "maxTurns": 6, "maxToolCalls": 8, "maxToolOutputChars": 120000})
+findings = await agent("Review diff", {"agentType": "read-only-reviewer", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "xhigh", "maxTurns": 8})
+return await agent("Synthesize: " + json.dumps(findings), {"agentType": "synthesizer", "provider": "openai-codex", "model": "gpt-5.6-luna", "reasoningEffort": "xhigh", "maxTurns": 6})
 ```
 
 Built-in library presets:
