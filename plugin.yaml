@@ -9,7 +9,6 @@ provides_tools:
 
 failmode:
   hook.gateway_callback: open
-  hook.pre_gateway_dispatch: open
   hook.pre_tool_call: open
 failmode_intent: >-
   open by design — workflow infrastructure and gateway steering should not
